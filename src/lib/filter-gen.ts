@@ -121,7 +121,10 @@ export async function fileToRows(file: File, limit = 200): Promise<unknown[]> {
   }
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const sheetName = wb.SheetNames[0];
+  if (!sheetName) throw new Error("This spreadsheet has no sheets.");
+  const sheet = wb.Sheets[sheetName];
+  if (!sheet) throw new Error("Could not read the first sheet.");
   return XLSX.utils.sheet_to_json(sheet).slice(0, limit);
 }
 
