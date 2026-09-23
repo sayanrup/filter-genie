@@ -381,6 +381,13 @@ function Index() {
                     </button>
                     <button
                       type="button"
+                      onClick={() => downloadMarkdown(s)}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                    >
+                      Download .md
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => deleteSaved(s.id)}
                       className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-destructive hover:bg-danger-soft"
                     >
