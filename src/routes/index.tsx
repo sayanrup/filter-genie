@@ -721,7 +721,7 @@ function Index() {
                 onClick={saveResult}
                 className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
               >
-                Save these results
+                Save results + download .md
               </button>
             </div>
           </div>
@@ -835,7 +835,7 @@ function Index() {
               ) : null}
             </div>
           ) : tab === "preview" ? (
-            <SearchPreview result={result} />
+            <SearchPreview result={result} initialDevice={device} onDeviceChange={setDevice} />
           ) : (
             <pre className="panel max-h-[28rem] overflow-auto p-4 font-mono text-[11px] whitespace-pre-wrap">
               {JSON.stringify(result, null, 2)}
