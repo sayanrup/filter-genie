@@ -115,8 +115,8 @@ function Index() {
       savedAt: entry.savedAt,
       model: entry.model,
       result: entry.result,
-      inputs: entry.inputs,
-      device: entry.device,
+      inputs: entry.inputs ?? { serp: "", internal: "", context: "", specs: "", products: "" },
+      device: entry.device ?? "desktop",
     });
     const blob = new Blob([md], { type: "text/markdown" });
     const a = document.createElement("a");
