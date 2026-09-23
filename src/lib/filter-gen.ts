@@ -72,7 +72,7 @@ export async function callLlm(
     resp = await fetch(`${base}/chat/completions`, {
       method: "POST",
       headers,
-      signal,
+      signal: signal ?? null,
       body: JSON.stringify({
         model: settings.model,
         max_tokens: maxTokens,
