@@ -1,18 +1,33 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { InputPanel } from "@/components/InputPanel";
 import {
-  DEFAULT_BASE_URLS,
-  MODEL_PRESETS,
-  PRODUCT_RESTRUCTURE_SYSTEM,
-  buildPrompts,
-  callLlm,
+  SOURCE_LABEL,
+  describeKeywordTable,
   fileToRows,
-  stripFences,
-  type FilterResult,
+  flattenListing,
+  textToRows,
+  toKeywordTable,
+  type Row,
+} from "@/lib/data";
+import {
+  DEFAULT_BASE_URLS,
+  INITIAL_STEPS,
+  MODEL_PRESETS,
+  USD_TO_INR,
+  chat,
+  previewPrompts,
+  runCostInr,
+  runPipeline,
+  type FilterRow,
   type LlmSettings,
+  type PipelineInputs,
+  type PipelineRun,
+  type PromptRecord,
   type Provider,
+  type Step,
 } from "@/lib/filter-gen";
+import { SKILLS, stageSkills } from "@/skills";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -40,6 +55,68 @@ type Status = { kind: "ok" | "error" | "busy"; message: string } | null;
 
 const STORAGE_KEY = "filter-gen-settings";
 
+const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
+
+function safeRows(text: string): Row[] {
+  try {
+    return textToRows(text);
+  } catch {
+    return [];
+  }
+}
+
+function copy(text: string) {
+  void navigator.clipboard?.writeText(text);
+}
+
+function download(name: string, type: string, body: string) {
+  const blob = new Blob([body], { type });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function toCsv(filters: FilterRow[]) {
+  const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const head = [
+    "tier",
+    "rank",
+    "name",
+    "ui_pattern",
+    "values",
+    "confidence",
+    "rationale",
+    "sources",
+    "coverage_pct",
+    "top_value_share_pct",
+    "listing_fill_pct",
+    "needs_new_isq",
+    "isq_note",
+  ];
+  const rows = filters.map((f) =>
+    [
+      f.tier,
+      f.rank,
+      f.name,
+      f.ui_pattern,
+      f.values.join(" | "),
+      f.confidence,
+      f.rationale,
+      (f.sources ?? []).join(" | "),
+      f.coverage_pct,
+      f.top_value_share_pct,
+      f.listing_fill_pct,
+      f.needs_new_isq,
+      f.isq_note,
+    ]
+      .map(esc)
+      .join(","),
+  );
+  return [head.join(","), ...rows].join("\n");
+}
+
 function Index() {
   const [settings, setSettings] = useState<LlmSettings>({
     provider: "openrouter",
@@ -56,102 +133,118 @@ function Index() {
   const [specsText, setSpecsText] = useState("");
   const [productsText, setProductsText] = useState("");
 
-  const [serpFile, setSerpFile] = useState("");
-  const [internalFile, setInternalFile] = useState("");
-  const [productsFile, setProductsFile] = useState("");
+  const [serpFile, setSerpFile] = useState<Row[] | null>(null);
+  const [internalFile, setInternalFile] = useState<Row[] | null>(null);
+  const [productsFile, setProductsFile] = useState<Row[] | null>(null);
 
   const [serpStatus, setSerpStatus] = useState<Status>(null);
   const [internalStatus, setInternalStatus] = useState<Status>(null);
   const [productsStatus, setProductsStatus] = useState<Status>(null);
 
   const [showPrompt, setShowPrompt] = useState(false);
+  const [showSkills, setShowSkills] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<FilterResult | null>(null);
-  const [usageLine, setUsageLine] = useState("");
-  const [tab, setTab] = useState<"table" | "raw">("table");
+  const [steps, setSteps] = useState<Step[]>([]);
+  const [run, setRun] = useState<PipelineRun | null>(null);
+  const [tab, setTab] = useState<"table" | "evidence" | "raw">("table");
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
         setSettings((prev) => ({ ...prev, ...JSON.parse(saved) }));
         setRemember(true);
-      } catch {
-        /* ignore malformed storage */
       }
+    } catch {
+      /* storage unavailable or malformed */
     }
   }, []);
 
   useEffect(() => {
-    if (remember) localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-    else localStorage.removeItem(STORAGE_KEY);
+    try {
+      if (remember) localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      else localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      /* storage unavailable */
+    }
   }, [remember, settings]);
 
-  const inputs = useMemo(
+  const inputs: PipelineInputs = useMemo(
     () => ({
-      serp: serpFile || serpText,
-      internal: internalFile || internalText,
+      serpRows: serpFile ?? safeRows(serpText),
+      internalRows: internalFile ?? safeRows(internalText),
       context: contextText,
       specs: specsText,
-      products: productsFile || productsText,
+      listingRows: productsFile ?? safeRows(productsText),
     }),
-    [serpFile, serpText, internalFile, internalText, contextText, specsText, productsFile, productsText],
+    [
+      serpFile,
+      serpText,
+      internalFile,
+      internalText,
+      contextText,
+      specsText,
+      productsFile,
+      productsText,
+    ],
   );
 
-  const prompts = useMemo(() => buildPrompts(inputs), [inputs]);
+  const serpDetail = useMemo(
+    () => describeKeywordTable(toKeywordTable(inputs.serpRows, "serp")),
+    [inputs.serpRows],
+  );
+  const internalDetail = useMemo(
+    () => describeKeywordTable(toKeywordTable(inputs.internalRows, "internal")),
+    [inputs.internalRows],
+  );
+  const productsDetail = useMemo(() => {
+    if (!inputs.listingRows.length) return "";
+    const keys = new Set<string>();
+    for (const r of inputs.listingRows.slice(0, 100))
+      for (const k of Object.keys(flattenListing(r))) keys.add(k);
+    return `${inputs.listingRows.length.toLocaleString()} listings · ${keys.size} distinct fields found`;
+  }, [inputs.listingRows]);
+
+  const hasInput = Boolean(
+    inputs.serpRows.length ||
+    inputs.internalRows.length ||
+    contextText.trim() ||
+    specsText.trim() ||
+    inputs.listingRows.length,
+  );
+
+  const promptRecords: PromptRecord[] = useMemo(() => {
+    if (!showPrompt) return [];
+    return run ? run.prompts : previewPrompts(inputs);
+  }, [showPrompt, run, inputs]);
+
   const preset = MODEL_PRESETS.find((m) => m.id === settings.model);
-  const estINR = preset
-    ? (((preset.inputCost * 4000) / 1e6 + (preset.outputCost * 2000) / 1e6) * 84).toFixed(2)
-    : null;
+  const estINR = preset ? runCostInr(preset).toFixed(2) : null;
 
   function setProvider(provider: Provider) {
     setSettings((prev) => ({ ...prev, provider, baseUrl: DEFAULT_BASE_URLS[provider] }));
     setTestStatus(null);
   }
 
-  async function loadSheet(
+  async function loadFile(
     file: File,
-    setFileData: (v: string) => void,
+    setRows: (r: Row[] | null) => void,
     setStatus: (s: Status) => void,
   ) {
     setStatus({ kind: "busy", message: `Reading ${file.name}…` });
     try {
-      const rows = await fileToRows(file, 200);
-      setFileData(JSON.stringify(rows));
-      setStatus({ kind: "ok", message: `Loaded ${rows.length} rows from ${file.name}` });
+      const rows = await fileToRows(file);
+      if (!rows.length) throw new Error("No rows found in this file.");
+      setRows(rows);
+      setStatus({
+        kind: "ok",
+        message: `Loaded ${rows.length.toLocaleString()} rows from ${file.name}`,
+      });
     } catch (err) {
-      setFileData("");
+      setRows(null);
       setStatus({ kind: "error", message: (err as Error).message });
-    }
-  }
-
-  async function loadProducts(file: File) {
-    setProductsStatus({ kind: "busy", message: `Reading ${file.name}…` });
-    try {
-      const rows = await fileToRows(file, 100);
-      if (!settings.apiKey) {
-        setProductsFile(JSON.stringify(rows));
-        setProductsStatus({
-          kind: "ok",
-          message: `Loaded ${rows.length} listings as-is — add a key above and re-drop to tidy them up`,
-        });
-        return;
-      }
-      setProductsStatus({ kind: "busy", message: `Tidying up ${rows.length} listings…` });
-      const { content } = await callLlm(
-        settings,
-        PRODUCT_RESTRUCTURE_SYSTEM,
-        `Raw product data (${rows.length} items) from file "${file.name}":\n\n${JSON.stringify(rows).substring(0, 20000)}`,
-        4000,
-      );
-      const parsed = JSON.parse(stripFences(content));
-      if (!Array.isArray(parsed?.products)) throw new Error("The model did not return a usable list of products.");
-      setProductsFile(JSON.stringify(parsed.products));
-      setProductsStatus({ kind: "ok", message: `Cleaned up ${parsed.products.length} listings from ${file.name}` });
-    } catch (err) {
-      setProductsFile("");
-      setProductsStatus({ kind: "error", message: (err as Error).message });
     }
   }
 
@@ -162,8 +255,18 @@ function Index() {
     }
     setTestStatus({ kind: "busy", message: "Testing…" });
     try {
-      const { content } = await callLlm(settings, "Reply with exactly: OK", "ping", 10);
-      setTestStatus({ kind: "ok", message: `Connected — ${settings.model} replied "${content.trim().slice(0, 24)}"` });
+      const { content } = await chat(
+        settings,
+        [
+          { role: "system", content: "Reply with exactly: OK" },
+          { role: "user", content: "ping" },
+        ],
+        { maxTokens: 10 },
+      );
+      setTestStatus({
+        kind: "ok",
+        message: `Connected — ${settings.model} replied "${content.trim().slice(0, 24)}"`,
+      });
     } catch (err) {
       setTestStatus({ kind: "error", message: (err as Error).message });
     }
@@ -171,7 +274,7 @@ function Index() {
 
   async function generate() {
     setError("");
-    if (!prompts.hasInput) {
+    if (!hasInput) {
       setError("Add at least one input above — any single one is enough.");
       return;
     }
@@ -179,27 +282,27 @@ function Index() {
       setError("Enter your API key first.");
       return;
     }
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoading(true);
-    setResult(null);
+    setRun(null);
+    setSteps(INITIAL_STEPS.map((s) => ({ ...s })));
     try {
-      const { content, usage } = await callLlm(settings, prompts.system, prompts.user, 4000);
-      const parsed = JSON.parse(stripFences(content)) as FilterResult;
-      if (!Array.isArray(parsed.filters)) throw new Error('The response had no "filters" list.');
-      setResult(parsed);
+      const result = await runPipeline(settings, inputs, {
+        signal: controller.signal,
+        onStep: (id, status, detail) =>
+          setSteps((prev) =>
+            prev.map((s) => (s.id === id ? { ...s, status, ...(detail ? { detail } : {}) } : s)),
+          ),
+      });
+      setRun(result);
       setTab("table");
-      let cost = "";
-      if (preset && usage.prompt_tokens && usage.completion_tokens) {
-        const usd =
-          (preset.inputCost * usage.prompt_tokens) / 1e6 + (preset.outputCost * usage.completion_tokens) / 1e6;
-        cost = ` · ~$${usd.toFixed(5)} (₹${(usd * 84).toFixed(2)})`;
-      }
-      setUsageLine(
-        `${settings.model} · in ${usage.prompt_tokens ?? "?"} tok · out ${usage.completion_tokens ?? "?"} tok${cost}`,
-      );
     } catch (err) {
-      setError((err as Error).message);
+      setError((err as Error).name === "AbortError" ? "Stopped." : (err as Error).message);
+      setSteps((prev) => prev.map((s) => (s.status === "running" ? { ...s, status: "error" } : s)));
     } finally {
       setLoading(false);
+      abortRef.current = null;
     }
   }
 
@@ -209,29 +312,40 @@ function Index() {
     setContextText("");
     setSpecsText("");
     setProductsText("");
-    setSerpFile("");
-    setInternalFile("");
-    setProductsFile("");
+    setSerpFile(null);
+    setInternalFile(null);
+    setProductsFile(null);
     setSerpStatus(null);
     setInternalStatus(null);
     setProductsStatus(null);
-    setResult(null);
+    setRun(null);
+    setSteps([]);
     setError("");
-    setUsageLine("");
     setShowPrompt(false);
   }
 
-  function exportJson() {
-    if (!result) return;
-    const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "filter-recommendations.json";
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
+  const result = run?.result ?? null;
   const tierCount = (tier: string) => result?.filters.filter((f) => f.tier === tier).length ?? 0;
+
+  const usageLine = useMemo(() => {
+    if (!run) return "";
+    const { prompt_tokens: pin, completion_tokens: pout } = run.usage;
+    let cost = "";
+    if (preset && pin && pout) {
+      const usd = (preset.inputCost * pin) / 1e6 + (preset.outputCost * pout) / 1e6;
+      cost = ` · ~$${usd.toFixed(5)} (₹${(usd * USD_TO_INR).toFixed(2)})`;
+    }
+    return `${settings.model} · ${run.calls} call${run.calls === 1 ? "" : "s"} · in ${pin ?? "?"} tok · out ${pout ?? "?"} tok${cost}`;
+  }, [run, preset, settings.model]);
+
+  const allPromptsText = promptRecords
+    .map((p) =>
+      [
+        `##### ${p.title}`,
+        ...p.messages.map((m) => `--- ${m.role.toUpperCase()} ---\n${m.content}`),
+      ].join("\n\n"),
+    )
+    .join("\n\n\n");
 
   return (
     <main className="mx-auto max-w-6xl px-5 py-8">
@@ -239,9 +353,10 @@ function Index() {
         <p className="label-caps mb-1">Category research → search UX</p>
         <h1 className="text-3xl font-bold">Search Filter Generator</h1>
         <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-          Add whatever data you have — keywords, research notes, spec rankings, listings. Every field is optional,
-          and each one takes a dropped file or pasted text. You get back a ranked, tiered set of filters with the
-          evidence behind each one.
+          Add whatever data you have — keywords, research notes, spec rankings, listings. Every
+          field is optional, and each one takes a dropped file or pasted text. The numbers are
+          totalled in your browser; the model labels and judges them, and you get a ranked, tiered
+          set of filters with the evidence behind each one.
         </p>
       </header>
 
@@ -323,7 +438,11 @@ function Index() {
             Test connection
           </button>
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+            />
             Remember on this device
           </label>
           {testStatus ? (
@@ -343,7 +462,8 @@ function Index() {
 
         {settings.provider === "litellm" ? (
           <p className="mt-2 text-[11px] text-muted-foreground">
-            Point this at your LiteLLM gateway address and use the model name exactly as it is configured there.
+            Point this at your LiteLLM gateway address and use the model name exactly as it is
+            configured there.
           </p>
         ) : null}
       </section>
@@ -351,7 +471,6 @@ function Index() {
       {/* Model price strip */}
       <div className="mb-5 flex gap-2 overflow-x-auto pb-1">
         {MODEL_PRESETS.map((m) => {
-          const runINR = (((m.inputCost * 4000) / 1e6 + (m.outputCost * 2000) / 1e6) * 84).toFixed(2);
           const active = m.id === settings.model;
           return (
             <button
@@ -359,7 +478,9 @@ function Index() {
               type="button"
               onClick={() => setSettings((s) => ({ ...s, model: m.id }))}
               className={`min-w-40 shrink-0 rounded-lg border p-3 text-left transition-colors ${
-                active ? "border-primary bg-primary-soft" : "border-border bg-card hover:border-primary/50"
+                active
+                  ? "border-primary bg-primary-soft"
+                  : "border-border bg-card hover:border-primary/50"
               }`}
             >
               <div className="flex items-center gap-1.5">
@@ -381,7 +502,9 @@ function Index() {
               <div className="mt-1 font-mono text-[11px] text-muted-foreground">
                 ${m.inputCost} in · ${m.outputCost} out
               </div>
-              <div className="font-mono text-[11px] font-semibold">~₹{runINR}/run</div>
+              <div className="font-mono text-[11px] font-semibold">
+                ~₹{runCostInr(m).toFixed(2)}/run
+              </div>
             </button>
           );
         })}
@@ -393,23 +516,33 @@ function Index() {
           step={1}
           title="Google SERP keywords"
           hint="Search Console queries with clicks, impressions and position."
-          accept=".xlsx,.csv"
-          placeholder="Paste CSV rows here…"
+          accept=".xlsx,.csv,.tsv,.txt"
+          placeholder={"query,clicks,impressions,position\nsecurity cabin price,120,5400,6.2\n…"}
           text={serpText}
-          onTextChange={setSerpText}
-          onFile={(f) => loadSheet(f, setSerpFile, setSerpStatus)}
+          onTextChange={(v) => {
+            setSerpText(v);
+            setSerpFile(null);
+            setSerpStatus(null);
+          }}
+          onFile={(f) => loadFile(f, setSerpFile, setSerpStatus)}
           status={serpStatus}
+          detail={serpDetail}
         />
         <InputPanel
           step={2}
           title="Internal search keywords"
-          hint="Search-bar queries with CTR, engagement, conversion and enquiry metrics."
-          accept=".xlsx,.csv"
-          placeholder="Paste CSV rows here…"
+          hint="Search-bar queries with pageviews, CTR, conversion and enquiry metrics."
+          accept=".xlsx,.csv,.tsv,.txt"
+          placeholder={"keyword,pageviews,enquiries\npuf security cabin,400,90\n…"}
           text={internalText}
-          onTextChange={setInternalText}
-          onFile={(f) => loadSheet(f, setInternalFile, setInternalStatus)}
+          onTextChange={(v) => {
+            setInternalText(v);
+            setInternalFile(null);
+            setInternalStatus(null);
+          }}
+          onFile={(f) => loadFile(f, setInternalFile, setInternalStatus)}
           status={internalStatus}
+          detail={internalDetail}
         />
         <InputPanel
           step={3}
@@ -427,7 +560,9 @@ function Index() {
           title="Spec importance ranking"
           hint="The category manager's ranked spec list or tiers."
           accept=".txt,.md,.csv"
-          placeholder={"Green (top): 1-Size, 2-Material, 3-Application\nYellow (mid): 4-Built Type, 5-Insulation\nPurple (low): 6-Brand, 7-Roof Type"}
+          placeholder={
+            "Green (top): 1-Size, 2-Material, 3-Application\nYellow (mid): 4-Built Type, 5-Insulation\nPurple (low): 6-Brand, 7-Roof Type"
+          }
           text={specsText}
           onTextChange={setSpecsText}
           onFile={async (f) => setSpecsText(await f.text())}
@@ -435,42 +570,73 @@ function Index() {
         />
         <InputPanel
           step={5}
-          title="Product listings (top 100)"
-          hint="Any export shape — with a key set, it gets tidied into a clean structure first. Pasted text is used as-is."
+          title="Product listings"
+          hint="Any export shape (JSON, CSV, XLSX). Nested specs are flattened, field names are mapped to clean specs, and fill rates are measured across all listings."
           accept=".json,.csv,.xlsx"
-          placeholder="Paste listings JSON here…"
+          placeholder="Paste listings JSON or CSV here…"
           text={productsText}
-          onTextChange={setProductsText}
-          onFile={loadProducts}
+          onTextChange={(v) => {
+            setProductsText(v);
+            setProductsFile(null);
+            setProductsStatus(null);
+          }}
+          onFile={(f) => loadFile(f, setProductsFile, setProductsStatus)}
           status={productsStatus}
+          detail={productsDetail}
           className="md:col-span-2"
         />
       </div>
 
       {/* Actions */}
       <div className="mt-5 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={generate}
-          disabled={loading}
-          className="rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
-        >
-          {loading ? "Generating…" : "Generate filter recommendations"}
-        </button>
+        {loading ? (
+          <button
+            type="button"
+            onClick={() => abortRef.current?.abort()}
+            className="rounded-lg bg-destructive px-5 py-2.5 text-sm font-semibold text-destructive-foreground transition-opacity hover:opacity-90"
+          >
+            Stop
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={generate}
+            className="rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+          >
+            Generate filter recommendations
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setShowPrompt((v) => !v)}
           className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent"
         >
-          {showPrompt ? "Hide instructions" : "View instructions"}
+          {showPrompt ? "Hide prompts" : "View prompts"}
         </button>
         <button
           type="button"
-          onClick={exportJson}
+          onClick={() =>
+            result &&
+            download(
+              "filter-recommendations.json",
+              "application/json",
+              JSON.stringify(result, null, 2),
+            )
+          }
           disabled={!result}
           className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
         >
           Export JSON
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            result && download("filter-recommendations.csv", "text/csv", toCsv(result.filters))
+          }
+          disabled={!result}
+          className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
+        >
+          Export CSV
         </button>
         <button
           type="button"
@@ -479,72 +645,196 @@ function Index() {
         >
           Clear all
         </button>
-        <span className="font-mono text-[11px] text-muted-foreground">
-          ~{Math.round((prompts.system.length + prompts.user.length) / 4).toLocaleString()} tokens
-          {estINR ? ` · ~₹${estINR}/run` : ""}
-        </span>
+        {estINR ? (
+          <span className="font-mono text-[11px] text-muted-foreground">
+            ~₹{estINR}/run (2–4 model calls)
+          </span>
+        ) : null}
       </div>
 
       {showPrompt ? (
         <section className="panel mt-4 p-4">
-          <div className="mb-2 flex items-center gap-2">
-            <h2 className="label-caps">What the model is told</h2>
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <h2 className="label-caps">
+              {run ? "Prompts sent in the last run" : "Prompts (preview from your current inputs)"}
+            </h2>
             <button
               type="button"
-              onClick={() => navigator.clipboard.writeText(prompts.system)}
+              onClick={() => copy(allPromptsText)}
               className="ml-auto rounded border border-border px-2 py-1 text-[11px] font-medium hover:bg-accent"
             >
-              Copy instructions
+              Copy all prompts
             </button>
             <button
               type="button"
-              onClick={() => navigator.clipboard.writeText(prompts.user)}
+              onClick={() => setShowSkills((v) => !v)}
               className="rounded border border-border px-2 py-1 text-[11px] font-medium hover:bg-accent"
             >
-              Copy your data
+              {showSkills ? "Hide skill docs" : "Skill docs"}
             </button>
           </div>
-          <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-3 font-mono text-[11px] leading-relaxed">
-            {prompts.system}
-          </pre>
-          <pre className="mt-2 max-h-52 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-3 font-mono text-[11px] leading-relaxed">
-            {prompts.user}
-          </pre>
+          <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
+            Each system prompt is assembled from{" "}
+            <code className="font-mono">src/skills/base.md</code> plus the “## Prompt” section of
+            the skill docs listed under it. Edit one skill file to change one layer.
+          </p>
+
+          {showSkills ? (
+            <div className="mb-4 grid gap-2">
+              {Object.values(SKILLS).map((s) => (
+                <details key={s.id} className="rounded-md border border-border bg-card">
+                  <summary className="cursor-pointer px-3 py-2 text-xs font-semibold">
+                    {s.title}{" "}
+                    <span className="font-mono font-normal text-muted-foreground">
+                      · src/skills/{s.file}
+                    </span>
+                  </summary>
+                  <pre className="max-h-72 overflow-auto whitespace-pre-wrap border-t border-border p-3 font-mono text-[11px] leading-relaxed">
+                    {s.markdown}
+                  </pre>
+                </details>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="grid gap-4">
+            {promptRecords.map((p, pi) => (
+              <div key={`${p.id}-${pi}`} className="rounded-lg border border-border p-3">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <h3 className="font-display text-sm font-semibold">{p.title}</h3>
+                  {p.stage ? (
+                    <div className="flex flex-wrap gap-1">
+                      {stageSkills(p.stage).map((s) => (
+                        <span
+                          key={s.id}
+                          className="rounded bg-primary-soft px-1.5 py-px font-mono text-[10px] text-primary"
+                          title={s.title}
+                        >
+                          {s.file}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+                {p.messages.map((m, mi) => (
+                  <div key={mi} className="mt-2">
+                    <div className="mb-1 flex items-center gap-2">
+                      <span className="label-caps">
+                        {m.role === "system"
+                          ? "System prompt"
+                          : m.role === "user"
+                            ? "Data sent"
+                            : "Model reply"}
+                      </span>
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        ~{Math.round(m.content.length / 4).toLocaleString()} tok
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => copy(m.content)}
+                        className="ml-auto rounded border border-border px-2 py-0.5 text-[10px] font-medium hover:bg-accent"
+                      >
+                        Copy
+                      </button>
+                    </div>
+                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-3 font-mono text-[11px] leading-relaxed">
+                      {m.content}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
         </section>
       ) : null}
 
       {error ? (
-        <div className="mt-4 rounded-lg bg-danger-soft px-4 py-3 text-sm text-destructive">{error}</div>
-      ) : null}
-
-      {loading ? (
-        <div className="mt-4 flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-4 text-sm text-muted-foreground">
-          <span className="size-4 animate-spin rounded-full border-2 border-border border-t-primary" />
-          Working through your data with {settings.model}…
+        <div className="mt-4 rounded-lg bg-danger-soft px-4 py-3 text-sm text-destructive">
+          {error}
         </div>
       ) : null}
 
-      {result ? (
+      {steps.length && (loading || !run) ? (
+        <ol className="panel mt-4 grid gap-1.5 px-4 py-3 text-sm">
+          {steps.map((s) => (
+            <li key={s.id} className="flex items-center gap-3">
+              <span
+                className={`flex size-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
+                  s.status === "running"
+                    ? "animate-spin border-2 border-border border-t-primary"
+                    : s.status === "done"
+                      ? "bg-success-soft text-success"
+                      : s.status === "error"
+                        ? "bg-danger-soft text-destructive"
+                        : "bg-secondary text-muted-foreground"
+                }`}
+              >
+                {s.status === "done"
+                  ? "✓"
+                  : s.status === "error"
+                    ? "!"
+                    : s.status === "skipped"
+                      ? "–"
+                      : ""}
+              </span>
+              <span
+                className={
+                  s.status === "pending" || s.status === "skipped" ? "text-muted-foreground" : ""
+                }
+              >
+                {s.label}
+              </span>
+              {s.detail ? (
+                <span className="font-mono text-[11px] text-muted-foreground">{s.detail}</span>
+              ) : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+
+      {run && result ? (
         <section className="mt-6">
           <div className="mb-4 flex flex-wrap gap-3">
             {[
               { label: "Total filters", value: result.filters.length, tone: "" },
               { label: "Tier 1", value: tierCount("Tier 1"), tone: "text-success" },
               { label: "Tier 2", value: tierCount("Tier 2"), tone: "text-warning" },
-              { label: "Tier 3", value: tierCount("Tier 3"), tone: "text-destructive" },
+              { label: "Tier 3 (display)", value: tierCount("Tier 3"), tone: "text-destructive" },
               ...(result.total_keywords_analyzed
                 ? [{ label: "Keywords analysed", value: result.total_keywords_analyzed, tone: "" }]
                 : []),
+              ...(run.evidence.listing
+                ? [{ label: "Listings profiled", value: run.evidence.listing.count, tone: "" }]
+                : []),
             ].map((s) => (
               <div key={s.label} className="panel min-w-32 flex-1 px-4 py-3">
-                <div className={`font-display text-2xl font-bold ${s.tone}`}>{s.value.toLocaleString()}</div>
+                <div className={`font-display text-2xl font-bold ${s.tone}`}>
+                  {s.value.toLocaleString()}
+                </div>
                 <div className="text-[11px] text-muted-foreground">{s.label}</div>
               </div>
             ))}
           </div>
 
+          {result.category_name ? (
+            <p className="mb-3 text-sm">
+              Category: <strong>{result.category_name}</strong>
+            </p>
+          ) : null}
+
+          {run.warnings.length ? (
+            <div className="mb-4 rounded-lg bg-warning-soft px-4 py-3 text-xs text-warning-foreground">
+              <strong className="mb-1 block">Check these before using the output</strong>
+              <ul className="list-disc pl-4 leading-relaxed">
+                {run.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
           <div className="mb-3 flex gap-1 border-b-2 border-border">
-            {(["table", "raw"] as const).map((t) => (
+            {(["table", "evidence", "raw"] as const).map((t) => (
               <button
                 key={t}
                 type="button"
@@ -555,7 +845,7 @@ function Index() {
                     : "border-transparent text-muted-foreground hover:text-foreground"
                 }`}
               >
-                {t === "table" ? "Filter table" : "Raw JSON"}
+                {t === "table" ? "Filter table" : t === "evidence" ? "Evidence" : "Raw JSON"}
               </button>
             ))}
           </div>
@@ -565,28 +855,33 @@ function Index() {
               <table className="w-full border-collapse text-sm">
                 <thead>
                   <tr>
-                    {["#", "Tier", "Filter", "UI pattern", "Values", "Confidence", "Why"].map((h) => (
-                      <th
-                        key={h}
-                        className="label-caps border-b-2 border-border px-3 py-2.5 text-left whitespace-nowrap"
-                      >
-                        {h}
-                      </th>
-                    ))}
+                    {["#", "Tier", "Filter", "UI pattern", "Values", "Confidence", "Why"].map(
+                      (h) => (
+                        <th
+                          key={h}
+                          className="label-caps border-b-2 border-border px-3 py-2.5 text-left whitespace-nowrap"
+                        >
+                          {h}
+                        </th>
+                      ),
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {[...result.filters]
-                    .sort((a, b) => {
-                      const order: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
-                      return (order[a.tier] ?? 9) - (order[b.tier] ?? 9) || a.rank - b.rank;
-                    })
+                    .sort(
+                      (a, b) =>
+                        (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank,
+                    )
                     .map((f, i) => (
-                      <tr key={`${f.name}-${i}`} className="border-b border-border last:border-0 align-top">
+                      <tr
+                        key={`${f.name}-${i}`}
+                        className="border-b border-border align-top last:border-0"
+                      >
                         <td className="px-3 py-3 font-semibold">{i + 1}</td>
                         <td className="px-3 py-3">
                           <span
-                            className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
+                            className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider whitespace-nowrap ${
                               f.tier === "Tier 1"
                                 ? "bg-success-soft text-success"
                                 : f.tier === "Tier 2"
@@ -599,6 +894,17 @@ function Index() {
                         </td>
                         <td className="px-3 py-3">
                           <strong>{f.name}</strong>
+                          <div className="mt-1 flex flex-wrap gap-x-2 font-mono text-[10px] text-muted-foreground">
+                            {f.coverage_pct != null ? (
+                              <span>coverage {f.coverage_pct}%</span>
+                            ) : null}
+                            {f.top_value_share_pct != null ? (
+                              <span>top value {f.top_value_share_pct}%</span>
+                            ) : null}
+                            {f.listing_fill_pct != null ? (
+                              <span>filled {f.listing_fill_pct}%</span>
+                            ) : null}
+                          </div>
                           {f.needs_new_isq ? (
                             <div className="mt-1 text-[10px] text-destructive">
                               ⚠ {f.isq_note || "Needs a new listing field"}
@@ -608,7 +914,7 @@ function Index() {
                         <td className="px-3 py-3 text-xs">{f.ui_pattern}</td>
                         <td className="px-3 py-3">
                           <div className="flex flex-wrap gap-1">
-                            {(f.values ?? []).slice(0, 15).map((v, vi) => (
+                            {f.values.slice(0, 15).map((v, vi) => (
                               <span
                                 key={`${v}-${vi}`}
                                 className="rounded border border-border bg-secondary px-1.5 py-px text-[11px]"
@@ -616,9 +922,9 @@ function Index() {
                                 {v}
                               </span>
                             ))}
-                            {(f.values ?? []).length > 15 ? (
+                            {f.values.length > 15 ? (
                               <span className="rounded border border-border px-1.5 py-px text-[11px] text-muted-foreground">
-                                +{(f.values ?? []).length - 15}
+                                +{f.values.length - 15}
                               </span>
                             ) : null}
                           </div>
@@ -636,7 +942,21 @@ function Index() {
                             {f.confidence}
                           </span>
                         </td>
-                        <td className="max-w-64 px-3 py-3 text-xs text-muted-foreground">{f.rationale}</td>
+                        <td className="max-w-72 px-3 py-3 text-xs text-muted-foreground">
+                          {f.rationale}
+                          {f.sources?.length ? (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {f.sources.map((s) => (
+                                <span
+                                  key={s}
+                                  className="rounded bg-secondary px-1 py-px font-mono text-[9px] uppercase"
+                                >
+                                  {s}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                        </td>
                       </tr>
                     ))}
                 </tbody>
@@ -667,15 +987,173 @@ function Index() {
                 </div>
               ) : null}
             </div>
+          ) : tab === "evidence" ? (
+            <EvidenceView run={run} />
           ) : (
             <pre className="panel max-h-[28rem] overflow-auto p-4 font-mono text-[11px] whitespace-pre-wrap">
               {JSON.stringify(result, null, 2)}
             </pre>
           )}
 
-          {usageLine ? <p className="mt-2 font-mono text-[11px] text-muted-foreground">{usageLine}</p> : null}
+          {usageLine ? (
+            <p className="mt-2 font-mono text-[11px] text-muted-foreground">{usageLine}</p>
+          ) : null}
         </section>
       ) : null}
     </main>
+  );
+}
+
+function EvidenceView({ run }: { run: PipelineRun }) {
+  const { tables, aggregation, listing, mining, labels } = run.evidence;
+  const fmt = (n: number) => Math.round(n).toLocaleString("en-IN");
+  return (
+    <div className="grid gap-4">
+      <p className="text-xs text-muted-foreground">
+        These tables were computed in your browser and are exactly what the master prompt received.
+        The model only labelled the keyword terms ({labels.length} of {mining?.terms.length ?? 0})
+        and mapped listing fields.
+      </p>
+
+      {tables.length ? (
+        <div className="panel p-4">
+          <h3 className="label-caps mb-2">Keyword sources</h3>
+          <ul className="grid gap-1 font-mono text-[11px]">
+            {tables.map((t) => (
+              <li key={t.source}>
+                <strong>{SOURCE_LABEL[t.source]}</strong> — {describeKeywordTable(t)} · total{" "}
+                {fmt(t.totalDemand)} {t.demandMetric ?? "keywords"}
+                {aggregation
+                  ? ` · ${aggregation.genericShare[t.source] ?? 0}% generic (no qualifier)`
+                  : ""}
+              </li>
+            ))}
+          </ul>
+          {mining?.coreTerms.length ? (
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              Core category words: {mining.coreTerms.join(", ")}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {aggregation?.dimensions.map((d) => (
+        <div key={d.name} className="panel overflow-x-auto p-4">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-4 gap-y-1">
+            <h3 className="font-display text-sm font-semibold">{d.name}</h3>
+            {tables.map((t) =>
+              d.bySource[t.source] ? (
+                <span key={t.source} className="font-mono text-[11px] text-muted-foreground">
+                  {SOURCE_LABEL[t.source]}: coverage {d.bySource[t.source]!.coverage}% · top value{" "}
+                  {d.bySource[t.source]!.topShare}%
+                </span>
+              ) : null,
+            )}
+          </div>
+          <table className="w-full border-collapse text-xs">
+            <thead>
+              <tr>
+                <th className="label-caps border-b border-border px-2 py-1.5 text-left">Value</th>
+                {tables.map((t) => (
+                  <th
+                    key={t.source}
+                    className="label-caps border-b border-border px-2 py-1.5 text-right"
+                    colSpan={t.actionMetric ? 3 : 2}
+                  >
+                    {SOURCE_LABEL[t.source]}
+                  </th>
+                ))}
+              </tr>
+              <tr className="text-[10px] text-muted-foreground">
+                <th />
+                {tables.map((t) => [
+                  <th key={`${t.source}-d`} className="px-2 py-1 text-right font-normal">
+                    {t.demandMetric ?? "kws"}
+                  </th>,
+                  <th key={`${t.source}-s`} className="px-2 py-1 text-right font-normal">
+                    share
+                  </th>,
+                  t.actionMetric ? (
+                    <th key={`${t.source}-a`} className="px-2 py-1 text-right font-normal">
+                      {t.actionMetric}
+                    </th>
+                  ) : null,
+                ])}
+              </tr>
+            </thead>
+            <tbody>
+              {d.values.slice(0, 20).map((v) => (
+                <tr key={v.value} className="border-b border-border last:border-0">
+                  <td className="px-2 py-1.5">{v.value}</td>
+                  {tables.map((t) => {
+                    const b = v.bySource[t.source];
+                    return [
+                      <td key={`${t.source}-d`} className="px-2 py-1.5 text-right font-mono">
+                        {b ? fmt(b.demand) : "–"}
+                      </td>,
+                      <td key={`${t.source}-s`} className="px-2 py-1.5 text-right font-mono">
+                        {b ? `${b.share}%` : "–"}
+                      </td>,
+                      t.actionMetric ? (
+                        <td key={`${t.source}-a`} className="px-2 py-1.5 text-right font-mono">
+                          {b ? fmt(b.action) : "–"}
+                        </td>
+                      ) : null,
+                    ];
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+
+      {listing ? (
+        <div className="panel overflow-x-auto p-4">
+          <h3 className="label-caps mb-2">
+            Listing spec profile · {listing.count} listings
+            {listing.mapped ? "" : " (raw field names)"}
+          </h3>
+          {listing.price ? (
+            <p className="mb-2 font-mono text-[11px] text-muted-foreground">
+              Price ({listing.price.n} priced
+              {listing.price.unit ? `, per ${listing.price.unit}` : ""}): min ₹
+              {fmt(listing.price.min)} · p25 ₹{fmt(listing.price.p25)} · median ₹
+              {fmt(listing.price.median)} · p75 ₹{fmt(listing.price.p75)} · max ₹
+              {fmt(listing.price.max)}
+            </p>
+          ) : null}
+          <table className="w-full border-collapse text-xs">
+            <thead>
+              <tr>
+                {["Spec", "Filled", "Distinct", "Most common values"].map((h) => (
+                  <th key={h} className="label-caps border-b border-border px-2 py-1.5 text-left">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {listing.fields.map((f) => (
+                <tr key={f.key} className="border-b border-border align-top last:border-0">
+                  <td className="px-2 py-1.5" title={f.sources.join(", ")}>
+                    {f.key}
+                  </td>
+                  <td
+                    className={`px-2 py-1.5 font-mono ${f.fillPct >= 60 ? "text-success" : f.fillPct >= 30 ? "text-warning" : "text-destructive"}`}
+                  >
+                    {f.fillPct}%
+                  </td>
+                  <td className="px-2 py-1.5 font-mono">{f.distinct}</td>
+                  <td className="px-2 py-1.5 text-muted-foreground">
+                    {f.top.map(([v, n]) => `${v} (${n})`).join(", ")}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
   );
 }
