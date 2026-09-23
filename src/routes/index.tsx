@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { InputPanel } from "@/components/InputPanel";
+import { SearchPreview } from "@/components/SearchPreview";
 import {
   DEFAULT_BASE_URLS,
   MODEL_PRESETS,
@@ -69,7 +70,7 @@ function Index() {
   const [error, setError] = useState("");
   const [result, setResult] = useState<FilterResult | null>(null);
   const [usageLine, setUsageLine] = useState("");
-  const [tab, setTab] = useState<"table" | "raw">("table");
+  const [tab, setTab] = useState<"table" | "preview" | "raw">("table");
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -544,7 +545,7 @@ function Index() {
           </div>
 
           <div className="mb-3 flex gap-1 border-b-2 border-border">
-            {(["table", "raw"] as const).map((t) => (
+            {(["table", "preview", "raw"] as const).map((t) => (
               <button
                 key={t}
                 type="button"
@@ -555,10 +556,11 @@ function Index() {
                     : "border-transparent text-muted-foreground hover:text-foreground"
                 }`}
               >
-                {t === "table" ? "Filter table" : "Raw JSON"}
+                {t === "table" ? "Filter table" : t === "preview" ? "See it on a page" : "Raw JSON"}
               </button>
             ))}
           </div>
+
 
           {tab === "table" ? (
             <div className="panel overflow-x-auto">
@@ -667,11 +669,14 @@ function Index() {
                 </div>
               ) : null}
             </div>
+          ) : tab === "preview" ? (
+            <SearchPreview result={result} />
           ) : (
             <pre className="panel max-h-[28rem] overflow-auto p-4 font-mono text-[11px] whitespace-pre-wrap">
               {JSON.stringify(result, null, 2)}
             </pre>
           )}
+
 
           {usageLine ? <p className="mt-2 font-mono text-[11px] text-muted-foreground">{usageLine}</p> : null}
         </section>
