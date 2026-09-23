@@ -7,12 +7,15 @@ returns empty results.
 - **Layer:** code (deterministic) + a prompt section for the design model
 - **Used by:** master prompt (evidence D)
 - **Code:** `src/lib/data.ts` → `profileListings()`; `src/lib/prompts.ts` → `formatListing()`
+- **Field mapping:** see skill 04 (code rules + optional model merge)
 
 ## What the code does
 
 - Source fields mapped to the same spec are merged; a listing counts as filled if any of them has a value
   (`-`, `NA`, `null`, empty don't count).
-- Values are grouped case-insensitively; top 8 per spec are kept.
+- Values are grouped case-insensitively; top 8 per spec are kept (the Evidence tab shows all 8).
+- In the prompt, to save tokens: only specs filled on ≥ 5% of listings (max 30) get a row with their top 5
+  values; rarer specs are listed by name on one line.
 - Price: first number in the price field; min / 25th / median / 75th / max over listings with a price,
   and the most common unit (from a unit field or the text after `/`).
 

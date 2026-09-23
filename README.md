@@ -18,31 +18,43 @@ The app runs entirely in the browser with your own **OpenRouter** or **LiteLLM**
 
 ## How a run works
 
-The model never does arithmetic. Code totals the numbers; the model labels and judges.
+The model never does arithmetic, and it only sees what code can't decide on its own.
 
 ```
-                    ┌──────────────── code (src/lib/data.ts) ────────────────┐
-keywords (1, 2) ──▶ parse → detect columns → normalise → mine terms ──┐        │
-                    └───────────────────────────────────────────────┼────────┘
-                                                                     ▼
-                                    model · stage 1: label terms → dimension + value
-                                                                     ▼
-                    code: total demand per dimension/value (coverage, top-value share)
-                                                                     │
-listings (5) ─────▶ code: flatten JSON → field summary               │
-                         ▼                                           │
-                    model · stage 2: map fields → canonical specs    │
-                         ▼                                           │
-                    code: fill % per spec, common values, price quartiles
-                                                                     ▼
-context (3) + ranking (4) + all evidence ──▶ model · stage 3: MASTER PROMPT → filter panel JSON
-                                                                     ▼
-                    code: validate (Tier 1 = 3–5, real options, cited evidence …)
-                          └─ if anything fails → one repair turn → warnings for what's left
+keywords (1, 2) ─▶ code: parse → detect columns → normalise → mine terms
+                        ├─ price words, places, sizes ──▶ labelled by code (free)
+                        └─ remaining top 150 terms ──▶ model · step 1: label → dimension + value
+                   code: total demand per dimension/value (coverage, top-value share)
+
+listings (5) ────▶ code: flatten JSON → field rules (ignore ids/urls, name, price, unit, spec names)
+                        └─ if ≥ 2 spec names ──▶ model · step 2: merge synonyms / drop non-specs
+                   code: fill % per spec, common values, price quartiles
+
+context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT → filters linked to evidence rows
+                   code: fill in coverage / share / fill % from the links, auto-fix (Tier 1 = 3–5,
+                         real options, Tier 3 display-only, ISQ blockers) and list every fix
 ```
 
-Stages 1 and 2 run in parallel. A full run is 2–4 model calls. If stage 1 or 2 fails, the run carries on
-with raw term totals / raw field names and says so in the warnings.
+Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.
+
+## Cost
+
+A typical run is **3 calls and about 5–9k input / 2–3k output tokens** — well under ₹0.10 on the default
+model. The button bar shows a live estimate for your current inputs. What keeps it low:
+
+| Saving | How |
+|--------|-----|
+| No arithmetic by the model | Code totals everything; the model gets compact tables, not raw rows |
+| Fewer terms to label | Price words, cities/states and sizes are labelled by code; only the top 150 other terms go to the model, with no numbers |
+| Short answers | Labels come back grouped (`dimension → value → [terms]`); spec mapping returns only merges; filters return evidence *links* and code fills the numbers |
+| Field mapping mostly free | Rules handle ids, URLs, names, prices, units and spec names; the model is called only to merge synonyms |
+| No repair call | Tier limits, option clean-up, display-only and ISQ blockers are fixed in code |
+| Reuse | Labelling and field-mapping answers are cached for the session — editing only the context doc or ranking and re-running costs one call |
+| Cheapest routing | On OpenRouter, requests use `provider.sort = price`; reasoning is off for steps 1–2 and low for step 3 (reasoning tokens bill as output) |
+| Stable prompt prefix | System prompts come first and don't change between runs, so providers with automatic prompt caching bill repeats at the cached rate |
+| Trimmed evidence | ≤ 12 values per dimension, minor dimensions on one line, top 10 keywords, specs filled on ≥ 5% of listings |
+
+If a provider rejects an optional parameter (JSON mode, reasoning, routing), the call is retried once without them.
 
 ## Skill docs — the prompts live in `src/skills/`
 
@@ -57,16 +69,16 @@ system prompt for a stage = base.md + the "## Prompt" section of each skill doc 
 |------|-------|---------|
 | `base.md` | Shared context and ground rules | every stage |
 | `01-parse-keyword-files.md` | Reading keyword exports, demand/action metrics | master prompt |
-| `02-derive-specs-from-keywords.md` | Mining terms from keywords; labelling them as dimension + value | stage 1 |
+| `02-derive-specs-from-keywords.md` | Mining terms from keywords; code auto-labels; model labels the rest | step 1 |
 | `03-demand-aggregation.md` | Coverage, top-value share, generic share | master prompt |
-| `04-parse-product-json.md` | Flattening product JSON; mapping fields to canonical specs | stage 2 |
+| `04-parse-product-json.md` | Flattening product JSON; field rules; merging spec synonyms | step 2 |
 | `05-listing-spec-profile.md` | Fill rates, common values, price distribution (supply) | master prompt |
 | `06-context-and-ranking.md` | Reading the context doc and CM ranking | master prompt |
 | `07-filter-design-brief.md` | Master prompt role and goal | master prompt |
 | `08-scoring-and-tiering.md` | Scoring, confidence, tiers, ordering | master prompt |
 | `09-filter-options-and-ui.md` | Option lists, numeric ranges, UI pattern | master prompt |
 | `10-rationale-and-output.md` | Rationale, rules, blockers, JSON schema, worked example | master prompt |
-| `11-output-validation.md` | Code checks and the repair-turn instruction | repair turn |
+| `11-output-validation.md` | Code checks and automatic fixes (no prompt) | after step 3 |
 
 Each skill doc has:
 
@@ -79,16 +91,19 @@ import it in `index.ts` and list it under a stage.
 
 **View prompts** (next to Generate) shows the fully assembled prompt of every stage — the base prompt plus
 the skill docs it's built from, with the file names — and the exact data sent. Before a run it previews
-from your current inputs; after a run it shows what was actually sent, including any repair turn.
+from your current inputs; after a run it shows what was actually sent.
 The **Skill docs** toggle in that panel shows each markdown file in full.
 
 ## Output
 
 - **Filter table** — tier, rank, name, UI pattern, options, confidence, rationale, supporting sources,
-  coverage / top-value share / listing fill %, and ISQ gaps.
+  coverage / top-value share / listing fill % (filled in by code), and ISQ gaps.
+- **See it on a page** — a demo search page: Tier 1 in the filter bar, Tier 2 under "More filters",
+  Tier 3 specs shown on the product cards.
+- **Save results + download .md** — keeps runs on this device (reopen them from "View saved results").
 - **Evidence** — the dimension/value demand tables and the listing spec profile the master prompt received.
 - **Raw JSON**, **Export JSON**, **Export CSV**.
-- **Warnings** — anything the validator still flags after the repair turn.
+- **Warnings** — every automatic fix, and anything code couldn't fix.
 
 ## Code map
 
@@ -96,8 +111,10 @@ The **Skill docs** toggle in that panel shows each markdown file in full.
 |------|------|
 | `src/lib/data.ts` | Parsing, column detection, term mining, aggregation, listing flattening & profiling (no model) |
 | `src/lib/prompts.ts` | Builds each stage's user message (the data blocks) |
-| `src/lib/llm.ts` | OpenRouter/LiteLLM client: JSON mode with fallback, retry on 429/5xx, JSON extraction |
-| `src/lib/filter-gen.ts` | The pipeline: prepare → label ∥ map fields → design → validate/repair |
+| `src/lib/llm.ts` | OpenRouter/LiteLLM client: JSON mode, reasoning budget, price routing (with fallback), retry on 429/5xx |
+| `src/lib/filter-gen.ts` | The pipeline: prepare → label ∥ merge specs → design → link evidence & auto-fix; cache; cost estimate |
+| `src/lib/export.ts` | Markdown export for saved runs |
+| `src/components/SearchPreview.tsx` | Demo search page |
 | `src/skills/` | Skill docs and the prompt composer |
 | `src/routes/index.tsx` | The page |
 

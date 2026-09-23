@@ -89,5 +89,3 @@ export function composeSystemPrompt(stage: StageId): string {
     .filter(Boolean)
     .join(DIVIDER);
 }
-
-export const REPAIR_INSTRUCTION = SKILLS.validation.prompt;

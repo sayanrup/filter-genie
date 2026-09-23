@@ -4,7 +4,7 @@ Turns a raw product export — any JSON shape, CSV or XLSX — into flat records
 source field names onto canonical spec names so that fill rates can be measured per spec.
 
 - **Layer:** code (flattening) + prompt (field-mapping stage — its own model call)
-- **Used by:** stage 2 · listing field mapping
+- **Used by:** step 2 · spec-name merging (skipped when fewer than 2 spec names)
 - **Code:** `src/lib/data.ts` → `flattenListing()`, `rawFieldSummary()`; `src/lib/prompts.ts` → `buildFieldMapUser()`
 
 ## What the code does
@@ -13,25 +13,23 @@ source field names onto canonical spec names so that fill rates can be measured 
 2. Flattens nested objects to dotted paths (`specs.material`).
 3. Turns **name/value spec arrays** — e.g. `[{"name": "Material", "value": "MS"}]`, a common ISQ shape —
    into real keys (`Material: MS`).
-4. Summarises every source field: fill %, three sample values. Only this summary goes to the model;
-   the mapping is then applied by code to **all** listings (nothing is truncated or re-typed by the model).
-5. Without a successful mapping, a heuristic profile is used (ids/URLs/images ignored, price fields detected by name).
+4. **Maps fields by rule, for free** (`heuristicFieldMap()`): ids, URLs, images, contacts, dates, ratings and
+   long free text → ignored; name/title → `@name`; category/mcat → `@category`; price/mrp/rate → `@price`;
+   unit/uom → `@unit`; everything else → a canonical spec name (`specs.isq_material_type` → `Material Type`).
+   Fields with the same canonical name merge automatically.
+5. Only when two or more spec names remain does the model get a call — and it sees just the spec names
+   with fill % and three sample values, and returns only the merges/removals. The mapping is then applied
+   by code to **all** listings.
 
 ## Prompt
 
-TASK: Map the fields of a messy product-listing export (one category) onto a clean, canonical schema so fill rates can be measured per spec. You receive every source field with its fill rate and up to three sample values. For each source field choose ONE target:
-- "@name" — the product title/name
-- "@price" — the price or price range (numbers, possibly with ₹ and "/ Piece")
-- "@unit" — the price unit (piece, sq ft, kg, set…) when it is a separate field
-- "@category" — category / MCAT / group name
-- "@ignore" — ids, URLs, images, descriptions, seller contact/company/address, dates, ratings, SEO text, and anything that is not a product attribute
-- otherwise a canonical SPEC NAME in Title Case, as a buyer-facing filter would label it ("Material", "Size", "Usage/Application", "Brand", "Roof Type")
+TASK: Clean up spec names from a product-listing export (one category) so fill rates can be measured per spec. Each line is one spec name as found in the data, with its fill rate and up to three sample values.
 
-RULES
-1. Different source fields that hold the same attribute MUST map to the identical spec name ("specs.material", "Material Type", "isq_material" → "Material").
-2. Keep spec names short and generic; don't put units or the category name in them.
-3. Decide by the field's name AND its samples. If you can't tell, use "@ignore".
+Return only the changes needed:
+- "merge": spec names that hold the SAME attribute, grouped under one short canonical Title Case name a buyer-facing filter would use ("Material Type", "Build Material" → "Material"; "Usage", "Application" → "Usage/Application"). Don't include units or the category name in names.
+- "drop": spec names that are not product attributes (seller info, marketing text, stock, delivery, payment terms, ids).
+Spec names you don't mention stay as they are. Decide by the name AND the samples; when unsure, leave a spec unchanged.
 
 OUTPUT:
-{ "fields": [["source field exactly as given", "target"], ...] }
-Include every source field.
+{"merge": {"Material": ["Material Type", "Build Material"]}, "drop": ["Delivery Time"]}
+Copy spec names exactly as given. Use {} and [] when nothing needs changing.

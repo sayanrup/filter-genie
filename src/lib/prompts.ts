@@ -1,21 +1,22 @@
 import {
   SOURCE_LABEL,
   type Aggregation,
-  type KeywordSource,
   type KeywordTable,
   type ListingProfile,
   type TermMining,
-  type rawFieldSummary,
+  type TermStat,
+  type specSummary,
 } from "./data";
-import { REPAIR_INSTRUCTION, composeSystemPrompt } from "@/skills";
+import { composeSystemPrompt } from "@/skills";
 
 /*
  * System prompts are assembled from the skill docs in src/skills (base.md + one .md per layer).
  * This file only builds the per-run USER messages — the data blocks the model reads:
- *   1. term labelling    — mined keyword terms to label with a dimension + clean value
- *   2. field mapping     — listing export fields to map onto canonical spec names
+ *   1. term labelling    — mined keyword terms (the ones code couldn't label itself)
+ *   2. field mapping     — canonical spec names to merge or drop
  *   3. filter design     — the computed evidence (dimension tables, context, ranking, listing profile)
  * All numbers the model sees in step 3 are computed by code, so it never has to add anything up.
+ * Every block is kept as small as it can be: input tokens are the bulk of a run's cost.
  */
 
 const fmt = (n: number) => Math.round(n).toLocaleString("en-IN");
@@ -26,8 +27,12 @@ function block(label: string, body: string) {
   return `<<<${label}\n${body.trim()}\n${label}>>>`;
 }
 
+/** Trim long text on a line break and collapse runs of blank lines / spaces (they cost tokens). */
 function clip(text: string, max: number) {
-  const t = text.trim();
+  const t = text
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n\n")
+    .trim();
   if (t.length <= max) return t;
   const cut = t.lastIndexOf("\n", max);
   return `${t.slice(0, cut > max * 0.7 ? cut : max)}\n[… truncated — ${fmt(t.length - max)} more characters not shown]`;
@@ -37,37 +42,14 @@ function clip(text: string, max: number) {
 
 export const TERM_LABEL_SYSTEM = composeSystemPrompt("label");
 
-function termSourceCell(t: TermMining["terms"][number], src: KeywordSource) {
-  const s = t.bySource[src];
-  return s ? `${s.keywords}/${fmt(s.demand)}` : "–";
-}
-
-export function buildTermLabelUser(tables: KeywordTable[], mining: TermMining) {
-  const sources = tables.map((t) => t.source);
-  const header = [
-    "term",
-    ...sources.map(
-      (s) =>
-        `${SOURCE_LABEL[s]} kws/${tables.find((t) => t.source === s)?.demandMetric ?? "count"}`,
-    ),
-    "hint",
-    "example keyword",
-  ].join(" | ");
-  const lines = mining.terms.map((t) =>
-    [
-      t.term,
-      ...sources.map((s) => termSourceCell(t, s)),
-      t.hint ? `[${t.hint}]` : "",
-      t.example,
-    ].join(" | "),
+export function buildTermLabelUser(terms: TermStat[], mining: TermMining) {
+  // No numbers: labelling doesn't need them. Skip the example when it's just the term itself.
+  const lines = terms.map((t) =>
+    t.example.toLowerCase().trim() === t.term ? t.term : `${t.term} | ${t.example}`,
   );
   return [
-    `Category core words (already excluded from the terms): ${mining.coreTerms.join(", ") || "(none detected)"}`,
-    `Keywords analysed: ${fmt(mining.totalKeywords)} across ${tables.map((t) => SOURCE_LABEL[t.source]).join(" + ")}.`,
-    "",
-    block("TERMS", [header, ...lines].join("\n")),
-    "",
-    "Label the terms now. Reply with the JSON object only.",
+    `Category words (not qualifiers): ${mining.coreTerms.join(", ") || "(none detected)"}`,
+    block("TERMS", `term | example keyword\n${lines.join("\n")}`),
   ].join("\n");
 }
 
@@ -75,18 +57,11 @@ export function buildTermLabelUser(tables: KeywordTable[], mining: TermMining) {
 
 export const FIELD_MAP_SYSTEM = composeSystemPrompt("fields");
 
-export function buildFieldMapUser(
-  summary: ReturnType<typeof rawFieldSummary>,
-  listingCount: number,
-) {
-  const lines = summary.map(
-    (f) => `${f.key} | ${f.fillPct}% | ${f.samples.map((s) => JSON.stringify(s)).join(", ")}`,
-  );
+export function buildFieldMapUser(summary: ReturnType<typeof specSummary>, listingCount: number) {
+  const lines = summary.map((f) => `${f.spec} | ${f.fillPct}% | ${f.samples.join(" / ")}`);
   return [
-    `${listingCount} listings. Fields (source field | filled | sample values):`,
-    block("FIELDS", lines.join("\n")),
-    "",
-    "Map every field. Reply with the JSON object only.",
+    `${listingCount} listings.`,
+    block("SPECS", `spec name | filled | samples\n${lines.join("\n")}`),
   ].join("\n");
 }
 
@@ -126,40 +101,50 @@ function formatSourceOverview(tables: KeywordTable[]) {
     .join("\n");
 }
 
+const SHORT: Record<string, string> = { internal: "INT", serp: "SERP" };
+const MAX_VALUES = 12;
+const MINOR_COVERAGE = 1; // % — dimensions below this in every source get one summary line
+
 function formatDimensions(agg: Aggregation, tables: KeywordTable[]) {
   const sources = tables.map((t) => t.source);
+  const tableOf = (s: string) => tables.find((t) => t.source === s)!;
   const out: string[] = [];
   out.push(
+    `Column prefixes: ${sources.map((s) => `${SHORT[s]} = ${SOURCE_LABEL[s]}`).join(", ")}.`,
     `Generic share (no qualifier at all): ${sources
-      .map((s) => `${SOURCE_LABEL[s]} ${pctStr(agg.genericShare[s] ?? 0)}`)
+      .map((s) => `${SHORT[s]} ${pctStr(agg.genericShare[s] ?? 0)}`)
       .join(" · ")}`,
   );
-  for (const d of agg.dimensions) {
+  const major = agg.dimensions.filter((d) =>
+    sources.some((s) => (d.bySource[s]?.coverage ?? 0) >= MINOR_COVERAGE),
+  );
+  const minor = agg.dimensions.filter((d) => !major.includes(d));
+
+  for (const d of major) {
     const head = sources
       .filter((s) => d.bySource[s])
       .map((s) => {
         const x = d.bySource[s]!;
-        return `${SOURCE_LABEL[s]}: coverage ${pctStr(x.coverage)}, top-value share ${pctStr(x.topShare)}, ${x.keywords} kws${
-          tables.find((t) => t.source === s)?.actionMetric
-            ? `, ${fmt(x.action)} ${tables.find((t) => t.source === s)!.actionMetric}`
-            : ""
+        const t = tableOf(s);
+        return `${SHORT[s]}: coverage ${pctStr(x.coverage)}, top-value share ${pctStr(x.topShare)}, ${x.keywords} kws${
+          t.actionMetric ? `, ${fmt(x.action)} ${t.actionMetric}` : ""
         }`;
       })
       .join(" · ");
     out.push("", `DIMENSION ${d.name} — ${head}`);
     const cols = sources.flatMap((s) => {
-      const t = tables.find((x) => x.source === s)!;
-      const c = [`${SOURCE_LABEL[s]} kws`, `${metricName(t)}`, "share"];
-      if (t.actionMetric) c.push(t.actionMetric);
-      for (const r of t.rateMetrics) c.push(r);
+      const t = tableOf(s);
+      const c = [`${SHORT[s]} ${metricName(t)}`, `${SHORT[s]} share`];
+      if (t.actionMetric) c.push(`${SHORT[s]} ${t.actionMetric}`);
+      for (const r of t.rateMetrics) c.push(`${SHORT[s]} ${r}`);
       return c;
     });
     out.push(`value | ${cols.join(" | ")}`);
-    for (const v of d.values.slice(0, 20)) {
+    for (const v of d.values.slice(0, MAX_VALUES)) {
       const cells = sources.flatMap((s) => {
-        const t = tables.find((x) => x.source === s)!;
+        const t = tableOf(s);
         const b = v.bySource[s];
-        const c = b ? [String(b.keywords), fmt(b.demand), pctStr(b.share)] : ["–", "–", "–"];
+        const c = b ? [fmt(b.demand), pctStr(b.share)] : ["–", "–"];
         if (t.actionMetric) c.push(b ? fmt(b.action) : "–");
         for (const r of t.rateMetrics)
           c.push(b && b.rates[r] !== undefined ? pctStr(b.rates[r]!) : "–");
@@ -167,38 +152,51 @@ function formatDimensions(agg: Aggregation, tables: KeywordTable[]) {
       });
       out.push(`${v.value} | ${cells.join(" | ")}`);
     }
-    if (d.values.length > 20) out.push(`(+${d.values.length - 20} smaller values not shown)`);
+    if (d.values.length > MAX_VALUES) out.push(`(+${d.values.length - MAX_VALUES} smaller values)`);
+  }
+  if (minor.length) {
+    out.push(
+      "",
+      `Minor dimensions (coverage < ${MINOR_COVERAGE}% everywhere): ${minor
+        .map(
+          (d) =>
+            `${d.name} (${d.values
+              .map((v) => v.value)
+              .slice(0, 4)
+              .join(", ")})`,
+        )
+        .join("; ")}`,
+    );
   }
   return out.join("\n");
 }
 
 function formatRawTerms(mining: TermMining, tables: KeywordTable[]) {
   const sources = tables.map((t) => t.source);
-  const lines = mining.terms.slice(0, 120).map(
+  const lines = mining.terms.slice(0, 80).map(
     (t) =>
-      `${t.term}${t.hint ? ` [${t.hint}]` : ""} | ${sources
+      `${t.term} | ${sources
         .map((s) => {
           const x = t.bySource[s];
-          return x
-            ? `${SOURCE_LABEL[s]} ${x.keywords} kws / ${fmt(x.demand)}`
-            : `${SOURCE_LABEL[s]} –`;
+          return `${SHORT[s]} ${x ? `${x.keywords} kws / ${fmt(x.demand)}` : "–"}`;
         })
         .join(" | ")}`,
   );
   return [
-    "Terms could not be pre-grouped into dimensions, so raw term totals are listed. Group them into dimensions yourself; keywords can contain several terms, so term totals overlap — don't add them up, cite them individually.",
+    "Terms could not be grouped into dimensions, so raw term totals are listed. Group them yourself; keywords contain several terms, so totals overlap — cite them individually, never add them up.",
     ...lines,
   ].join("\n");
 }
 
-function formatTopKeywords(tables: KeywordTable[], n = 25) {
+function formatTopKeywords(tables: KeywordTable[], n = 10) {
   return tables
     .map((t) => {
       const rows = t.rows.slice(0, n).map((r) => {
-        const extra = t.actionMetric ? ` · ${fmt(r.action)} ${t.actionMetric}` : "";
-        return `${r.query} — ${fmt(r.demand)} ${metricName(t)}${extra}`;
+        const extra = t.actionMetric ? ` / ${fmt(r.action)}` : "";
+        return `${r.query} — ${fmt(r.demand)}${extra}`;
       });
-      return `${SOURCE_LABEL[t.source]} (top ${rows.length} by ${metricName(t)}):\n${rows.join("\n")}`;
+      const unit = `${metricName(t)}${t.actionMetric ? ` / ${t.actionMetric}` : ""}`;
+      return `Top ${rows.length} ${SOURCE_LABEL[t.source]} keywords (${unit}):\n${rows.join("\n")}`;
     })
     .join("\n\n");
 }
@@ -209,15 +207,27 @@ function formatLakh(n: number) {
   return `₹${fmt(n)}`;
 }
 
+const MAX_SPECS = 30;
+
 function formatListing(p: ListingProfile) {
+  // Specs almost nobody fills are summarised by name only.
+  const shown = p.fields.filter((f) => f.fillPct >= 5).slice(0, MAX_SPECS);
+  const rare = p.fields.filter((f) => !shown.includes(f));
   const lines = [
-    `${p.count} listings profiled${p.mapped ? " (source fields merged onto canonical specs)" : " (raw field names)"}.`,
+    `${p.count} listings profiled.`,
     "spec | filled | distinct values | most common values (count)",
-    ...p.fields.map(
+    ...shown.map(
       (f) =>
-        `${f.key} | ${f.fillPct}% (${f.filled}/${p.count}) | ${f.distinct} | ${f.top.map(([v, n]) => `${v} (${n})`).join(", ")}`,
+        `${f.key} | ${f.fillPct}% | ${f.distinct} | ${f.top
+          .slice(0, 5)
+          .map(([v, n]) => `${v.slice(0, 30)} (${n})`)
+          .join(", ")}`,
     ),
   ];
+  if (rare.length)
+    lines.push(
+      `Rarely filled (< 5% or beyond top ${MAX_SPECS}): ${rare.map((f) => f.key).join(", ")}`,
+    );
   if (p.price) {
     const u = p.price.unit ? ` per ${p.price.unit}` : "";
     lines.push(
@@ -264,7 +274,7 @@ export function buildDesignUser(ev: DesignEvidence) {
     );
   }
   if (ev.context.trim())
-    parts.push("", "## B. CATEGORY CONTEXT", block("CONTEXT", clip(ev.context, 10000)));
+    parts.push("", "## B. CATEGORY CONTEXT", block("CONTEXT", clip(ev.context, 8000)));
   if (ev.specs.trim())
     parts.push(
       "",
@@ -280,15 +290,4 @@ export function buildDesignUser(ev: DesignEvidence) {
 
   parts.push("", "Design the filter panel now. Reply with the JSON object only.");
   return parts.join("\n");
-}
-
-// ───────────────────────────── repair turn ─────────────────────────────
-
-export function buildRepairUser(issues: string[]) {
-  return [
-    "Your answer has these problems:",
-    ...issues.map((i) => `- ${i}`),
-    "",
-    REPAIR_INSTRUCTION,
-  ].join("\n");
 }

@@ -1,10 +1,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- model replies are untyped JSON and are normalised field by field */
 import {
   aggregate,
+  autoLabels,
   flattenListing,
+  heuristicFieldMap,
   mineTerms,
   profileListings,
-  rawFieldSummary,
+  specSummary,
+  termsForModel,
   toKeywordTable,
   type Aggregation,
   type KeywordTable,
@@ -12,6 +15,7 @@ import {
   type Row,
   type TermLabel,
   type TermMining,
+  type TermStat,
 } from "./data";
 import { addUsage, chatJson, type ChatMessage, type LlmSettings, type Usage } from "./llm";
 import {
@@ -20,7 +24,6 @@ import {
   TERM_LABEL_SYSTEM,
   buildDesignUser,
   buildFieldMapUser,
-  buildRepairUser,
   buildTermLabelUser,
 } from "./prompts";
 import type { StageId } from "@/skills";
@@ -105,7 +108,7 @@ export const INITIAL_STEPS: Step[] = [
   { id: "label", label: "Label keyword terms", status: "pending" },
   { id: "fields", label: "Map listing fields", status: "pending" },
   { id: "design", label: "Design the filter panel", status: "pending" },
-  { id: "check", label: "Check & repair output", status: "pending" },
+  { id: "check", label: "Check & fix output", status: "pending" },
 ];
 
 // ───────────────────────────── deterministic prep ─────────────────────────────
@@ -113,7 +116,12 @@ export const INITIAL_STEPS: Step[] = [
 export interface Prepared {
   tables: KeywordTable[];
   mining: TermMining | null;
+  /** Terms code couldn't label itself — the only ones sent to the model. */
+  modelTerms: TermStat[];
   flatListings: Record<string, string>[];
+  /** Code-only field roles / canonical spec names for every source field. */
+  fieldMap: Map<string, string>;
+  specs: ReturnType<typeof specSummary>;
 }
 
 export function prepare(inputs: PipelineInputs): Prepared {
@@ -123,38 +131,55 @@ export function prepare(inputs: PipelineInputs): Prepared {
   ].filter((t): t is KeywordTable => t !== null && t.rows.length > 0);
   const mining = tables.length ? mineTerms(tables) : null;
   const flatListings = inputs.listingRows.slice(0, 500).map((r) => flattenListing(r));
-  return { tables, mining, flatListings };
+  const fieldMap = heuristicFieldMap(flatListings);
+  return {
+    tables,
+    mining,
+    modelTerms: mining ? termsForModel(mining) : [],
+    flatListings,
+    fieldMap,
+    specs: specSummary(flatListings, fieldMap),
+  };
+}
+
+/** The field-mapping call only helps when there are at least two specs that might be synonyms. */
+const needsFieldCall = (prep: Prepared) => prep.specs.length >= 2;
+
+function labelMessages(prep: Prepared): ChatMessage[] {
+  return [
+    { role: "system", content: TERM_LABEL_SYSTEM },
+    { role: "user", content: buildTermLabelUser(prep.modelTerms, prep.mining!) },
+  ];
+}
+
+function fieldMessages(prep: Prepared): ChatMessage[] {
+  return [
+    { role: "system", content: FIELD_MAP_SYSTEM },
+    { role: "user", content: buildFieldMapUser(prep.specs, prep.flatListings.length) },
+  ];
 }
 
 /** Prompts as they'd be sent, before any model call (for the "View prompts" panel). */
 export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
   const prep = prepare(inputs);
   const out: PromptRecord[] = [];
-  if (prep.mining && prep.mining.terms.length) {
+  if (prep.modelTerms.length) {
     out.push({
       id: "label",
       stage: "label",
       title: "1 · Label keyword terms",
-      messages: [
-        { role: "system", content: TERM_LABEL_SYSTEM },
-        { role: "user", content: buildTermLabelUser(prep.tables, prep.mining) },
-      ],
+      messages: labelMessages(prep),
     });
   }
-  if (prep.flatListings.length) {
+  if (needsFieldCall(prep)) {
     out.push({
       id: "fields",
       stage: "fields",
-      title: "2 · Map listing fields",
-      messages: [
-        { role: "system", content: FIELD_MAP_SYSTEM },
-        {
-          role: "user",
-          content: buildFieldMapUser(rawFieldSummary(prep.flatListings), prep.flatListings.length),
-        },
-      ],
+      title: "2 · Merge listing spec names",
+      messages: fieldMessages(prep),
     });
   }
+  const auto = prep.mining ? autoLabels(prep.mining) : [];
   out.push({
     id: "design",
     stage: "design",
@@ -167,13 +192,16 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
           category: null,
           tables: prep.tables,
           mining: prep.mining,
-          aggregation: null,
+          // Preview with the labels code already knows; step 1's labels are added at run time.
+          aggregation: auto.length ? aggregate(prep.tables, auto) : null,
           context: inputs.context,
           specs: inputs.specs,
-          listing: prep.flatListings.length ? profileListings(prep.flatListings) : null,
+          listing: prep.flatListings.length
+            ? profileListings(prep.flatListings, prep.fieldMap)
+            : null,
         }).concat(
-          prep.mining
-            ? "\n\n[Preview: at run time the keyword section is replaced by the dimension/value tables built from step 1's labels.]"
+          prep.modelTerms.length
+            ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
             : "",
         ),
       },
@@ -182,91 +210,273 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
   return out;
 }
 
-// ───────────────────────────── validation ─────────────────────────────
+// ───────────────────────────── stage caches ─────────────────────────────
+
+/*
+ * Labelling and field mapping depend only on the keyword / listing data, not on the context doc or
+ * ranking. Re-running Generate after editing those reuses the earlier answers instead of paying again.
+ */
+const stageCache = new Map<string, unknown>();
+
+function cacheKey(settings: LlmSettings, messages: ChatMessage[]) {
+  return `${settings.provider}|${settings.baseUrl}|${settings.model}\n${messages.map((m) => m.content).join("\n")}`;
+}
+
+function remember(key: string, value: unknown) {
+  stageCache.set(key, value);
+  if (stageCache.size > 24) stageCache.delete(stageCache.keys().next().value as string);
+}
+
+// ───────────────────────────── parsing model answers ─────────────────────────────
+
+/** {"dimensions": {"Material": {"PUF": ["puf","puff"]}}} → labels (older [[term, dim, value]] also accepted). */
+export function parseLabels(data: any, known: Set<string>): TermLabel[] {
+  const out: TermLabel[] = [];
+  const push = (term: unknown, dimension: unknown, value: unknown) => {
+    if (typeof term !== "string" || typeof dimension !== "string" || typeof value !== "string")
+      return;
+    const t = term.toLowerCase().trim();
+    if (known.has(t) && dimension.trim() && value.trim())
+      out.push({ term: t, dimension: dimension.trim(), value: value.trim() });
+  };
+  const dims = data?.dimensions;
+  if (dims && typeof dims === "object" && !Array.isArray(dims)) {
+    for (const [dim, values] of Object.entries(dims as Record<string, unknown>)) {
+      if (!values || typeof values !== "object") continue;
+      for (const [value, terms] of Object.entries(values as Record<string, unknown>)) {
+        for (const term of Array.isArray(terms) ? terms : [terms]) push(term, dim, value);
+      }
+    }
+  }
+  if (Array.isArray(data?.labels)) {
+    for (const l of data.labels) {
+      if (Array.isArray(l)) push(l[0], l[1], l[2]);
+      else push(l?.term, l?.dimension, l?.value);
+    }
+  }
+  return out;
+}
+
+/** Apply {"merge": {...}, "drop": [...]} from the model on top of the code-only field map. */
+export function applySpecMerges(
+  fieldMap: Map<string, string>,
+  data: any,
+): { map: Map<string, string>; changes: number } {
+  const rename = new Map<string, string>();
+  let changes = 0;
+  const merge = data?.merge && typeof data.merge === "object" ? data.merge : {};
+  for (const [target, sources] of Object.entries(merge as Record<string, unknown>)) {
+    if (!target.trim()) continue;
+    for (const src of Array.isArray(sources) ? sources : [])
+      if (typeof src === "string") rename.set(src.toLowerCase(), target.trim());
+  }
+  for (const d of Array.isArray(data?.drop) ? data.drop : [])
+    if (typeof d === "string") rename.set(d.toLowerCase(), "@ignore");
+
+  const map = new Map<string, string>();
+  for (const [key, role] of fieldMap) {
+    const next = role.startsWith("@") ? role : (rename.get(role.toLowerCase()) ?? role);
+    if (next !== role) changes++;
+    map.set(key, next);
+  }
+  return { map, changes };
+}
+
+// ───────────────────────────── normalise, link evidence, fix ─────────────────────────────
 
 const TIER_ALIASES: Record<string, Tier> = { "1": "Tier 1", "2": "Tier 2", "3": "Tier 3" };
 
-function normalizeResult(raw: any): FilterResult {
-  const filters: FilterRow[] = (Array.isArray(raw?.filters) ? raw.filters : []).map(
-    (f: any, i: number) => {
-      const tierDigit = String(f?.tier ?? "").match(/[123]/)?.[0] ?? "2";
-      const conf = String(f?.confidence ?? "").toLowerCase();
-      const num = (v: unknown) =>
-        typeof v === "number" && Number.isFinite(v)
-          ? v
-          : typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))
-            ? Number(v)
-            : null;
-      return {
-        rank: Number(f?.rank) || i + 1,
-        tier: TIER_ALIASES[tierDigit]!,
-        name: String(f?.name ?? "").trim(),
-        ui_pattern: String(f?.ui_pattern ?? "").trim(),
-        values: Array.isArray(f?.values)
-          ? f.values.map((v: unknown) => String(v).trim()).filter(Boolean)
-          : [],
-        confidence: conf.startsWith("h") ? "High" : conf.startsWith("l") ? "Low" : "Medium",
-        rationale: String(f?.rationale ?? "").trim(),
-        sources: Array.isArray(f?.sources) ? f.sources.map(String) : [],
-        coverage_pct: num(f?.coverage_pct),
-        top_value_share_pct: num(f?.top_value_share_pct),
-        listing_fill_pct: num(f?.listing_fill_pct),
-        needs_new_isq: Boolean(f?.needs_new_isq),
-        isq_note: f?.isq_note ? String(f.isq_note) : null,
-      };
-    },
-  );
-  const out: FilterResult = {
+interface RawLinks {
+  dimension: string | null;
+  listing_spec: string | null;
+  backing: string[];
+}
+
+function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } {
+  const list: any[] = Array.isArray(raw?.filters) ? raw.filters : [];
+  const links: RawLinks[] = [];
+  const filters: FilterRow[] = list.map((f: any, i: number) => {
+    const tierDigit = String(f?.tier ?? "").match(/[123]/)?.[0] ?? "2";
+    const conf = String(f?.confidence ?? "").toLowerCase();
+    links.push({
+      dimension: typeof f?.dimension === "string" && f.dimension.trim() ? f.dimension.trim() : null,
+      listing_spec:
+        typeof f?.listing_spec === "string" && f.listing_spec.trim() ? f.listing_spec.trim() : null,
+      backing: Array.isArray(f?.backing) ? f.backing.map(String) : [],
+    });
+    return {
+      rank: Number(f?.rank) || i + 1,
+      tier: TIER_ALIASES[tierDigit]!,
+      name: String(f?.name ?? "").trim(),
+      ui_pattern: String(f?.ui_pattern ?? "").trim(),
+      values: Array.isArray(f?.values)
+        ? f.values.map((v: unknown) => String(v).trim()).filter(Boolean)
+        : [],
+      confidence: conf.startsWith("h") ? "High" : conf.startsWith("l") ? "Low" : "Medium",
+      rationale: String(f?.rationale ?? "").trim(),
+      needs_new_isq: Boolean(f?.needs_new_isq),
+      isq_note: f?.isq_note ? String(f.isq_note) : null,
+    };
+  });
+  const result: FilterResult = {
     filters,
     interaction_rules: Array.isArray(raw?.interaction_rules)
       ? raw.interaction_rules.map(String)
       : [],
     blockers: Array.isArray(raw?.blockers) ? raw.blockers.map(String) : [],
   };
-  if (raw?.category_name) out.category_name = String(raw.category_name);
-  return out;
+  if (raw?.category_name) result.category_name = String(raw.category_name);
+  return { result, links };
 }
 
-export function validateResult(r: FilterResult): string[] {
-  const issues: string[] = [];
-  if (r.filters.length === 0) return ['"filters" is empty.'];
-  const t1 = r.filters.filter((f) => f.tier === "Tier 1");
-  const filterable = r.filters.filter((f) => f.tier !== "Tier 3").length;
-  if (t1.length > 5)
-    issues.push(`Tier 1 has ${t1.length} filters; the maximum is 5. Move the weakest to Tier 2.`);
-  if (t1.length < 3 && filterable >= 3)
-    issues.push(
-      `Tier 1 has only ${t1.length} filter(s); it needs 3–5. Promote the strongest Tier 2 filters.`,
-    );
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-  const seen = new Map<string, number>();
+/**
+ * Fill coverage / top-value share / fill % / sources from the evidence rows the model linked to.
+ * Numbers come from code, never from the model. Falls back to matching the filter name.
+ */
+export function attachEvidence(
+  result: FilterResult,
+  links: RawLinks[],
+  aggregation: Aggregation | null,
+  listing: ListingProfile | null,
+): string[] {
+  const notes: string[] = [];
+  const dims = new Map((aggregation?.dimensions ?? []).map((d) => [norm(d.name), d]));
+  const specs = new Map((listing?.fields ?? []).map((f) => [norm(f.key), f]));
+  result.filters.forEach((f, i) => {
+    const link = links[i] ?? { dimension: null, listing_spec: null, backing: [] };
+    let dim = link.dimension ? dims.get(norm(link.dimension)) : undefined;
+    if (link.dimension && !dim && aggregation)
+      notes.push(
+        `"${f.name}" pointed at a keyword dimension "${link.dimension}" that isn't in the evidence; link cleared.`,
+      );
+    dim ??= dims.get(norm(f.name));
+    let spec = link.listing_spec ? specs.get(norm(link.listing_spec)) : undefined;
+    if (link.listing_spec && !spec && listing)
+      notes.push(
+        `"${f.name}" pointed at a listing spec "${link.listing_spec}" that isn't in the evidence; link cleared.`,
+      );
+    spec ??= specs.get(norm(f.name));
+
+    const sources: string[] = [];
+    if (dim) {
+      let best: { coverage: number; topShare: number } | null = null;
+      for (const [src, st] of Object.entries(dim.bySource)) {
+        if (!st) continue;
+        sources.push(src);
+        if (!best || st.coverage > best.coverage) best = st;
+      }
+      f.coverage_pct = best?.coverage ?? null;
+      f.top_value_share_pct = best?.topShare ?? null;
+    } else {
+      f.coverage_pct = null;
+      f.top_value_share_pct = null;
+    }
+    f.listing_fill_pct = spec ? spec.fillPct : null;
+    if (spec) sources.push("listings");
+    for (const b of link.backing) if (b === "context" || b === "ranking") sources.push(b);
+    f.sources = sources;
+  });
+  return notes;
+}
+
+const MAX_OPTIONS = 12;
+
+/**
+ * Deterministic fixes instead of a second (full-price) model call. Returns a note per change so
+ * nothing changes silently, plus warnings for what can't be fixed in code.
+ */
+export function fixResult(r: FilterResult): { fixes: string[]; warnings: string[] } {
+  const fixes: string[] = [];
+  const warnings: string[] = [];
+  const confScore: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
+  const byTier = (t: Tier) => r.filters.filter((f) => f.tier === t).sort((a, b) => a.rank - b.rank);
+
+  // Duplicates (same normalised name) — keep the first.
+  const seen = new Set<string>();
+  r.filters = r.filters.filter((f) => {
+    const k = norm(f.name);
+    if (!k) {
+      fixes.push("Removed a filter with no name.");
+      return false;
+    }
+    if (seen.has(k)) {
+      fixes.push(`Removed a duplicate "${f.name}".`);
+      return false;
+    }
+    seen.add(k);
+    return true;
+  });
+
   for (const f of r.filters) {
-    const key = f.name.toLowerCase().replace(/[^a-z0-9]/g, "");
-    seen.set(key, (seen.get(key) ?? 0) + 1);
-    if (!f.name) issues.push("A filter has no name.");
-    if (f.tier !== "Tier 3" && f.values.length < 2)
-      issues.push(
-        `"${f.name}" (${f.tier}) has ${f.values.length} option(s); filters need at least 2 real options.`,
+    const junk = f.values.filter((v) => v.length < 2 || /^\d+(\.\d+)?$/.test(v));
+    if (junk.length) {
+      f.values = f.values.filter((v) => !junk.includes(v));
+      fixes.push(`"${f.name}": dropped options that aren't labels (${junk.join(", ")}).`);
+    }
+    const unique = [...new Map(f.values.map((v) => [v.toLowerCase(), v])).values()];
+    if (unique.length !== f.values.length) f.values = unique;
+    if (f.values.length > MAX_OPTIONS) {
+      const hasOther = f.values.some((v) => /^other/i.test(v));
+      f.values = [...f.values.filter((v) => !/^other/i.test(v)).slice(0, MAX_OPTIONS - 1), "Other"];
+      fixes.push(
+        `"${f.name}": kept the top ${MAX_OPTIONS - 1} options${hasOther ? "" : ' and added "Other"'}.`,
       );
-    if (f.values.length > 15)
-      issues.push(
-        `"${f.name}" has ${f.values.length} options; cap at ~10 and fold the tail into "Other".`,
-      );
-    const junk = f.values.filter((v) => v.length < 2 || /^\d+$/.test(v));
-    if (junk.length)
-      issues.push(
-        `"${f.name}" has options that aren't real labels: ${junk.map((j) => JSON.stringify(j)).join(", ")}.`,
-      );
-    if (!/\d/.test(f.rationale) && !/context|interview|ranking|ranked|CM\b/i.test(f.rationale))
-      issues.push(
-        `The rationale for "${f.name}" cites no evidence (no number and no named source).`,
-      );
-    if (f.tier === "Tier 3" && !/display/i.test(f.ui_pattern))
-      issues.push(`"${f.name}" is Tier 3, so its ui_pattern must be "display only".`);
+    }
+    if (f.tier !== "Tier 3" && f.values.length < 2) {
+      f.tier = "Tier 3";
+      f.ui_pattern = "display only";
+      fixes.push(`"${f.name}" had fewer than 2 options, so it moved to Tier 3 (display only).`);
+    }
+    if (f.tier === "Tier 3" && !/display/i.test(f.ui_pattern)) f.ui_pattern = "display only";
+    if (
+      !/\d/.test(f.rationale) &&
+      !/context|interview|ranking|ranked|\bCM\b|listing/i.test(f.rationale)
+    )
+      warnings.push(`The rationale for "${f.name}" cites no evidence.`);
   }
-  for (const [k, n] of seen)
-    if (n > 1 && k) issues.push(`More than one filter is named like "${k}"; merge duplicates.`);
-  return issues;
+
+  // Tier 1 size: 3–5.
+  const t1 = byTier("Tier 1");
+  if (t1.length > 5) {
+    for (const f of t1.slice(5)) f.tier = "Tier 2";
+    fixes.push(
+      `Tier 1 had ${t1.length} filters; moved ${t1
+        .slice(5)
+        .map((f) => `"${f.name}"`)
+        .join(", ")} to Tier 2.`,
+    );
+  } else if (t1.length < 3) {
+    const pool = byTier("Tier 2").sort(
+      (a, b) => (confScore[a.confidence] ?? 1) - (confScore[b.confidence] ?? 1) || a.rank - b.rank,
+    );
+    const promote = pool.slice(0, 3 - t1.length);
+    for (const f of promote) f.tier = "Tier 1";
+    if (promote.length)
+      fixes.push(
+        `Tier 1 had ${t1.length} filter(s); promoted ${promote.map((f) => `"${f.name}"`).join(", ")} from Tier 2.`,
+      );
+  }
+
+  // Renumber ranks 1…n per tier, keeping the model's order (promoted filters go last in Tier 1).
+  for (const t of ["Tier 1", "Tier 2", "Tier 3"] as Tier[]) {
+    const inTier = r.filters.filter((f) => f.tier === t);
+    const original = new Map(inTier.map((f) => [f, f.rank]));
+    inTier.sort((a, b) => original.get(a)! - original.get(b)!).forEach((f, i) => (f.rank = i + 1));
+  }
+
+  // Every ISQ gap gets a blocker.
+  r.blockers ??= [];
+  for (const f of r.filters.filter((x) => x.needs_new_isq)) {
+    if (!r.blockers.some((b) => b.toLowerCase().includes(f.name.toLowerCase()))) {
+      r.blockers.push(
+        `${f.name}: ${f.isq_note || "not captured on listings — add it to the seller form."}`,
+      );
+      fixes.push(`Added a blocker for "${f.name}" (needs a new ISQ).`);
+    }
+  }
+  return { fixes, warnings };
 }
 
 // ───────────────────────────── run ─────────────────────────────
@@ -282,7 +492,9 @@ export async function runPipeline(
   hooks: RunHooks,
 ): Promise<PipelineRun> {
   const { onStep, signal } = hooks;
-  const opts = (maxTokens: number) => (signal ? { maxTokens, signal } : { maxTokens });
+  // Small tasks don't need reasoning; the design step gets a little.
+  const opts = (maxTokens: number, reasoning: "off" | "low") =>
+    signal ? { maxTokens, reasoning, signal } : { maxTokens, reasoning };
   let usage: Usage = {};
   let calls = 0;
   const prompts: PromptRecord[] = [];
@@ -292,12 +504,13 @@ export async function runPipeline(
   onStep("prepare", "running");
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
+  const auto = prep.mining ? autoLabels(prep.mining) : [];
   onStep(
     "prepare",
     "done",
     [
       kwCount
-        ? `${kwCount.toLocaleString()} keywords, ${prep.mining?.terms.length ?? 0} terms`
+        ? `${kwCount.toLocaleString()} keywords · ${auto.length} terms labelled by code`
         : "no keywords",
       prep.flatListings.length ? `${prep.flatListings.length} listings` : "",
     ]
@@ -305,49 +518,45 @@ export async function runPipeline(
       .join(" · "),
   );
 
-  // 2 + 3 · labelling and field mapping run in parallel
+  // 2 + 3 · labelling and spec-name merging run in parallel
   const labelTask = async (): Promise<{ labels: TermLabel[]; category: string | null }> => {
-    if (!prep.mining || prep.mining.terms.length === 0) {
-      onStep("label", "skipped", "no keyword data");
-      return { labels: [], category: null };
+    if (!prep.mining || prep.modelTerms.length === 0) {
+      onStep("label", "skipped", prep.mining ? "all terms labelled by code" : "no keyword data");
+      return { labels: auto, category: null };
     }
-    onStep("label", "running");
-    const messages: ChatMessage[] = [
-      { role: "system", content: TERM_LABEL_SYSTEM },
-      { role: "user", content: buildTermLabelUser(prep.tables, prep.mining) },
-    ];
+    const messages = labelMessages(prep);
     prompts.push({ id: "label", stage: "label", title: "1 · Label keyword terms", messages });
+    const key = cacheKey(settings, messages);
+    const known = new Set(prep.modelTerms.map((t) => t.term));
     try {
-      const res = await chatJson<{ category_name?: string; labels?: unknown[] }>(
-        settings,
-        messages,
-        opts(6000),
+      let data = stageCache.get(key);
+      const cached = Boolean(data);
+      if (!cached) {
+        onStep("label", "running");
+        const res = await chatJson<unknown>(settings, messages, opts(2500, "off"));
+        usage = addUsage(usage, res.usage);
+        calls++;
+        data = res.data;
+        remember(key, data);
+      }
+      const labels = parseLabels(data, known);
+      onStep(
+        "label",
+        "done",
+        `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}`,
       );
-      usage = addUsage(usage, res.usage);
-      calls++;
-      const known = new Set(prep.mining.terms.map((t) => t.term));
-      const labels: TermLabel[] = (res.data.labels ?? [])
-        .map((l) =>
-          Array.isArray(l) ? l : [(l as any)?.term, (l as any)?.dimension, (l as any)?.value],
-        )
-        .filter(
-          (l) => typeof l[0] === "string" && typeof l[1] === "string" && typeof l[2] === "string",
-        )
-        .map((l) => ({
-          term: String(l[0]).toLowerCase().trim(),
-          dimension: String(l[1]).trim(),
-          value: String(l[2]).trim(),
-        }))
-        .filter((l) => known.has(l.term) && l.dimension && l.value);
-      onStep("label", "done", `${labels.length} of ${prep.mining.terms.length} terms labelled`);
-      return { labels, category: res.data.category_name ?? null };
+      const category = (data as any)?.category_name;
+      return {
+        labels: [...auto, ...labels],
+        category: typeof category === "string" ? category : null,
+      };
     } catch (err) {
       if ((err as Error).name === "AbortError") throw err;
       warnings.push(
-        `Term labelling failed (${(err as Error).message}); the design step used raw term totals instead.`,
+        `Term labelling failed (${(err as Error).message}); only code-labelled terms (price, location, size) were grouped.`,
       );
-      onStep("label", "error", "fell back to raw term totals");
-      return { labels: [], category: null };
+      onStep("label", "error", "used code labels only");
+      return { labels: auto, category: null };
     }
   };
 
@@ -356,34 +565,44 @@ export async function runPipeline(
       onStep("fields", "skipped", "no listings");
       return null;
     }
-    onStep("fields", "running");
-    const summary = rawFieldSummary(prep.flatListings);
-    const messages: ChatMessage[] = [
-      { role: "system", content: FIELD_MAP_SYSTEM },
-      { role: "user", content: buildFieldMapUser(summary, prep.flatListings.length) },
-    ];
-    prompts.push({ id: "fields", stage: "fields", title: "2 · Map listing fields", messages });
+    if (!needsFieldCall(prep)) {
+      onStep("fields", "skipped", "mapped by code");
+      return profileListings(prep.flatListings, prep.fieldMap);
+    }
+    const messages = fieldMessages(prep);
+    prompts.push({
+      id: "fields",
+      stage: "fields",
+      title: "2 · Merge listing spec names",
+      messages,
+    });
+    const key = cacheKey(settings, messages);
     try {
-      const res = await chatJson<{ fields?: unknown[] }>(settings, messages, opts(4000));
-      usage = addUsage(usage, res.usage);
-      calls++;
-      const mapping = new Map<string, string>();
-      for (const f of res.data.fields ?? []) {
-        const pair = Array.isArray(f) ? f : [(f as any)?.source, (f as any)?.target];
-        if (typeof pair[0] === "string" && typeof pair[1] === "string")
-          mapping.set(pair[0], pair[1].trim());
+      let data = stageCache.get(key);
+      const cached = Boolean(data);
+      if (!cached) {
+        onStep("fields", "running");
+        const res = await chatJson<unknown>(settings, messages, opts(1500, "off"));
+        usage = addUsage(usage, res.usage);
+        calls++;
+        data = res.data;
+        remember(key, data);
       }
-      if (mapping.size === 0) throw new Error("no field mapping returned");
-      const profile = profileListings(prep.flatListings, mapping);
-      onStep("fields", "done", `${profile.fields.length} specs from ${summary.length} fields`);
+      const { map, changes } = applySpecMerges(prep.fieldMap, data);
+      const profile = profileListings(prep.flatListings, map);
+      onStep(
+        "fields",
+        "done",
+        `${profile.fields.length} specs · ${changes} field(s) merged or dropped${cached ? " · reused (no cost)" : ""}`,
+      );
       return profile;
     } catch (err) {
       if ((err as Error).name === "AbortError") throw err;
       warnings.push(
-        `Listing field mapping failed (${(err as Error).message}); raw field names were profiled instead.`,
+        `Spec-name merging failed (${(err as Error).message}); the code-only field mapping was used.`,
       );
-      onStep("fields", "error", "profiled raw field names");
-      return profileListings(prep.flatListings);
+      onStep("fields", "error", "used code mapping");
+      return profileListings(prep.flatListings, prep.fieldMap);
     }
   };
 
@@ -400,7 +619,7 @@ export async function runPipeline(
 
   // 4 · design
   onStep("design", "running");
-  let messages: ChatMessage[] = [
+  const messages: ChatMessage[] = [
     { role: "system", content: FILTER_DESIGN_SYSTEM },
     {
       role: "user",
@@ -421,40 +640,50 @@ export async function runPipeline(
     title: "3 · Master prompt — design the filter panel",
     messages,
   });
-  const design = await chatJson<unknown>(settings, messages, opts(8000));
+  const design = await chatJson<unknown>(settings, messages, opts(6000, "low"));
   usage = addUsage(usage, design.usage);
   calls++;
-  messages = design.messages;
-  let result = normalizeResult(design.data);
+  const { result, links } = normalizeResult(design.data);
+  if (result.filters.length === 0)
+    throw new Error("The model returned no filters. Try again or pick another model.");
   onStep("design", "done", `${result.filters.length} filters proposed`);
 
-  // 5 · validate, one repair round if needed
+  // 5 · link evidence and fix in code (no second model call)
   onStep("check", "running");
-  let issues = validateResult(result);
-  if (issues.length) {
-    const repairMessages: ChatMessage[] = [
-      ...messages,
-      { role: "user", content: buildRepairUser(issues) },
-    ];
-    prompts.push({ id: "repair", title: "4 · Repair turn", messages: repairMessages });
-    try {
-      const fixed = await chatJson<unknown>(settings, repairMessages, opts(8000));
-      usage = addUsage(usage, fixed.usage);
-      calls++;
-      const candidate = normalizeResult(fixed.data);
-      const remaining = validateResult(candidate);
-      if (candidate.filters.length && remaining.length <= issues.length) {
-        result = candidate;
-        issues = remaining;
-      }
-    } catch (err) {
-      if ((err as Error).name === "AbortError") throw err;
-    }
-  }
-  warnings.push(...issues);
-  onStep("check", "done", issues.length ? `${issues.length} issue(s) left` : "all checks passed");
+  const linkNotes = attachEvidence(result, links, aggregation, listing);
+  const { fixes, warnings: left } = fixResult(result);
+  warnings.push(...fixes.map((f) => `Auto-fixed: ${f}`), ...linkNotes, ...left);
+  onStep("check", "done", fixes.length ? `${fixes.length} auto-fix(es)` : "all checks passed");
 
   if (!result.category_name && category) result.category_name = category;
   result.total_keywords_analyzed = kwCount;
   return { result, evidence, warnings, usage, calls, prompts };
+}
+
+// ───────────────────────────── cost estimate ─────────────────────────────
+
+export interface RunEstimate {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/**
+ * Tokens a run will use with the current inputs: prompt sizes from the real prompts (≈ 4 chars/token),
+ * output from how much each step writes back (grouped labels, merges, ~120 tokens per filter).
+ */
+export function estimateRun(prompts: PromptRecord[]): RunEstimate {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const p of prompts) {
+    const chars = p.messages.reduce((n, m) => n + m.content.length, 0);
+    inputTokens += Math.ceil(chars / 4);
+    const userLines = (p.messages[1]?.content.match(/\n/g) ?? []).length;
+    if (p.id === "label") outputTokens += 60 + userLines * 7;
+    else if (p.id === "fields") outputTokens += 40 + userLines * 4;
+    else if (p.id === "design") outputTokens += 1800;
+  }
+  // The design step's evidence grows once step 1's labels are added.
+  if (prompts.some((p) => p.id === "label")) inputTokens += 600;
+  return { calls: prompts.length, inputTokens, outputTokens };
 }

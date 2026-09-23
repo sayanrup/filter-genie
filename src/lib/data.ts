@@ -206,8 +206,9 @@ interface ColumnInfo {
   rate: boolean;
 }
 
+// Word-bounded so count columns like "Enquiries Generated" or "Times searched" aren't taken for rates.
 const RATE_NAME =
-  /ctr|rate|%|ratio|avg|average|position|\bpos\b|rank|share|bounce|time|duration|percent/i;
+  /%|\b(ctr|rate|ratio|avg|average|position|pos|rank|share|bounce|duration|percent(age)?)\b/i;
 
 function describeColumns(rows: Row[]): ColumnInfo[] {
   const sample = rows.slice(0, 300);
@@ -368,10 +369,14 @@ export function describeKeywordTable(t: KeywordTable | null): string {
 
 // ───────────────────────────── term mining ─────────────────────────────
 
-const SIZE_TOKEN =
-  /^\d+(\.\d+)?(x\d+(\.\d+)?){1,2}$|^\d+(\.\d+)?(sqft|sqm|ft|feet|foot|mm|cm|inch|inches|mtr|meter|metre|m|kg|kgs|ton|tons|tonne|ltr|litre|liter|l|kl|kw|kva|hp|seater|seat|bhk|gsm|micron|watt|w|v|volt|amp|a|mah|gb|tb|rpm|bar|psi)$/;
+const SIZE_UNITS =
+  "sqft|sqm|ft|feet|foot|mm|cm|inch|inches|mtr|meter|metre|m|kg|kgs|ton|tons|tonne|ltr|litre|liter|l|kl|kw|kva|hp|seater|seat|bhk|gsm|micron|watt|w|v|volt|amp|a|mah|gb|tb|rpm|bar|psi";
+/** A dimension ("10x10", "20x8x8" with optional unit) or a number with a unit ("20ft", "1000l"). */
+const SIZE_TOKEN = new RegExp(
+  `^\\d+(\\.\\d+)?((x\\d+(\\.\\d+)?){1,2}(${SIZE_UNITS})?|(${SIZE_UNITS}))$`,
+);
 const PRICE_TOKEN =
-  /^(price|prices|pricing|cost|costs|costing|rate|rates|cheap|cheapest|budget|rs|inr|lowest|affordable|quotation|quote|wholesale|economical|low-cost|mrp)$/;
+  /^(price|prices|pricing|cost|costs|costing|rate|rates|cheap|cheapest|budget|rs|inr|lowest|affordable|quotation|quote|economical|low-cost|mrp)$/;
 
 // Major Indian cities, states and regions (the marketplace context uses ₹ and ISQs).
 const PLACES = new Set(
@@ -397,6 +402,8 @@ export interface TermSourceStat {
 export interface TermStat {
   term: string;
   hint: "" | "size?" | "price?" | "location?";
+  /** Set when code can label the term itself (price words, places, sizes) — it then skips the model. */
+  auto: TermLabel | "skip" | null;
   example: string;
   bySource: Partial<Record<KeywordSource, TermSourceStat>>;
   score: number;
@@ -406,6 +413,103 @@ export interface TermMining {
   coreTerms: string[];
   terms: TermStat[];
   totalKeywords: number;
+}
+
+const PLACE_ALIASES: Record<string, string> = {
+  bangalore: "Bengaluru",
+  gurgaon: "Gurugram",
+  "new-delhi": "Delhi",
+  ncr: "Delhi NCR",
+  "navi-mumbai": "Navi Mumbai",
+  mysore: "Mysuru",
+  mangalore: "Mangaluru",
+  baroda: "Vadodara",
+  allahabad: "Prayagraj",
+  cochin: "Kochi",
+  ernakulam: "Kochi",
+  trivandrum: "Thiruvananthapuram",
+  calicut: "Kozhikode",
+  vizag: "Visakhapatnam",
+  orissa: "Odisha",
+  tamilnadu: "Tamil Nadu",
+  "tamil-nadu": "Tamil Nadu",
+  andhra: "Andhra Pradesh",
+  bengal: "West Bengal",
+  himachal: "Himachal Pradesh",
+  "near-me": "Near me",
+  nearby: "Near me",
+  local: "Near me",
+};
+
+const UNIT_LABEL: Record<string, string> = {
+  sqft: "sq ft",
+  sqm: "sq m",
+  ft: "ft",
+  feet: "ft",
+  foot: "ft",
+  mm: "mm",
+  cm: "cm",
+  inch: "inch",
+  inches: "inch",
+  mtr: "m",
+  meter: "m",
+  metre: "m",
+  m: "m",
+  kg: "kg",
+  kgs: "kg",
+  ton: "ton",
+  tons: "ton",
+  tonne: "tonne",
+  ltr: "L",
+  litre: "L",
+  liter: "L",
+  l: "L",
+  kl: "KL",
+  kw: "kW",
+  kva: "kVA",
+  hp: "HP",
+  seater: "seater",
+  seat: "seater",
+  bhk: "BHK",
+  gsm: "GSM",
+  micron: "micron",
+  watt: "W",
+  w: "W",
+  v: "V",
+  volt: "V",
+  amp: "A",
+  a: "A",
+  mah: "mAh",
+  gb: "GB",
+  tb: "TB",
+  rpm: "RPM",
+  bar: "bar",
+  psi: "psi",
+};
+
+const titleCase = (s: string) => s.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+/** "20x10ft" → "20 x 10 ft", "1000l" → "1000 L". */
+export function formatSize(token: string): string {
+  const m = token.match(/^([\d.x]+?)([a-z]*)$/);
+  if (!m) return token;
+  const dims = m[1]!.split("x").join(" x ");
+  const unit = m[2] ? (UNIT_LABEL[m[2]] ?? m[2]) : "";
+  return unit ? `${dims} ${unit}` : dims;
+}
+
+/** Deterministic labels for single-token price words, places and sizes. */
+function autoLabel(term: string): TermLabel | "skip" | null {
+  if (term.includes(" ")) {
+    // Phrases built on an auto-labelled word add nothing: the single word is counted on its own.
+    return term.split(" ").some((t) => autoLabel(t) !== null) ? "skip" : null;
+  }
+  if (PRICE_TOKEN.test(term)) return { term, dimension: "Price", value: "Price intent" };
+  if (term === "india") return "skip";
+  if (PLACES.has(term))
+    return { term, dimension: "Location", value: PLACE_ALIASES[term] ?? titleCase(term) };
+  if (SIZE_TOKEN.test(term)) return { term, dimension: "Size / Capacity", value: formatSize(term) };
+  return null;
 }
 
 function hintFor(term: string): TermStat["hint"] {
@@ -449,7 +553,7 @@ function termsOf(tokens: string[], core: Set<string>) {
   return out;
 }
 
-export function mineTerms(tables: KeywordTable[], maxTerms = 250): TermMining {
+export function mineTerms(tables: KeywordTable[], maxTerms = 400): TermMining {
   const plurals = pluralMap(tables);
   const totalKeywords = tables.reduce((s, t) => s + t.rows.length, 0);
 
@@ -460,9 +564,13 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 250): TermMining {
       for (const tok of new Set(canonicalTokens(r, plurals)))
         if (isContent(tok)) df.set(tok, (df.get(tok) ?? 0) + 1);
   const ranked = [...df.entries()].sort((a, b) => b[1] - a[1]);
-  let core = ranked.filter(([, n]) => n / Math.max(totalKeywords, 1) >= 0.4).map(([t]) => t);
-  if (core.length === 0 && ranked[0] && ranked[0][1] / Math.max(totalKeywords, 1) >= 0.2)
-    core = [ranked[0][0]];
+  // Words code labels itself (price, places, sizes) are qualifiers even when very frequent.
+  const coreCandidates = ranked.filter(([t]) => autoLabel(t) === null);
+  let core = coreCandidates
+    .filter(([, n]) => n / Math.max(totalKeywords, 1) >= 0.4)
+    .map(([t]) => t);
+  const first = coreCandidates[0];
+  if (core.length === 0 && first && first[1] / Math.max(totalKeywords, 1) >= 0.2) core = [first[0]];
   const coreSet = new Set(core);
 
   const stats = new Map<string, TermStat>();
@@ -472,7 +580,14 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 250): TermMining {
       for (const term of termsOf(canonicalTokens(r, plurals), coreSet)) {
         let st = stats.get(term);
         if (!st) {
-          st = { term, hint: hintFor(term), example: r.query, bySource: {}, score: 0 };
+          st = {
+            term,
+            hint: hintFor(term),
+            auto: autoLabel(term),
+            example: r.query,
+            bySource: {},
+            score: 0,
+          };
           stats.set(term, st);
         }
         const s = (st.bySource[t.source] ??= { keywords: 0, demand: 0, action: 0 });
@@ -491,13 +606,25 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 250): TermMining {
 
   const terms = [...stats.values()]
     .filter((st) => {
+      if (st.auto === "skip") return false;
+      if (st.auto) return true; // free: labelled by code
       const kws = Object.values(st.bySource).reduce((s, x) => s + (x?.keywords ?? 0), 0);
-      return kws >= 2 || st.score >= 0.005 || st.hint !== "";
+      // Phrases must recur; single words may pass on demand alone.
+      return st.term.includes(" ") ? kws >= 2 : kws >= 2 || st.score >= 0.005;
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, maxTerms);
 
   return { coreTerms: core, terms, totalKeywords };
+}
+
+/** Terms the model still has to label, highest demand first, capped to keep the call cheap. */
+export function termsForModel(mining: TermMining, cap = 150): TermStat[] {
+  return mining.terms.filter((t) => !t.auto).slice(0, cap);
+}
+
+export function autoLabels(mining: TermMining): TermLabel[] {
+  return mining.terms.map((t) => t.auto).filter((l): l is TermLabel => !!l && l !== "skip");
 }
 
 // ───────────────────────────── aggregation ─────────────────────────────
@@ -737,6 +864,51 @@ export type FieldRole = "@name" | "@price" | "@unit" | "@category" | "@ignore";
 const IGNORE_KEY =
   /(^|[._\s])(id|_id|uid|sku|url|link|href|src|image|images|img|photo|thumb|thumbnail|video|html|desc|description|created|updated|timestamp|date|seo|slug|meta|rating|review|contact|mobile|phone|email|gst|address|pincode|lat|lng|long)([._\s]|$)/i;
 const PRICE_KEY = /price|mrp|\brate\b|cost/i;
+const NAME_KEY = /(^|[._\s])(name|title|product_?name|item_?name|heading)$/i;
+const CATEGORY_KEY = /(^|[._\s])(category|mcat|mcat_?name|subcategory|group|cat)$/i;
+const UNIT_KEY = /(^|[._\s])(unit|uom|price_?unit|moq_?unit)$/i;
+
+/** "specs.isq_material_type" → "Material Type". */
+export function canonicalSpecName(key: string): string {
+  const last = key.split(".").pop() ?? key;
+  const cleaned = last
+    .replace(/^(isq|spec|specs|attr|attribute|prop|property)[_\s-]+/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .trim()
+    .toLowerCase();
+  return cleaned.replace(/\b\w/g, (c) => c.toUpperCase()) || key;
+}
+
+/**
+ * Code-only field roles: ignores ids/URLs/contacts and long free text, detects name/category/price/unit,
+ * and gives every other field a canonical spec name (fields with the same name merge).
+ */
+export function heuristicFieldMap(flat: Record<string, string>[]): Map<string, string> {
+  const lengths = new Map<string, { total: number; n: number }>();
+  for (const rec of flat)
+    for (const [k, v] of Object.entries(rec)) {
+      const l = lengths.get(k) ?? { total: 0, n: 0 };
+      l.total += v.length;
+      l.n++;
+      lengths.set(k, l);
+    }
+  const map = new Map<string, string>();
+  for (const [key, l] of lengths) {
+    const avgLen = l.total / Math.max(l.n, 1);
+    let role: string;
+    if (IGNORE_KEY.test(key)) role = "@ignore";
+    else if (NAME_KEY.test(key)) role = "@name";
+    else if (CATEGORY_KEY.test(key)) role = "@category";
+    else if (UNIT_KEY.test(key)) role = "@unit";
+    else if (PRICE_KEY.test(key)) role = "@price";
+    else if (avgLen > 80)
+      role = "@ignore"; // free text, not an attribute
+    else role = canonicalSpecName(key);
+    map.set(key, role);
+  }
+  return map;
+}
 
 function quantile(sorted: number[], q: number) {
   if (sorted.length === 0) return 0;
@@ -752,12 +924,8 @@ export function profileListings(
   mapping?: Map<string, string>,
 ): ListingProfile {
   const count = flat.length;
-  const roleOf = (key: string): string => {
-    if (mapping) return mapping.get(key) ?? "@ignore";
-    if (IGNORE_KEY.test(key)) return "@ignore";
-    if (PRICE_KEY.test(key)) return "@price";
-    return key;
-  };
+  const map = mapping ?? heuristicFieldMap(flat);
+  const roleOf = (key: string): string => map.get(key) ?? "@ignore";
 
   const fields = new Map<
     string,
@@ -836,23 +1004,42 @@ export function profileListings(
   return { count, fields: out, price, mapped: Boolean(mapping) };
 }
 
-/** Raw source keys with fill rate and sample values — what the field-mapping step looks at. */
-export function rawFieldSummary(flat: Record<string, string>[], maxKeys = 120) {
-  const stats = new Map<string, { n: number; samples: string[] }>();
+/**
+ * Canonical spec names (after the code-only mapping) with fill rate, source fields and sample values —
+ * all the field-mapping model call needs to merge synonyms. Ignored/name/price fields are not sent.
+ */
+export function specSummary(
+  flat: Record<string, string>[],
+  map: Map<string, string>,
+  maxSpecs = 80,
+) {
+  const stats = new Map<string, { rows: number; samples: string[]; sources: Set<string> }>();
   for (const rec of flat) {
+    const seen = new Set<string>();
     for (const [k, v] of Object.entries(rec)) {
-      let s = stats.get(k);
+      const role = map.get(k) ?? "@ignore";
+      if (role.startsWith("@")) continue;
+      let s = stats.get(role);
       if (!s) {
-        s = { n: 0, samples: [] };
-        stats.set(k, s);
+        s = { rows: 0, samples: [], sources: new Set() };
+        stats.set(role, s);
       }
-      s.n++;
-      const short = v.slice(0, 40);
+      s.sources.add(k);
+      if (!seen.has(role)) {
+        seen.add(role);
+        s.rows++;
+      }
+      const short = v.slice(0, 30);
       if (s.samples.length < 3 && !s.samples.includes(short)) s.samples.push(short);
     }
   }
   return [...stats.entries()]
-    .sort((a, b) => b[1].n - a[1].n)
-    .slice(0, maxKeys)
-    .map(([key, s]) => ({ key, fillPct: pct(s.n, flat.length), samples: s.samples }));
+    .sort((a, b) => b[1].rows - a[1].rows)
+    .slice(0, maxSpecs)
+    .map(([spec, s]) => ({
+      spec,
+      fillPct: pct(s.rows, flat.length),
+      samples: s.samples,
+      sources: [...s.sources],
+    }));
 }

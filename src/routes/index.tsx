@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { InputPanel } from "@/components/InputPanel";
 import {
   SOURCE_LABEL,
@@ -16,6 +16,8 @@ import {
   MODEL_PRESETS,
   USD_TO_INR,
   chat,
+  EST_RUN_TOKENS,
+  estimateRun,
   previewPrompts,
   runCostInr,
   runPipeline,
@@ -278,13 +280,29 @@ function Index() {
     inputs.listingRows.length,
   );
 
-  const promptRecords: PromptRecord[] = useMemo(() => {
-    if (!showPrompt) return [];
-    return run ? run.prompts : previewPrompts(inputs);
-  }, [showPrompt, run, inputs]);
+  // Deferred so typing stays smooth while the preview/estimate recomputes.
+  const deferredInputs = useDeferredValue(inputs);
+  const previewRecords = useMemo(
+    () => (hasInput ? previewPrompts(deferredInputs) : []),
+    [deferredInputs, hasInput],
+  );
+  const promptRecords: PromptRecord[] = !showPrompt
+    ? []
+    : run?.prompts.length
+      ? run.prompts
+      : previewRecords;
+  const estimate = useMemo(
+    () =>
+      previewRecords.length
+        ? estimateRun(previewRecords)
+        : { calls: 3, inputTokens: EST_RUN_TOKENS.input, outputTokens: EST_RUN_TOKENS.output },
+    [previewRecords],
+  );
 
   const preset = MODEL_PRESETS.find((m) => m.id === settings.model);
-  const estINR = preset ? runCostInr(preset).toFixed(2) : null;
+  const estINR = preset
+    ? runCostInr(preset, estimate.inputTokens, estimate.outputTokens).toFixed(2)
+    : null;
 
   function setProvider(provider: Provider) {
     setSettings((prev) => ({ ...prev, provider, baseUrl: DEFAULT_BASE_URLS[provider] }));
@@ -708,7 +726,7 @@ function Index() {
                 ${m.inputCost} in · ${m.outputCost} out
               </div>
               <div className="font-mono text-[11px] font-semibold">
-                ~₹{runCostInr(m).toFixed(2)}/run
+                ~₹{runCostInr(m, estimate.inputTokens, estimate.outputTokens).toFixed(2)}/run
               </div>
             </button>
           );
@@ -852,7 +870,9 @@ function Index() {
         </button>
         {estINR ? (
           <span className="font-mono text-[11px] text-muted-foreground">
-            ~₹{estINR}/run (2–4 model calls)
+            ~₹{estINR}/run · {estimate.calls} model call{estimate.calls === 1 ? "" : "s"} · ~
+            {(estimate.inputTokens / 1000).toFixed(1)}k in /{" "}
+            {(estimate.outputTokens / 1000).toFixed(1)}k out tokens
           </span>
         ) : null}
       </div>

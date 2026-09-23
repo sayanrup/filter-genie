@@ -16,7 +16,11 @@ dimension and value — the numbers the master prompt quotes in its rationales.
   biggest value). A keyword that hits two values counts once towards the dimension total.
 - Per value: keywords, demand, action, share of the dimension, demand-weighted rates.
 - **Generic share:** % of demand from keywords with no labelled qualifier at all.
-- Sources are never mixed: internal pageviews and SERP clicks are reported side by side.
+- Sources are never mixed: internal pageviews and SERP clicks are reported side by side (`INT` / `SERP` columns).
+- In the prompt, to save tokens: up to 12 values per dimension; dimensions under 1% coverage in every source
+  are summarised on one line; top 10 keywords per source.
+- After the master prompt answers, `attachEvidence()` looks up each filter's `dimension` here to fill
+  `coverage_pct` / `top_value_share_pct` — the model never copies these numbers.
 
 ## Prompt
 
@@ -26,4 +30,5 @@ HOW TO READ THE DIMENSION TABLES (evidence A):
 - per value — keywords, demand, share of the dimension, action metric and rates when present.
 - generic share — % of demand from keywords with no qualifier at all: buyers who will rely on filters the most.
 - "Price intent" rows measure how often buyers mention price at all; the Price filter's ranges come from listing prices (evidence D), not from keywords.
+- Values are listed highest demand first; dimensions with coverage under 1% are summarised on one "minor" line.
 - If the evidence says terms could not be grouped, you receive raw term totals instead. Terms overlap inside keywords, so never add them up — cite them individually.

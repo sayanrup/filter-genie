@@ -46,8 +46,8 @@ export const MODEL_PRESETS: ModelPreset[] = [
   { id: "google/gemini-2.0-flash-001", name: "Gemini 2.0 Flash", inputCost: 0.1, outputCost: 0.4 },
 ];
 
-/** Rough token budget of one full run (label + field map + design, plus an occasional repair). */
-export const EST_RUN_TOKENS = { input: 14000, output: 5000 };
+/** Typical run when no inputs are loaded yet (label + spec merge + design). */
+export const EST_RUN_TOKENS = { input: 8000, output: 2600 };
 
 export const USD_TO_INR = 84;
 
@@ -74,6 +74,11 @@ export interface CallOptions {
   temperature?: number;
   /** Ask the provider for a JSON object response (falls back automatically if unsupported). */
   json?: boolean;
+  /**
+   * Thinking budget on reasoning-capable models (OpenRouter only). Reasoning tokens are billed as
+   * output, so small labelling tasks turn it off and the design step keeps it low.
+   */
+  reasoning?: "off" | "low";
   signal?: AbortSignal;
 }
 
@@ -121,7 +126,8 @@ export async function chat(
     headers["X-Title"] = "Search Filter Generator";
   }
 
-  let useJsonMode = Boolean(opts.json);
+  // Optional parameters: dropped together if the provider rejects the request as invalid.
+  let useOptional = true;
   let retriedTransient = false;
 
   for (;;) {
@@ -131,7 +137,16 @@ export async function chat(
       temperature: opts.temperature ?? 0.2,
       messages,
     };
-    if (useJsonMode) body["response_format"] = { type: "json_object" };
+    if (useOptional) {
+      if (opts.json) body["response_format"] = { type: "json_object" };
+      if (settings.provider === "openrouter") {
+        // Route to the cheapest provider serving this model.
+        body["provider"] = { sort: "price" };
+        if (opts.reasoning === "off") body["reasoning"] = { enabled: false };
+        else if (opts.reasoning === "low") body["reasoning"] = { effort: "low", exclude: true };
+      }
+    }
+    const sentOptional = useOptional && Object.keys(body).length > 4;
 
     let resp: Response;
     try {
@@ -162,12 +177,9 @@ export async function chat(
       data?.error?.message ?? (typeof data?.error === "string" ? data.error : undefined);
 
     if (!resp.ok || data?.error) {
-      // Some models/gateways reject response_format — retry once without it.
-      if (
-        useJsonMode &&
-        (resp.status === 400 || resp.status === 422 || /response_format|json/i.test(errMsg ?? ""))
-      ) {
-        useJsonMode = false;
+      // Some models/gateways reject response_format / reasoning / provider — retry once without them.
+      if (sentOptional && (resp.status === 400 || resp.status === 422)) {
+        useOptional = false;
         continue;
       }
       if (RETRYABLE.has(resp.status) && !retriedTransient) {
