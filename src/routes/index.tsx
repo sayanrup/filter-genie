@@ -40,6 +40,15 @@ export const Route = createFileRoute("/")({
 type Status = { kind: "ok" | "error" | "busy"; message: string } | null;
 
 const STORAGE_KEY = "filter-gen-settings";
+const SAVED_KEY = "filter-gen-saved";
+
+interface SavedRun {
+  id: string;
+  name: string;
+  savedAt: string;
+  model: string;
+  result: FilterResult;
+}
 
 function Index() {
   const [settings, setSettings] = useState<LlmSettings>({
@@ -71,6 +80,49 @@ function Index() {
   const [result, setResult] = useState<FilterResult | null>(null);
   const [usageLine, setUsageLine] = useState("");
   const [tab, setTab] = useState<"table" | "preview" | "raw">("table");
+  const [saved, setSaved] = useState<SavedRun[]>([]);
+  const [showSaved, setShowSaved] = useState(false);
+  const [saveNote, setSaveNote] = useState("");
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SAVED_KEY);
+      if (raw) setSaved(JSON.parse(raw));
+    } catch {
+      /* ignore malformed storage */
+    }
+  }, []);
+
+  function persistSaved(next: SavedRun[]) {
+    setSaved(next);
+    localStorage.setItem(SAVED_KEY, JSON.stringify(next));
+  }
+
+  function saveResult() {
+    if (!result) return;
+    const entry: SavedRun = {
+      id: `${Date.now()}`,
+      name: result.category_name || "Untitled category",
+      savedAt: new Date().toISOString(),
+      model: settings.model,
+      result,
+    };
+    persistSaved([entry, ...saved]);
+    setSaveNote(`Saved "${entry.name}"`);
+    setTimeout(() => setSaveNote(""), 2500);
+  }
+
+  function openSaved(entry: SavedRun) {
+    setResult(entry.result);
+    setUsageLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
+    setError("");
+    setTab("table");
+    setShowSaved(false);
+  }
+
+  function deleteSaved(id: string) {
+    persistSaved(saved.filter((s) => s.id !== id));
+  }
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -237,14 +289,65 @@ function Index() {
   return (
     <main className="mx-auto max-w-6xl px-5 py-8">
       <header className="mb-7">
-        <p className="label-caps mb-1">Category research → search UX</p>
-        <h1 className="text-3xl font-bold">Search Filter Generator</h1>
+        <div className="flex flex-wrap items-start gap-3">
+          <div>
+            <p className="label-caps mb-1">Category research → search UX</p>
+            <h1 className="text-3xl font-bold">Search Filter Generator</h1>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowSaved((v) => !v)}
+            className="ml-auto rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
+          >
+            {showSaved ? "Hide saved results" : `View saved results (${saved.length})`}
+          </button>
+        </div>
         <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
           Add whatever data you have — keywords, research notes, spec rankings, listings. Every field is optional,
           and each one takes a dropped file or pasted text. You get back a ranked, tiered set of filters with the
           evidence behind each one.
         </p>
       </header>
+
+      {showSaved ? (
+        <section className="panel mb-5 p-4">
+          <h2 className="font-display mb-2 text-sm font-semibold">Saved results</h2>
+          {saved.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              Nothing saved yet. Generate filters, then use “Save these results”.
+            </p>
+          ) : (
+            <ul className="divide-y divide-border">
+              {saved.map((s) => (
+                <li key={s.id} className="flex flex-wrap items-center gap-2 py-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold">{s.name}</div>
+                    <div className="font-mono text-[11px] text-muted-foreground">
+                      {new Date(s.savedAt).toLocaleString()} · {s.result.filters.length} filters · {s.model}
+                    </div>
+                  </div>
+                  <div className="ml-auto flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => openSaved(s)}
+                      className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-accent"
+                    >
+                      Open
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteSaved(s.id)}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-destructive hover:bg-danger-soft"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      ) : null}
 
       {/* Connection */}
       <section className="panel mb-5 p-4">
@@ -544,7 +647,7 @@ function Index() {
             ))}
           </div>
 
-          <div className="mb-3 flex gap-1 border-b-2 border-border">
+          <div className="mb-3 flex flex-wrap items-center gap-1 border-b-2 border-border">
             {(["table", "preview", "raw"] as const).map((t) => (
               <button
                 key={t}
@@ -559,6 +662,16 @@ function Index() {
                 {t === "table" ? "Filter table" : t === "preview" ? "See it on a page" : "Raw JSON"}
               </button>
             ))}
+            <div className="mb-2 ml-auto flex items-center gap-2">
+              {saveNote ? <span className="text-xs text-success">{saveNote}</span> : null}
+              <button
+                type="button"
+                onClick={saveResult}
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+              >
+                Save these results
+              </button>
+            </div>
           </div>
 
 
