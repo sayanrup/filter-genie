@@ -116,8 +116,16 @@ function FilterChip({
   );
 }
 
-export function SearchPreview({ result }: { result: FilterResult }) {
-  const [device, setDevice] = useState<Device>("desktop");
+export function SearchPreview({
+  result,
+  initialDevice = "desktop",
+  onDeviceChange,
+}: {
+  result: FilterResult;
+  initialDevice?: Device;
+  onDeviceChange?: (device: Device) => void;
+}) {
+  const [device, setDevice] = useState<Device>(initialDevice);
   const [openChip, setOpenChip] = useState<string | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [selections, setSelections] = useState<Record<string, string[]>>({});
@@ -192,6 +200,7 @@ export function SearchPreview({ result }: { result: FilterResult }) {
               type="button"
               onClick={() => {
                 setDevice(d);
+                onDeviceChange?.(d);
                 setOpenChip(null);
                 setSheetOpen(false);
               }}
