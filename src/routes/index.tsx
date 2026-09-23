@@ -28,6 +28,8 @@ import {
   type Step,
 } from "@/lib/filter-gen";
 import { SKILLS, stageSkills } from "@/skills";
+import { SearchPreview } from "@/components/SearchPreview";
+import { buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -54,6 +56,53 @@ export const Route = createFileRoute("/")({
 type Status = { kind: "ok" | "error" | "busy"; message: string } | null;
 
 const STORAGE_KEY = "filter-gen-settings";
+
+const SAVED_KEY = "filter-gen-saved";
+
+type Tab = "table" | "preview" | "evidence" | "raw";
+type Device = "desktop" | "mobile";
+
+interface SavedRun {
+  id: string;
+  name: string;
+  savedAt: string;
+  model: string;
+  result: PipelineRun["result"];
+  inputs: InputBundle;
+  tab?: Tab;
+  device?: Device;
+}
+
+const EMPTY_BUNDLE: InputBundle = { serp: "", internal: "", context: "", specs: "", products: "" };
+
+function rowsFromBundle(json: string): Row[] | null {
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? (parsed as Row[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A saved run only keeps the result and inputs; evidence is recomputed on the next Generate. */
+function runFromSaved(entry: SavedRun): PipelineRun {
+  return {
+    result: entry.result,
+    evidence: {
+      category: null,
+      tables: [],
+      mining: null,
+      labels: [],
+      aggregation: null,
+      listing: null,
+    },
+    warnings: [],
+    usage: {},
+    calls: 0,
+    prompts: [],
+  };
+}
 
 const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
 
@@ -147,8 +196,22 @@ function Index() {
   const [error, setError] = useState("");
   const [steps, setSteps] = useState<Step[]>([]);
   const [run, setRun] = useState<PipelineRun | null>(null);
-  const [tab, setTab] = useState<"table" | "evidence" | "raw">("table");
+  const [tab, setTab] = useState<Tab>("table");
+  const [device, setDevice] = useState<Device>("desktop");
+  const [saved, setSaved] = useState<SavedRun[]>([]);
+  const [showSaved, setShowSaved] = useState(false);
+  const [saveNote, setSaveNote] = useState("");
+  const [savedLine, setSavedLine] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SAVED_KEY);
+      if (raw) setSaved(JSON.parse(raw));
+    } catch {
+      /* storage unavailable or malformed */
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -296,6 +359,7 @@ function Index() {
           ),
       });
       setRun(result);
+      setSavedLine("");
       setTab("table");
     } catch (err) {
       setError((err as Error).name === "AbortError" ? "Stopped." : (err as Error).message);
@@ -304,6 +368,85 @@ function Index() {
       setLoading(false);
       abortRef.current = null;
     }
+  }
+
+  /** Inputs in the saved-run format: rows as JSON strings, docs as text. */
+  function currentBundle(): InputBundle {
+    const rows = (r: Row[]) => (r.length ? JSON.stringify(r) : "");
+    return {
+      serp: rows(inputs.serpRows),
+      internal: rows(inputs.internalRows),
+      context: inputs.context,
+      specs: inputs.specs,
+      products: rows(inputs.listingRows),
+    };
+  }
+
+  function persistSaved(next: SavedRun[]) {
+    setSaved(next);
+    try {
+      localStorage.setItem(SAVED_KEY, JSON.stringify(next));
+    } catch {
+      setSaveNote("Saved, but this device's storage is full — download the .md to keep it.");
+    }
+  }
+
+  function downloadMarkdown(entry: SavedRun) {
+    const md = buildMarkdown({
+      name: entry.name,
+      savedAt: entry.savedAt,
+      model: entry.model,
+      result: entry.result,
+      inputs: entry.inputs ?? EMPTY_BUNDLE,
+      device: entry.device ?? "desktop",
+    });
+    download(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.md`, "text/markdown", md);
+  }
+
+  function saveResult() {
+    if (!run) return;
+    const entry: SavedRun = {
+      id: `${Date.now()}`,
+      name: run.result.category_name || "Untitled category",
+      savedAt: new Date().toISOString(),
+      model: settings.model,
+      result: run.result,
+      inputs: currentBundle(),
+      tab,
+      device,
+    };
+    persistSaved([entry, ...saved]);
+    setSaveNote(`Saved "${entry.name}"`);
+    downloadMarkdown(entry);
+    setTimeout(() => setSaveNote(""), 3500);
+  }
+
+  function openSaved(entry: SavedRun) {
+    const i = entry.inputs ?? EMPTY_BUNDLE;
+    const restored = (json: string): Status =>
+      json ? { kind: "ok", message: "Restored from a saved run" } : null;
+    setSerpFile(rowsFromBundle(i.serp));
+    setSerpText("");
+    setSerpStatus(restored(i.serp));
+    setInternalFile(rowsFromBundle(i.internal));
+    setInternalText("");
+    setInternalStatus(restored(i.internal));
+    setContextText(i.context);
+    setSpecsText(i.specs);
+    setProductsFile(rowsFromBundle(i.products));
+    setProductsText("");
+    setProductsStatus(restored(i.products));
+    setRun(runFromSaved(entry));
+    setSteps([]);
+    setError("");
+    setSavedLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
+    setDevice(entry.device ?? "desktop");
+    setTab(entry.tab === "evidence" ? "table" : (entry.tab ?? "table"));
+    setShowSaved(false);
+  }
+
+  function deleteSaved(id: string) {
+    persistSaved(saved.filter((s) => s.id !== id));
   }
 
   function clearAll() {
@@ -327,8 +470,11 @@ function Index() {
   const result = run?.result ?? null;
   const tierCount = (tier: string) => result?.filters.filter((f) => f.tier === tier).length ?? 0;
 
+  const hasEvidence = Boolean(run && (run.evidence.tables.length || run.evidence.listing));
+
   const usageLine = useMemo(() => {
     if (!run) return "";
+    if (savedLine) return savedLine;
     const { prompt_tokens: pin, completion_tokens: pout } = run.usage;
     let cost = "";
     if (preset && pin && pout) {
@@ -336,7 +482,7 @@ function Index() {
       cost = ` · ~$${usd.toFixed(5)} (₹${(usd * USD_TO_INR).toFixed(2)})`;
     }
     return `${settings.model} · ${run.calls} call${run.calls === 1 ? "" : "s"} · in ${pin ?? "?"} tok · out ${pout ?? "?"} tok${cost}`;
-  }, [run, preset, settings.model]);
+  }, [run, preset, settings.model, savedLine]);
 
   const allPromptsText = promptRecords
     .map((p) =>
@@ -350,8 +496,19 @@ function Index() {
   return (
     <main className="mx-auto max-w-6xl px-5 py-8">
       <header className="mb-7">
-        <p className="label-caps mb-1">Category research → search UX</p>
-        <h1 className="text-3xl font-bold">Search Filter Generator</h1>
+        <div className="flex flex-wrap items-start gap-3">
+          <div>
+            <p className="label-caps mb-1">Category research → search UX</p>
+            <h1 className="text-3xl font-bold">Search Filter Generator</h1>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowSaved((v) => !v)}
+            className="ml-auto rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
+          >
+            {showSaved ? "Hide saved results" : `View saved results (${saved.length})`}
+          </button>
+        </div>
         <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
           Add whatever data you have — keywords, research notes, spec rankings, listings. Every
           field is optional, and each one takes a dropped file or pasted text. The numbers are
@@ -359,6 +516,54 @@ function Index() {
           set of filters with the evidence behind each one.
         </p>
       </header>
+
+      {showSaved ? (
+        <section className="panel mb-5 p-4">
+          <h2 className="font-display mb-2 text-sm font-semibold">Saved results</h2>
+          {saved.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              Nothing saved yet. Generate filters, then use “Save results + download .md”.
+            </p>
+          ) : (
+            <ul className="divide-y divide-border">
+              {saved.map((s) => (
+                <li key={s.id} className="flex flex-wrap items-center gap-2 py-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold">{s.name}</div>
+                    <div className="font-mono text-[11px] text-muted-foreground">
+                      {new Date(s.savedAt).toLocaleString()} · {s.result.filters.length} filters ·{" "}
+                      {s.model}
+                    </div>
+                  </div>
+                  <div className="ml-auto flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => openSaved(s)}
+                      className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-accent"
+                    >
+                      Open
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadMarkdown(s)}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                    >
+                      Download .md
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteSaved(s.id)}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-destructive hover:bg-danger-soft"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      ) : null}
 
       {/* Connection */}
       <section className="panel mb-5 p-4">
@@ -833,21 +1038,39 @@ function Index() {
             </div>
           ) : null}
 
-          <div className="mb-3 flex gap-1 border-b-2 border-border">
-            {(["table", "evidence", "raw"] as const).map((t) => (
+          <div className="mb-3 flex flex-wrap items-center gap-1 border-b-2 border-border">
+            {(["table", "preview", "evidence", "raw"] as const)
+              .filter((t) => t !== "evidence" || hasEvidence)
+              .map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setTab(t)}
+                  className={`-mb-0.5 border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
+                    tab === t
+                      ? "border-primary text-primary"
+                      : "border-transparent text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {t === "table"
+                    ? "Filter table"
+                    : t === "preview"
+                      ? "See it on a page"
+                      : t === "evidence"
+                        ? "Evidence"
+                        : "Raw JSON"}
+                </button>
+              ))}
+            <div className="mb-2 ml-auto flex items-center gap-2">
+              {saveNote ? <span className="text-xs text-success">{saveNote}</span> : null}
               <button
-                key={t}
                 type="button"
-                onClick={() => setTab(t)}
-                className={`-mb-0.5 border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
-                  tab === t
-                    ? "border-primary text-primary"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                }`}
+                onClick={saveResult}
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
               >
-                {t === "table" ? "Filter table" : t === "evidence" ? "Evidence" : "Raw JSON"}
+                Save results + download .md
               </button>
-            ))}
+            </div>
           </div>
 
           {tab === "table" ? (
@@ -987,7 +1210,9 @@ function Index() {
                 </div>
               ) : null}
             </div>
-          ) : tab === "evidence" ? (
+          ) : tab === "preview" ? (
+            <SearchPreview result={result} initialDevice={device} onDeviceChange={setDevice} />
+          ) : tab === "evidence" && hasEvidence ? (
             <EvidenceView run={run} />
           ) : (
             <pre className="panel max-h-[28rem] overflow-auto p-4 font-mono text-[11px] whitespace-pre-wrap">
