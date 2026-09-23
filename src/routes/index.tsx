@@ -6,11 +6,14 @@ import {
   DEFAULT_BASE_URLS,
   MODEL_PRESETS,
   PRODUCT_RESTRUCTURE_SYSTEM,
+  buildMarkdown,
   buildPrompts,
   callLlm,
   fileToRows,
+  slugify,
   stripFences,
   type FilterResult,
+  type InputBundle,
   type LlmSettings,
   type Provider,
 } from "@/lib/filter-gen";
@@ -48,6 +51,9 @@ interface SavedRun {
   savedAt: string;
   model: string;
   result: FilterResult;
+  inputs: InputBundle;
+  tab?: "table" | "preview" | "raw";
+  device?: "desktop" | "mobile";
 }
 
 function Index() {
@@ -80,6 +86,7 @@ function Index() {
   const [result, setResult] = useState<FilterResult | null>(null);
   const [usageLine, setUsageLine] = useState("");
   const [tab, setTab] = useState<"table" | "preview" | "raw">("table");
+  const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
   const [saved, setSaved] = useState<SavedRun[]>([]);
   const [showSaved, setShowSaved] = useState(false);
   const [saveNote, setSaveNote] = useState("");
@@ -95,7 +102,28 @@ function Index() {
 
   function persistSaved(next: SavedRun[]) {
     setSaved(next);
-    localStorage.setItem(SAVED_KEY, JSON.stringify(next));
+    try {
+      localStorage.setItem(SAVED_KEY, JSON.stringify(next));
+    } catch {
+      setSaveNote("Saved, but this device's storage is full — download the .md to keep it.");
+    }
+  }
+
+  function downloadMarkdown(entry: SavedRun) {
+    const md = buildMarkdown({
+      name: entry.name,
+      savedAt: entry.savedAt,
+      model: entry.model,
+      result: entry.result,
+      inputs: entry.inputs,
+      device: entry.device,
+    });
+    const blob = new Blob([md], { type: "text/markdown" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
   function saveResult() {
@@ -106,17 +134,34 @@ function Index() {
       savedAt: new Date().toISOString(),
       model: settings.model,
       result,
+      inputs,
+      tab,
+      device,
     };
     persistSaved([entry, ...saved]);
     setSaveNote(`Saved "${entry.name}"`);
-    setTimeout(() => setSaveNote(""), 2500);
+    downloadMarkdown(entry);
+    setTimeout(() => setSaveNote(""), 3500);
   }
 
   function openSaved(entry: SavedRun) {
     setResult(entry.result);
     setUsageLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
     setError("");
-    setTab("table");
+    const i = entry.inputs ?? { serp: "", internal: "", context: "", specs: "", products: "" };
+    setSerpFile(i.serp);
+    setSerpText("");
+    setSerpStatus(i.serp ? { kind: "ok", message: "Restored from a saved run" } : null);
+    setInternalFile(i.internal);
+    setInternalText("");
+    setInternalStatus(i.internal ? { kind: "ok", message: "Restored from a saved run" } : null);
+    setContextText(i.context);
+    setSpecsText(i.specs);
+    setProductsFile(i.products);
+    setProductsText("");
+    setProductsStatus(i.products ? { kind: "ok", message: "Restored from a saved run" } : null);
+    setDevice(entry.device ?? "desktop");
+    setTab(entry.tab ?? "table");
     setShowSaved(false);
   }
 
