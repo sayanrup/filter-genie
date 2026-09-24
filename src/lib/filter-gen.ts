@@ -1,7 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- model replies are untyped JSON and are normalised field by field */
 import {
   aggregate,
+  alignAutoLabels,
   autoLabels,
+  dimensionCandidates,
   flattenListing,
   heuristicFieldMap,
   mineTerms,
@@ -16,6 +18,7 @@ import {
   type TermLabel,
   type TermMining,
   type TermStat,
+  type DimensionCandidates,
 } from "./data";
 import { addUsage, chatJson, type ChatMessage, type LlmSettings, type Usage } from "./llm";
 import {
@@ -63,6 +66,8 @@ export interface PipelineInputs {
   context: string;
   specs: string;
   listingRows: Row[];
+  /** Listing data is a demo sample: keep low-fill filters and flag them instead of dropping them. */
+  demoListings?: boolean;
 }
 
 export type { StageId };
@@ -122,6 +127,9 @@ export interface Prepared {
   /** Code-only field roles / canonical spec names for every source field. */
   fieldMap: Map<string, string>;
   specs: ReturnType<typeof specSummary>;
+  /** The category's own dimension names (ranking + listing specs) for keyword labelling. */
+  dims: DimensionCandidates;
+  context: string;
 }
 
 export function prepare(inputs: PipelineInputs): Prepared {
@@ -139,6 +147,11 @@ export function prepare(inputs: PipelineInputs): Prepared {
     flatListings,
     fieldMap,
     specs: specSummary(flatListings, fieldMap),
+    dims: dimensionCandidates(
+      inputs.specs,
+      flatListings.length ? profileListings(flatListings, fieldMap) : null,
+    ),
+    context: inputs.context,
   };
 }
 
@@ -148,7 +161,10 @@ const needsFieldCall = (prep: Prepared) => prep.specs.length >= 2;
 function labelMessages(prep: Prepared): ChatMessage[] {
   return [
     { role: "system", content: TERM_LABEL_SYSTEM },
-    { role: "user", content: buildTermLabelUser(prep.modelTerms, prep.mining!) },
+    {
+      role: "user",
+      content: buildTermLabelUser(prep.modelTerms, prep.mining!, prep.dims, prep.context),
+    },
   ];
 }
 
@@ -179,7 +195,7 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
       messages: fieldMessages(prep),
     });
   }
-  const auto = prep.mining ? autoLabels(prep.mining) : [];
+  const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
   out.push({
     id: "design",
     stage: "design",
@@ -199,6 +215,7 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
           listing: prep.flatListings.length
             ? profileListings(prep.flatListings, prep.fieldMap)
             : null,
+          demoListings: Boolean(inputs.demoListings),
         }).concat(
           prep.modelTerms.length
             ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
@@ -340,6 +357,7 @@ export function attachEvidence(
   links: RawLinks[],
   aggregation: Aggregation | null,
   listing: ListingProfile | null,
+  demoListings = false,
 ): string[] {
   const notes: string[] = [];
   const dims = new Map((aggregation?.dimensions ?? []).map((d) => [norm(d.name), d]));
@@ -358,6 +376,12 @@ export function attachEvidence(
         `"${f.name}" pointed at a listing spec "${link.listing_spec}" that isn't in the evidence; link cleared.`,
       );
     spec ??= specs.get(norm(f.name));
+    // Location filters are served by the seller-city field, whatever the filter is called.
+    const isPlace = /city|location|near ?me/i.test(`${f.name} ${link.dimension ?? ""}`);
+    if (!spec && isPlace)
+      spec = (listing?.fields ?? []).find((x) => /\b(city|location)\b/i.test(x.key));
+    // Price comes from the listings' price field, not from a spec.
+    const isPrice = /price|budget|cost/i.test(`${f.name} ${link.dimension ?? ""}`);
 
     const sources: string[] = [];
     if (dim) {
@@ -374,6 +398,13 @@ export function attachEvidence(
       f.top_value_share_pct = null;
     }
     f.listing_fill_pct = spec ? spec.fillPct : null;
+    // Low supply is kept visible, never silently dropped: make sure the rationale says so.
+    if (listing && !isPrice && f.tier !== "Tier 3" && !/fill/i.test(f.rationale)) {
+      const where = demoListings ? "sample listings" : "listings";
+      if (!spec) f.rationale += ` (not captured in ${where} — needs an ISQ field)`;
+      else if (spec.fillPct < 30)
+        f.rationale += ` (only ${spec.fillPct}% of ${where} fill this — needs ISQ push)`;
+    }
     if (spec) sources.push("listings");
     for (const b of link.backing) if (b === "context" || b === "ranking") sources.push(b);
     f.sources = sources;
@@ -504,7 +535,7 @@ export async function runPipeline(
   onStep("prepare", "running");
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
-  const auto = prep.mining ? autoLabels(prep.mining) : [];
+  const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
   onStep(
     "prepare",
     "done",
@@ -631,6 +662,7 @@ export async function runPipeline(
         context: inputs.context,
         specs: inputs.specs,
         listing,
+        demoListings: Boolean(inputs.demoListings),
       }),
     },
   ];
@@ -650,7 +682,7 @@ export async function runPipeline(
 
   // 5 · link evidence and fix in code (no second model call)
   onStep("check", "running");
-  const linkNotes = attachEvidence(result, links, aggregation, listing);
+  const linkNotes = attachEvidence(result, links, aggregation, listing, inputs.demoListings);
   const { fixes, warnings: left } = fixResult(result);
   warnings.push(...fixes.map((f) => `Auto-fixed: ${f}`), ...linkNotes, ...left);
   onStep("check", "done", fixes.length ? `${fixes.length} auto-fix(es)` : "all checks passed");

@@ -5,6 +5,7 @@ import {
   type ListingProfile,
   type TermMining,
   type TermStat,
+  type DimensionCandidates,
   type specSummary,
 } from "./data";
 import { composeSystemPrompt } from "@/skills";
@@ -42,15 +43,32 @@ function clip(text: string, max: number) {
 
 export const TERM_LABEL_SYSTEM = composeSystemPrompt("label");
 
-export function buildTermLabelUser(terms: TermStat[], mining: TermMining) {
+export function buildTermLabelUser(
+  terms: TermStat[],
+  mining: TermMining,
+  dims: DimensionCandidates,
+  context: string,
+) {
   // No numbers: labelling doesn't need them. Skip the example when it's just the term itself.
   const lines = terms.map((t) =>
     t.example.toLowerCase().trim() === t.term ? t.term : `${t.term} | ${t.example}`,
   );
-  return [
+  const dimLines: string[] = [];
+  if (dims.ranking.length)
+    dimLines.push(`CM ranking (most important first): ${dims.ranking.join(", ")}`);
+  if (dims.listing.length)
+    dimLines.push(
+      "Listing specs (name — common values):",
+      ...dims.listing.map((d) => `${d.name} — ${d.values.join(", ")}`),
+    );
+  const parts = [
     `Category words (not qualifiers): ${mining.coreTerms.join(", ") || "(none detected)"}`,
-    block("TERMS", `term | example keyword\n${lines.join("\n")}`),
-  ].join("\n");
+  ];
+  if (dimLines.length) parts.push(block("CATEGORY_DIMENSIONS", dimLines.join("\n")));
+  else parts.push("No category dimensions were provided — use the fallback dimensions.");
+  if (context.trim()) parts.push(block("CATEGORY_CONTEXT_EXCERPT", clip(context, 1500)));
+  parts.push(block("TERMS", `term | example keyword\n${lines.join("\n")}`));
+  return parts.join("\n");
 }
 
 // ───────────────────────────── 2 · listing field mapping ─────────────────────────────
@@ -79,6 +97,7 @@ export interface DesignEvidence {
   context: string;
   specs: string;
   listing: ListingProfile | null;
+  demoListings?: boolean;
 }
 
 function metricName(t: KeywordTable | undefined) {
@@ -209,9 +228,10 @@ function formatLakh(n: number) {
 
 const MAX_SPECS = 30;
 
-function formatListing(p: ListingProfile) {
-  // Specs almost nobody fills are summarised by name only.
-  const shown = p.fields.filter((f) => f.fillPct >= 5).slice(0, MAX_SPECS);
+function formatListing(p: ListingProfile, demo = false) {
+  // Specs almost nobody fills are summarised by name only (a demo sample keeps more of them visible).
+  const minFill = demo ? 1 : 5;
+  const shown = p.fields.filter((f) => f.fillPct >= minFill).slice(0, demo ? 40 : MAX_SPECS);
   const rare = p.fields.filter((f) => !shown.includes(f));
   const lines = [
     `${p.count} listings profiled.`,
@@ -226,7 +246,7 @@ function formatListing(p: ListingProfile) {
   ];
   if (rare.length)
     lines.push(
-      `Rarely filled (< 5% or beyond top ${MAX_SPECS}): ${rare.map((f) => f.key).join(", ")}`,
+      `Rarely filled (below ${minFill}% or beyond the top ${shown.length}): ${rare.map((f) => f.key).join(", ")}`,
     );
   if (p.price) {
     const u = p.price.unit ? ` per ${p.price.unit}` : "";
@@ -285,9 +305,14 @@ export function buildDesignUser(ev: DesignEvidence) {
     parts.push(
       "",
       "## D. LISTING SPEC PROFILE (computed by code)",
-      block("LISTINGS", formatListing(ev.listing)),
+      block("LISTINGS", formatListing(ev.listing, ev.demoListings)),
     );
 
+  if (ev.listing && ev.demoListings)
+    parts.push(
+      "",
+      'NOTE: the listing data (D) is a DEMO SAMPLE, not the full catalogue. Low fill rates are expected: do NOT drop or demote a filter because of low fill. Keep it in the tier its demand and context earn, and add the fill note to its rationale (e.g. "(only 12% of sample listings fill this — needs ISQ push)").',
+    );
   parts.push("", "Design the filter panel now. Reply with the JSON object only.");
   return parts.join("\n");
 }

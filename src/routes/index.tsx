@@ -185,6 +185,8 @@ function Index() {
   const [contextText, setContextText] = useState("");
   const [specsText, setSpecsText] = useState("");
   const [productsText, setProductsText] = useState("");
+  // Listings are a demo sample for now: keep low-fill filters and flag them.
+  const [demoListings, setDemoListings] = useState(true);
 
   const [serpFile, setSerpFile] = useState<Row[] | null>(null);
   const [internalFile, setInternalFile] = useState<Row[] | null>(null);
@@ -245,6 +247,7 @@ function Index() {
       context: contextText,
       specs: specsText,
       listingRows: productsFile ?? safeRows(productsText),
+      demoListings,
     }),
     [
       serpFile,
@@ -255,6 +258,7 @@ function Index() {
       specsText,
       productsFile,
       productsText,
+      demoListings,
     ],
   );
 
@@ -817,6 +821,20 @@ function Index() {
           className="md:col-span-2"
         />
       </div>
+
+      <label className="mt-3 flex items-start gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={demoListings}
+          onChange={(e) => setDemoListings(e.target.checked)}
+        />
+        <span>
+          <strong className="text-foreground">Listings are a demo sample</strong> — keep filters
+          with low listing fill rates in their tier and flag the fill rate in the rationale, instead
+          of demoting them.
+        </span>
+      </label>
 
       {/* Actions */}
       <div className="mt-5 flex flex-wrap items-center gap-2">
