@@ -3,7 +3,8 @@
 How each filter's option list is built and which UI control it gets.
 
 - **Layer:** prompt only
-- **Used by:** master prompt
+- **Used by:** master prompt — left out when **Include UI design** is unticked; the master prompt then
+  asks for filters, tiers, confidence and rationale only (`ui_pattern` "", `values` [], no interaction rules)
 
 ## Prompt
 

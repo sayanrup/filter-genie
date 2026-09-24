@@ -87,6 +87,12 @@ export function buildFieldMapUser(summary: ReturnType<typeof specSummary>, listi
 
 export const FILTER_DESIGN_SYSTEM = composeSystemPrompt("design");
 
+/** "Include UI design" unticked: the options & UI-pattern skill is left out of the master prompt. */
+export const FILTER_DESIGN_SYSTEM_NO_UI = composeSystemPrompt("design", ["options"]);
+
+export const NO_UI_NOTE =
+  'UI DESIGN IS SWITCHED OFF for this run: decide only which filters exist, their tier, rank, confidence and rationale. Return "ui_pattern": "", "values": [] for every filter and "interaction_rules": []. Do not spend any output on options.';
+
 // ───────────────────────────── design-stage user message ─────────────────────────────
 
 export interface DesignEvidence {
@@ -98,6 +104,7 @@ export interface DesignEvidence {
   specs: string;
   listing: ListingProfile | null;
   demoListings?: boolean;
+  uiDesign?: boolean;
 }
 
 function metricName(t: KeywordTable | undefined) {
@@ -313,6 +320,7 @@ export function buildDesignUser(ev: DesignEvidence) {
       "",
       'NOTE: the listing data (D) is a DEMO SAMPLE, not the full catalogue. Low fill rates are expected: do NOT drop or demote a filter because of low fill. Keep it in the tier its demand and context earn, and add the fill note to its rationale (e.g. "(only 12% of sample listings fill this — needs ISQ push)").',
     );
+  if (ev.uiDesign === false) parts.push("", NO_UI_NOTE);
   parts.push("", "Design the filter panel now. Reply with the JSON object only.");
   return parts.join("\n");
 }

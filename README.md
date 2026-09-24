@@ -47,6 +47,10 @@ ranking and fill rates all line up on the same names.
 fill rates in their tier and adds the fill rate to the rationale ("only 12% of sample listings fill this —
 needs ISQ push") instead of demoting them.
 
+**Include UI design.** Ticked by default. Untick it to get only the filter list — tiers, order, confidence and
+rationale — without UI patterns, option values or interaction rules. Skill 09 is then left out of the master
+prompt and the answer is shorter, so the run costs less; the table hides the UI columns and the page preview.
+
 ## Cost
 
 A typical run is **3 calls and about 5–9k input / 2–3k output tokens** — well under ₹0.10 on the default

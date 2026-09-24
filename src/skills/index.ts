@@ -79,12 +79,15 @@ export const STAGES: Record<StageId, { title: string; skills: SkillId[] }> = {
 
 const DIVIDER = "\n\n═══════════════════════════════════════\n\n";
 
-export function stageSkills(stage: StageId): SkillDoc[] {
-  return [SKILLS.base, ...STAGES[stage].skills.map((id) => SKILLS[id])];
+export function stageSkills(stage: StageId, exclude: SkillId[] = []): SkillDoc[] {
+  return [
+    SKILLS.base,
+    ...STAGES[stage].skills.filter((id) => !exclude.includes(id)).map((id) => SKILLS[id]),
+  ];
 }
 
-export function composeSystemPrompt(stage: StageId): string {
-  return stageSkills(stage)
+export function composeSystemPrompt(stage: StageId, exclude: SkillId[] = []): string {
+  return stageSkills(stage, exclude)
     .map((s) => s.prompt)
     .filter(Boolean)
     .join(DIVIDER);
