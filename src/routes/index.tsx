@@ -29,9 +29,10 @@ import {
   type PipelineRun,
   type PromptRecord,
   type Provider,
-  type Step,
+  type StepId,
 } from "@/lib/filter-gen";
 import { SKILLS, stageSkills } from "@/skills";
+import { StepCards, type StepView } from "@/components/StepCards";
 import { SearchPreview } from "@/components/SearchPreview";
 import { buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
@@ -201,7 +202,7 @@ function Index() {
   const [showSkills, setShowSkills] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [steps, setSteps] = useState<Step[]>([]);
+  const [steps, setSteps] = useState<StepView[]>([]);
   const [run, setRun] = useState<PipelineRun | null>(null);
   const [tab, setTab] = useState<Tab>("table");
   const [device, setDevice] = useState<Device>("desktop");
@@ -368,7 +369,7 @@ function Index() {
     }
   }
 
-  async function generate() {
+  async function generate(from?: StepId) {
     setError("");
     if (!hasInput) {
       setError("Add at least one input above — any single one is enough.");
@@ -386,9 +387,18 @@ function Index() {
     try {
       const result = await runPipeline(settings, inputs, {
         signal: controller.signal,
-        onStep: (id, status, detail) =>
+        ...(from ? { from } : {}),
+        onStep: (id, patch) =>
           setSteps((prev) =>
-            prev.map((s) => (s.id === id ? { ...s, status, ...(detail ? { detail } : {}) } : s)),
+            prev.map((s) =>
+              s.id === id
+                ? {
+                    ...s,
+                    ...patch,
+                    ...(patch.status === "running" ? { startedAt: Date.now() } : {}),
+                  }
+                : s,
+            ),
           ),
       });
       setRun(result);
@@ -872,7 +882,7 @@ function Index() {
         ) : (
           <button
             type="button"
-            onClick={generate}
+            onClick={() => void generate()}
             className="rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
           >
             Generate filter recommendations
@@ -1031,42 +1041,13 @@ function Index() {
         </div>
       ) : null}
 
-      {steps.length && (loading || !run) ? (
-        <ol className="panel mt-4 grid gap-1.5 px-4 py-3 text-sm">
-          {steps.map((s) => (
-            <li key={s.id} className="flex items-center gap-3">
-              <span
-                className={`flex size-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
-                  s.status === "running"
-                    ? "animate-spin border-2 border-border border-t-primary"
-                    : s.status === "done"
-                      ? "bg-success-soft text-success"
-                      : s.status === "error"
-                        ? "bg-danger-soft text-destructive"
-                        : "bg-secondary text-muted-foreground"
-                }`}
-              >
-                {s.status === "done"
-                  ? "✓"
-                  : s.status === "error"
-                    ? "!"
-                    : s.status === "skipped"
-                      ? "–"
-                      : ""}
-              </span>
-              <span
-                className={
-                  s.status === "pending" || s.status === "skipped" ? "text-muted-foreground" : ""
-                }
-              >
-                {s.label}
-              </span>
-              {s.detail ? (
-                <span className="font-mono text-[11px] text-muted-foreground">{s.detail}</span>
-              ) : null}
-            </li>
-          ))}
-        </ol>
+      {steps.length ? (
+        <StepCards
+          steps={steps}
+          preset={preset}
+          busy={loading}
+          onRerun={(from) => void generate(from)}
+        />
       ) : null}
 
       {run && result ? (

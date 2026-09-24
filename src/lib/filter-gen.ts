@@ -78,11 +78,30 @@ export type { StageId };
 export type StepId = "prepare" | "label" | "fields" | "design" | "check";
 export type StepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
+export interface StepStat {
+  label: string;
+  value: string | number;
+}
+
 export interface Step {
   id: StepId;
   label: string;
+  /** What the step does, in one or two plain sentences. */
+  description: string;
   status: StepStatus;
   detail?: string;
+  /** Wall-clock time of the step. */
+  ms?: number;
+  /** Model calls made by this step (0 = code only). */
+  calls?: number;
+  usage?: Usage;
+  /** The model answer came from this session's cache (no cost). */
+  cached?: boolean;
+  stats?: StepStat[];
+  /** What went into the step: the prompt sent, or a summary of the data read. */
+  input?: string;
+  /** What came out: the model's answer, or a summary of what code produced. */
+  output?: string;
 }
 
 export interface PromptRecord {
@@ -112,12 +131,47 @@ export interface PipelineRun {
 }
 
 export const INITIAL_STEPS: Step[] = [
-  { id: "prepare", label: "Read & total the data", status: "pending" },
-  { id: "label", label: "Label keyword terms", status: "pending" },
-  { id: "fields", label: "Map listing fields", status: "pending" },
-  { id: "design", label: "Design the filter panel", status: "pending" },
-  { id: "check", label: "Check & fix output", status: "pending" },
+  {
+    id: "prepare",
+    label: "Read & total the data",
+    description:
+      "Reads every input, finds the keyword and listing columns, mines search terms and labels price words, places and sizes itself. No model involved.",
+    status: "pending",
+  },
+  {
+    id: "label",
+    label: "Label keyword terms",
+    description:
+      "Sends only the terms code couldn't label to the model, which maps each one to a dimension and value using the category's own spec names.",
+    status: "pending",
+  },
+  {
+    id: "fields",
+    label: "Merge listing spec names",
+    description:
+      "Asks the model which listing spec names are synonyms or not specs at all, so fill rates are counted once per real spec. Skipped when code can map everything.",
+    status: "pending",
+  },
+  {
+    id: "design",
+    label: "Design the filter panel",
+    description:
+      "The master prompt: demand tables, context, ranking and listing fill rates go in; ranked, tiered filters linked to their evidence come out.",
+    status: "pending",
+  },
+  {
+    id: "check",
+    label: "Check & fix the output",
+    description:
+      "Code fills in coverage, share and fill rates from the evidence links, then enforces the tier rules and cleans options. No repair call.",
+    status: "pending",
+  },
 ];
+
+/** Prompt messages as readable text for the "See the working" panel. */
+export function messagesText(messages: ChatMessage[]): string {
+  return messages.map((m) => `── ${m.role} ──\n${m.content}`).join("\n\n");
+}
 
 // ───────────────────────────── deterministic prep ─────────────────────────────
 
@@ -534,16 +588,27 @@ export function fixResult(
 // ───────────────────────────── run ─────────────────────────────
 
 interface RunHooks {
-  onStep: (id: StepId, status: StepStatus, detail?: string) => void;
+  onStep: (id: StepId, patch: Partial<Step>) => void;
   signal?: AbortSignal;
+  /**
+   * Re-run from this step: model answers for this step and the ones after it are asked for again;
+   * earlier steps reuse their cached answers. Default "prepare" with the cache on (a normal run).
+   */
+  from?: StepId;
 }
+
+const pctOf = (n: number, d: number) => (d ? `${Math.round((n / d) * 100)}%` : "–");
 
 export async function runPipeline(
   settings: LlmSettings,
   inputs: PipelineInputs,
   hooks: RunHooks,
 ): Promise<PipelineRun> {
-  const { onStep, signal } = hooks;
+  const { onStep, signal, from } = hooks;
+  // Re-running from a step asks the model afresh for that step (from "prepare": for every step).
+  // Labelling and spec merging don't depend on each other; the design step is always asked afresh
+  // unless the re-run starts at the check step.
+  const fresh = (id: "label" | "fields") => from === id || from === "prepare";
   // Small tasks don't need reasoning; the design step gets a little.
   const opts = (maxTokens: number, reasoning: "off" | "low") =>
     signal ? { maxTokens, reasoning, signal } : { maxTokens, reasoning };
@@ -552,52 +617,146 @@ export async function runPipeline(
   const prompts: PromptRecord[] = [];
   const warnings: string[] = [];
 
+  const started: Partial<Record<StepId, number>> = {};
+  const step = (id: StepId, status: StepStatus, patch: Partial<Step> = {}) => {
+    const now = performance.now();
+    if (status === "running") started[id] = now;
+    const ms =
+      status !== "running" && started[id] !== undefined
+        ? Math.round(now - started[id]!)
+        : undefined;
+    onStep(id, { status, ...(ms !== undefined ? { ms } : {}), ...patch });
+  };
+
   // 1 · deterministic prep
-  onStep("prepare", "running");
+  step("prepare", "running");
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
   const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
-  onStep(
-    "prepare",
-    "done",
-    [
-      kwCount
-        ? `${kwCount.toLocaleString()} keywords · ${auto.length} terms labelled by code`
-        : "no keywords",
-      prep.flatListings.length ? `${prep.flatListings.length} listings` : "",
-    ]
-      .filter(Boolean)
-      .join(" · "),
-  );
+  {
+    const bySource = (src: string) => prep.tables.find((t) => t.source === src)?.rows.length ?? 0;
+    const stats: StepStat[] = [];
+    if (kwCount) {
+      if (bySource("internal"))
+        stats.push({ label: "internal keywords", value: bySource("internal") });
+      if (bySource("serp")) stats.push({ label: "SERP keywords", value: bySource("serp") });
+      stats.push(
+        { label: "terms mined", value: prep.mining?.terms.length ?? 0 },
+        { label: "labelled by code", value: auto.length },
+        { label: "terms for the model", value: prep.modelTerms.length },
+      );
+    }
+    if (prep.flatListings.length)
+      stats.push(
+        { label: "listings", value: prep.flatListings.length },
+        { label: "spec fields", value: prep.specs.length },
+      );
+    stats.push(
+      { label: "dimension names", value: prep.dims.ranking.length + prep.dims.listing.length },
+      { label: "context chars", value: inputs.context.length },
+    );
+    const inputLines = [
+      ...prep.tables.map(
+        (t) =>
+          `${t.source} keywords: ${t.rows.length} rows · query column "${t.queryColumn ?? "?"}" · demand "${t.demandMetric ?? "none"}" · action "${t.actionMetric ?? "none"}"${t.rateMetrics.length ? ` · rates ${t.rateMetrics.join(", ")}` : ""}`,
+      ),
+      `context document: ${inputs.context.length.toLocaleString()} characters`,
+      `spec ranking: ${inputs.specs.trim() ? inputs.specs.trim().split(/\n/).length + " line(s)" : "none"}`,
+      `listings: ${inputs.listingRows.length} row(s)${inputs.listingRows.length > 500 ? " (first 500 used)" : ""}`,
+    ];
+    const outputLines = [
+      prep.mining ? `Core category words: ${prep.mining.coreTerms.join(", ") || "none"}` : "",
+      auto.length
+        ? `Labelled by code (${auto.length}):\n${auto
+            .slice(0, 60)
+            .map((l) => `  ${l.term} → ${l.dimension} = ${l.value}`)
+            .join("\n")}${auto.length > 60 ? `\n  … ${auto.length - 60} more` : ""}`
+        : "",
+      prep.modelTerms.length
+        ? `Terms left for the model (${prep.modelTerms.length}): ${prep.modelTerms
+            .slice(0, 40)
+            .map((t) => t.term)
+            .join(", ")}${prep.modelTerms.length > 40 ? ", …" : ""}`
+        : "",
+      prep.dims.ranking.length
+        ? `Dimensions from the ranking: ${prep.dims.ranking.join(", ")}`
+        : "",
+      prep.dims.listing.length
+        ? `Dimensions from listing specs: ${prep.dims.listing
+            .slice(0, 30)
+            .map((d) => `${d.name} (${d.fillPct}%)`)
+            .join(", ")}`
+        : "",
+      prep.specs.length
+        ? `Spec fields detected (${prep.specs.length}):\n${prep.specs
+            .slice(0, 40)
+            .map((sp) => `  ${sp.spec} · filled ${sp.fillPct}% · e.g. ${sp.samples.join(", ")}`)
+            .join("\n")}`
+        : "",
+    ].filter(Boolean);
+    step("prepare", "done", {
+      calls: 0,
+      detail: [
+        kwCount
+          ? `${kwCount.toLocaleString()} keywords · ${auto.length} terms labelled by code`
+          : "no keywords",
+        prep.flatListings.length ? `${prep.flatListings.length} listings` : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      stats,
+      input: inputLines.join("\n"),
+      output: outputLines.join("\n\n"),
+    });
+  }
 
   // 2 + 3 · labelling and spec-name merging run in parallel
   const labelTask = async (): Promise<{ labels: TermLabel[]; category: string | null }> => {
     if (!prep.mining || prep.modelTerms.length === 0) {
-      onStep("label", "skipped", prep.mining ? "all terms labelled by code" : "no keyword data");
+      step("label", "skipped", {
+        calls: 0,
+        detail: prep.mining ? "all terms labelled by code" : "no keyword data",
+      });
       return { labels: auto, category: null };
     }
     const messages = labelMessages(prep);
     prompts.push({ id: "label", stage: "label", title: "1 · Label keyword terms", messages });
     const key = cacheKey(settings, messages);
     const known = new Set(prep.modelTerms.map((t) => t.term));
+    step("label", "running", { input: messagesText(messages) });
     try {
-      let data = stageCache.get(key);
+      let data = fresh("label") ? undefined : stageCache.get(key);
       const cached = Boolean(data);
+      let stepUsage: Usage = {};
       if (!cached) {
-        onStep("label", "running");
         const res = await chatJson<unknown>(settings, messages, opts(2500, "off"));
+        stepUsage = res.usage;
         usage = addUsage(usage, res.usage);
         calls++;
         data = res.data;
         remember(key, data);
       }
       const labels = parseLabels(data, known);
-      onStep(
-        "label",
-        "done",
-        `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}`,
-      );
+      const dims = new Set(labels.map((l) => l.dimension));
       const category = (data as any)?.category_name;
+      step("label", "done", {
+        calls: cached ? 0 : 1,
+        cached,
+        usage: stepUsage,
+        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}`,
+        stats: [
+          { label: "terms sent", value: prep.modelTerms.length },
+          { label: "labelled", value: labels.length },
+          { label: "left unlabelled", value: prep.modelTerms.length - labels.length },
+          { label: "labelled share", value: pctOf(labels.length, prep.modelTerms.length) },
+          { label: "dimensions used", value: dims.size },
+          { label: "labelled by code", value: auto.length },
+          ...(typeof category === "string" && category
+            ? [{ label: "category", value: category }]
+            : []),
+        ],
+        output: JSON.stringify(data, null, 2),
+      });
       return {
         labels: [...auto, ...labels],
         category: typeof category === "string" ? category : null,
@@ -607,19 +766,48 @@ export async function runPipeline(
       warnings.push(
         `Term labelling failed (${(err as Error).message}); only code-labelled terms (price, location, size) were grouped.`,
       );
-      onStep("label", "error", "used code labels only");
+      step("label", "error", {
+        detail: "used code labels only",
+        output: (err as Error).message,
+      });
       return { labels: auto, category: null };
     }
   };
 
+  const profileStats = (profile: ListingProfile): StepStat[] => [
+    { label: "specs kept", value: profile.fields.length },
+    {
+      label: "filled on ≥ 50%",
+      value: profile.fields.filter((f) => f.fillPct >= 50).length,
+    },
+    { label: "priced listings", value: profile.price?.n ?? 0 },
+  ];
+  const profileText = (profile: ListingProfile) =>
+    `Listing spec profile (${profile.count} listings):\n${profile.fields
+      .slice(0, 40)
+      .map(
+        (f) =>
+          `  ${f.key} · filled ${f.fillPct}% · ${f.distinct} values · ${f.top
+            .slice(0, 5)
+            .map(([v]) => v)
+            .join(", ")}`,
+      )
+      .join("\n")}`;
+
   const fieldTask = async (): Promise<ListingProfile | null> => {
     if (prep.flatListings.length === 0) {
-      onStep("fields", "skipped", "no listings");
+      step("fields", "skipped", { calls: 0, detail: "no listings" });
       return null;
     }
     if (!needsFieldCall(prep)) {
-      onStep("fields", "skipped", "mapped by code");
-      return profileListings(prep.flatListings, prep.fieldMap);
+      const profile = profileListings(prep.flatListings, prep.fieldMap);
+      step("fields", "skipped", {
+        calls: 0,
+        detail: "mapped by code",
+        stats: profileStats(profile),
+        output: profileText(profile),
+      });
+      return profile;
     }
     const messages = fieldMessages(prep);
     prompts.push({
@@ -629,12 +817,14 @@ export async function runPipeline(
       messages,
     });
     const key = cacheKey(settings, messages);
+    step("fields", "running", { input: messagesText(messages) });
     try {
-      let data = stageCache.get(key);
+      let data = fresh("fields") ? undefined : stageCache.get(key);
       const cached = Boolean(data);
+      let stepUsage: Usage = {};
       if (!cached) {
-        onStep("fields", "running");
         const res = await chatJson<unknown>(settings, messages, opts(1500, "off"));
+        stepUsage = res.usage;
         usage = addUsage(usage, res.usage);
         calls++;
         data = res.data;
@@ -642,18 +832,25 @@ export async function runPipeline(
       }
       const { map, changes } = applySpecMerges(prep.fieldMap, data);
       const profile = profileListings(prep.flatListings, map);
-      onStep(
-        "fields",
-        "done",
-        `${profile.fields.length} specs · ${changes} field(s) merged or dropped${cached ? " · reused (no cost)" : ""}`,
-      );
+      step("fields", "done", {
+        calls: cached ? 0 : 1,
+        cached,
+        usage: stepUsage,
+        detail: `${profile.fields.length} specs · ${changes} field(s) merged or dropped${cached ? " · reused (no cost)" : ""}`,
+        stats: [
+          { label: "spec names sent", value: prep.specs.length },
+          { label: "merged or dropped", value: changes },
+          ...profileStats(profile),
+        ],
+        output: `${JSON.stringify(data, null, 2)}\n\n${profileText(profile)}`,
+      });
       return profile;
     } catch (err) {
       if ((err as Error).name === "AbortError") throw err;
       warnings.push(
         `Spec-name merging failed (${(err as Error).message}); the code-only field mapping was used.`,
       );
-      onStep("fields", "error", "used code mapping");
+      step("fields", "error", { detail: "used code mapping", output: (err as Error).message });
       return profileListings(prep.flatListings, prep.fieldMap);
     }
   };
@@ -670,7 +867,6 @@ export async function runPipeline(
   };
 
   // 4 · design
-  onStep("design", "running");
   const messages: ChatMessage[] = [
     {
       role: "system",
@@ -697,21 +893,87 @@ export async function runPipeline(
     title: "3 · Master prompt — design the filter panel",
     messages,
   });
-  const design = await chatJson<unknown>(settings, messages, opts(6000, "low"));
-  usage = addUsage(usage, design.usage);
-  calls++;
-  const { result, links } = normalizeResult(design.data);
-  if (result.filters.length === 0)
+  step("design", "running", { input: messagesText(messages) });
+  // The design answer is only reused when re-running from the check step.
+  const designKey = cacheKey(settings, messages);
+  let designData = from === "check" ? stageCache.get(designKey) : undefined;
+  const designCached = designData !== undefined;
+  let designUsage: Usage = {};
+  if (!designCached) {
+    const design = await chatJson<unknown>(settings, messages, opts(6000, "low"));
+    designUsage = design.usage;
+    usage = addUsage(usage, design.usage);
+    calls++;
+    designData = design.data;
+    remember(designKey, designData);
+  }
+  const { result, links } = normalizeResult(designData);
+  if (result.filters.length === 0) {
+    step("design", "error", {
+      detail: "no filters returned",
+      output: JSON.stringify(designData, null, 2),
+    });
     throw new Error("The model returned no filters. Try again or pick another model.");
-  onStep("design", "done", `${result.filters.length} filters proposed`);
+  }
+  const tierN = (t: Tier) => result.filters.filter((f) => f.tier === t).length;
+  step("design", "done", {
+    calls: designCached ? 0 : 1,
+    cached: designCached,
+    usage: designUsage,
+    detail: `${result.filters.length} filters proposed${designCached ? " · reused (no cost)" : ""}`,
+    stats: [
+      { label: "filters", value: result.filters.length },
+      { label: "Tier 1", value: tierN("Tier 1") },
+      { label: "Tier 2", value: tierN("Tier 2") },
+      { label: "Tier 3", value: tierN("Tier 3") },
+      { label: "linked to a dimension", value: links.filter((l) => l.dimension).length },
+      { label: "linked to a listing spec", value: links.filter((l) => l.listing_spec).length },
+      { label: "evidence tables sent", value: aggregation?.dimensions.length ?? 0 },
+    ],
+    output: JSON.stringify(designData, null, 2),
+  });
 
   // 5 · link evidence and fix in code (no second model call)
-  onStep("check", "running");
+  step("check", "running");
   const linkNotes = attachEvidence(result, links, aggregation, listing, inputs.demoListings);
   const { fixes, warnings: left } = fixResult(result, inputs.uiDesign !== false);
   if (inputs.uiDesign === false) result.interaction_rules = [];
   warnings.push(...fixes.map((f) => `Auto-fixed: ${f}`), ...linkNotes, ...left);
-  onStep("check", "done", fixes.length ? `${fixes.length} auto-fix(es)` : "all checks passed");
+  step("check", "done", {
+    calls: 0,
+    detail: fixes.length ? `${fixes.length} auto-fix(es)` : "all checks passed",
+    stats: [
+      { label: "auto-fixes", value: fixes.length },
+      { label: "evidence notes", value: linkNotes.length },
+      { label: "open warnings", value: left.length },
+      {
+        label: "with coverage",
+        value: result.filters.filter((f) => f.coverage_pct != null).length,
+      },
+      {
+        label: "with fill rate",
+        value: result.filters.filter((f) => f.listing_fill_pct != null).length,
+      },
+      { label: "needs new ISQ", value: result.filters.filter((f) => f.needs_new_isq).length },
+    ],
+    input: `${result.filters.length} filters from the design step, with ${links.length} evidence link(s).`,
+    output:
+      [
+        fixes.length
+          ? `Auto-fixes:\n${fixes.map((f) => `  • ${f}`).join("\n")}`
+          : "No fixes needed.",
+        linkNotes.length ? `Evidence notes:\n${linkNotes.map((f) => `  • ${f}`).join("\n")}` : "",
+        left.length ? `Still open:\n${left.map((f) => `  • ${f}`).join("\n")}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n") +
+      `\n\nFinal filters:\n${result.filters
+        .map(
+          (f) =>
+            `  ${f.tier} #${f.rank} ${f.name}${f.coverage_pct != null ? ` · coverage ${f.coverage_pct}%` : ""}${f.listing_fill_pct != null ? ` · filled ${f.listing_fill_pct}%` : ""}`,
+        )
+        .join("\n")}`,
+  });
 
   if (!result.category_name && category) result.category_name = category;
   result.total_keywords_analyzed = kwCount;
