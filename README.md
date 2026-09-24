@@ -71,9 +71,21 @@ model. The button bar shows a live estimate for your current inputs. What keeps 
 | Field mapping mostly free | Rules handle ids, URLs, names, prices, units and spec names; the model is called only to merge synonyms |
 | No repair call | Tier limits, option clean-up, display-only and ISQ blockers are fixed in code |
 | Reuse | Labelling and field-mapping answers are cached for the session — editing only the context doc or ranking and re-running costs one call |
-| Cheapest routing | On OpenRouter, requests use `provider.sort = price`; reasoning is off for steps 1–2 and low for step 3 (reasoning tokens bill as output) |
+| Cheapest routing | On OpenRouter, requests use `provider.sort = price`; reasoning is off for steps 1–2 and capped at 1,024 tokens for step 3 (reasoning tokens bill as output, and uncapped thinking is what makes some models hang) |
 | Stable prompt prefix | System prompts come first and don't change between runs, so providers with automatic prompt caching bill repeats at the cached rate |
-| Trimmed evidence | ≤ 12 values per dimension, minor dimensions on one line, top 10 keywords, specs filled on ≥ 5% of listings |
+| Trimmed evidence | ≤ 8 values per dimension, minor dimensions on one line, top 8 keywords, ≤ 25 specs with 4 values each |
+| Relevant context only | A long context doc is cut to the ~4,500 characters that mention this category's specs and buyer choice, not just its first page |
+| Fits small models | Output room sized per step; if a provider says the prompt is too long, it's re-sent in a compact form automatically; stuck calls time out and retry on another provider |
+
+**Model presets** (OpenRouter, all under ₹0.5 a run; the chip shows the live estimate):
+
+| Preset | Price per M tokens (in / out) | Notes |
+|--------|------------------------------|-------|
+| Qwen 3.8 Flash | $0.03 / $0.13 | cheapest |
+| DeepSeek V4 Flash | $0.07 / $0.14 | |
+| DeepSeek V4.1 Flash | $0.15 / $0.60 | best results so far |
+| GLM 5.3 Flash | $0.15 / $0.50 | strong, widely used flash model |
+| Gemini 3.1 Flash Lite | $0.25 / $1.50 | long context, fast |
 
 If a provider rejects an optional parameter (JSON mode, reasoning, routing), the call is retried once without them.
 

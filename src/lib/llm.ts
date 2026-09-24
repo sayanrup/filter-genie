@@ -42,12 +42,17 @@ export const MODEL_PRESETS: ModelPreset[] = [
     inputCost: 0.15,
     outputCost: 0.6,
   },
-  { id: "openai/gpt-4o-mini", name: "GPT-4o Mini", inputCost: 0.15, outputCost: 0.6 },
-  { id: "google/gemini-2.0-flash-001", name: "Gemini 2.0 Flash", inputCost: 0.1, outputCost: 0.4 },
+  { id: "z-ai/glm-5.3-flash", name: "GLM 5.3 Flash", inputCost: 0.15, outputCost: 0.5 },
+  {
+    id: "google/gemini-3.1-flash-lite",
+    name: "Gemini 3.1 Flash Lite",
+    inputCost: 0.25,
+    outputCost: 1.5,
+  },
 ];
 
 /** Typical run when no inputs are loaded yet (label + spec merge + design). */
-export const EST_RUN_TOKENS = { input: 8000, output: 2600 };
+export const EST_RUN_TOKENS = { input: 6500, output: 2400 };
 
 export const USD_TO_INR = 84;
 
@@ -80,7 +85,22 @@ export interface CallOptions {
    */
   reasoning?: "off" | "low";
   signal?: AbortSignal;
+  /** Give up on an attempt after this long (default scales with maxTokens). */
+  timeoutMs?: number;
 }
+
+/** The provider says the prompt (plus the room reserved for the answer) doesn't fit the model. */
+export class ContextLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ContextLimitError";
+  }
+}
+
+const CONTEXT_ERROR =
+  /context (length|window|limit)|maximum context|too many tokens|prompt is too long|input (is )?too (long|large)|exceeds? (the )?(max|maximum|limit|context)|token limit|reduce the length|max_tokens.*(exceed|too large)|input.{0,40}(limit|threshold)/i;
+
+export const isContextError = (msg: string) => CONTEXT_ERROR.test(msg);
 
 export interface CallResult {
   content: string;
@@ -128,12 +148,19 @@ export async function chat(
 
   // Optional parameters: dropped together if the provider rejects the request as invalid.
   let useOptional = true;
+  // Cheapest-provider routing: dropped after a timeout or a context-size error, so OpenRouter can
+  // pick a faster provider or one with a bigger context window.
+  let sortByPrice = true;
+  let maxTokens = opts.maxTokens ?? 4000;
   let retriedTransient = false;
+  let retriedTimeout = false;
+  let retriedContext = false;
+  const timeoutMs = opts.timeoutMs ?? 90_000 + maxTokens * 15;
 
   for (;;) {
     const body: Record<string, unknown> = {
       model: settings.model,
-      max_tokens: opts.maxTokens ?? 4000,
+      max_tokens: maxTokens,
       temperature: opts.temperature ?? 0.2,
       messages,
     };
@@ -141,42 +168,80 @@ export async function chat(
       if (opts.json) body["response_format"] = { type: "json_object" };
       if (settings.provider === "openrouter") {
         // Route to the cheapest provider serving this model.
-        body["provider"] = { sort: "price" };
+        if (sortByPrice) body["provider"] = { sort: "price" };
+        // Thinking is off for small tasks and capped for the design step: uncapped thinking is what
+        // makes some models look "stuck" (and it bills as output).
         if (opts.reasoning === "off") body["reasoning"] = { enabled: false };
-        else if (opts.reasoning === "low") body["reasoning"] = { effort: "low", exclude: true };
+        else if (opts.reasoning === "low") body["reasoning"] = { max_tokens: 1024, exclude: true };
       }
     }
     const sentOptional = useOptional && Object.keys(body).length > 4;
 
-    let resp: Response;
-    try {
-      resp = await fetch(`${base}/chat/completions`, {
-        method: "POST",
-        headers,
-        signal: opts.signal ?? null,
-        body: JSON.stringify(body),
-      });
-    } catch (err) {
-      if ((err as Error).name === "AbortError") throw err;
-      throw new Error(
-        settings.provider === "litellm"
-          ? `Could not reach your LiteLLM server at ${base}. Check the address is running and allows requests from this page (CORS).`
-          : "Could not reach OpenRouter. Check your connection and that the key is valid.",
-      );
-    }
+    // One attempt = the caller's signal + our own timeout.
+    const attempt = new AbortController();
+    const onAbort = () => attempt.abort();
+    opts.signal?.addEventListener("abort", onAbort);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      attempt.abort();
+    }, timeoutMs);
 
+    let resp: Response;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped provider JSON
     let data: any;
     try {
-      data = await resp.json();
-    } catch {
-      data = null;
+      try {
+        resp = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers,
+          signal: attempt.signal,
+          body: JSON.stringify(body),
+        });
+        try {
+          data = await resp.json();
+        } catch (err) {
+          if ((err as Error).name === "AbortError") throw err;
+          data = null;
+        }
+      } catch (err) {
+        if ((err as Error).name === "AbortError") {
+          if (!timedOut) throw err;
+          if (!retriedTimeout) {
+            retriedTimeout = true;
+            sortByPrice = false;
+            continue;
+          }
+          throw new Error(
+            `The model didn't answer within ${Math.round(timeoutMs / 1000)}s, twice (it may be overloaded or stuck thinking). Try again, or pick another model.`,
+          );
+        }
+        throw new Error(
+          settings.provider === "litellm"
+            ? `Could not reach your LiteLLM server at ${base}. Check the address is running and allows requests from this page (CORS).`
+            : "Could not reach OpenRouter. Check your connection and that the key is valid.",
+        );
+      }
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
     }
 
     const errMsg: string | undefined =
       data?.error?.message ?? (typeof data?.error === "string" ? data.error : undefined);
 
     if (!resp.ok || data?.error) {
+      const detail = `${errMsg ?? ""} ${JSON.stringify(data?.error?.metadata ?? "")}`;
+      if (isContextError(detail) || resp.status === 413) {
+        // First try: less room reserved for the answer, any provider. Then let the caller shrink the prompt.
+        if (!retriedContext) {
+          retriedContext = true;
+          sortByPrice = false;
+          maxTokens = Math.max(1200, Math.floor(maxTokens * 0.6));
+          continue;
+        }
+        throw new ContextLimitError(errMsg || "The prompt is too long for this model.");
+      }
       // Some models/gateways reject response_format / reasoning / provider — retry once without them.
       if (sentOptional && (resp.status === 400 || resp.status === 422)) {
         useOptional = false;
@@ -272,7 +337,7 @@ export async function chatJson<T>(
       const bigger = await chat(settings, messages, {
         ...opts,
         json: true,
-        maxTokens: (opts.maxTokens ?? 4000) * 2,
+        maxTokens: Math.min(8000, (opts.maxTokens ?? 4000) * 2),
       });
       usage = addUsage(usage, bigger.usage);
       try {

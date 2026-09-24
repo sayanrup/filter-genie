@@ -77,7 +77,7 @@ export const STAGES: Record<StageId, { title: string; skills: SkillId[] }> = {
   },
 };
 
-const DIVIDER = "\n\n═══════════════════════════════════════\n\n";
+const DIVIDER = "\n\n---\n\n";
 
 export function stageSkills(stage: StageId, exclude: SkillId[] = []): SkillDoc[] {
   return [

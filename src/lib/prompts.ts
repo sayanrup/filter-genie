@@ -39,6 +39,113 @@ function clip(text: string, max: number) {
   return `${t.slice(0, cut > max * 0.7 ? cut : max)}\n[… truncated — ${fmt(t.length - max)} more characters not shown]`;
 }
 
+/**
+ * How much of each input goes into a prompt. "normal" is used first; "compact" is the automatic
+ * retry when a provider says the prompt is too long for the model (small-context providers).
+ */
+export interface PromptBudget {
+  /** Characters of the context doc (relevance-picked excerpt) in the design / labelling prompts. */
+  contextChars: number;
+  labelContextChars: number;
+  rankingChars: number;
+  /** Values per keyword dimension, and whether rate columns (CTR, conversion) are included. */
+  maxValues: number;
+  rates: boolean;
+  topKeywords: number;
+  rawTerms: number;
+  /** Listing specs shown with values, values per spec and characters per value. */
+  maxSpecs: number;
+  specValues: number;
+  valueChars: number;
+  /** Terms sent for labelling and spec names sent for merging. */
+  labelTerms: number;
+  fieldSpecs: number;
+}
+
+export const BUDGETS: Record<"normal" | "compact", PromptBudget> = {
+  normal: {
+    contextChars: 4500,
+    labelContextChars: 1200,
+    rankingChars: 1500,
+    maxValues: 8,
+    rates: true,
+    topKeywords: 8,
+    rawTerms: 60,
+    maxSpecs: 25,
+    specValues: 4,
+    valueChars: 24,
+    labelTerms: 150,
+    fieldSpecs: 60,
+  },
+  compact: {
+    contextChars: 1800,
+    labelContextChars: 0,
+    rankingChars: 800,
+    maxValues: 5,
+    rates: false,
+    topKeywords: 5,
+    rawTerms: 30,
+    maxSpecs: 12,
+    specValues: 3,
+    valueChars: 20,
+    labelTerms: 80,
+    fieldSpecs: 30,
+  },
+};
+
+const DECISION_WORDS =
+  /\b(buyer|buyers|choose|choice|decide|decision|filter|important|priority|prefer|ask|asks|must|need|spec|specification|ignore|missing|compare|budget|price|size|material|type|quality)\b/gi;
+
+/**
+ * Pick the parts of a long context doc that matter for filter design: paragraphs that name the
+ * category's dimensions or talk about how buyers decide. Kept in document order, within `max`.
+ */
+export function excerpt(text: string, max: number, keywords: string[]) {
+  const t = text
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n\n")
+    .trim();
+  if (max <= 0) return "";
+  if (t.length <= max) return t;
+  // Chunks of ≤ ~400 characters on line breaks.
+  const chunks: string[] = [];
+  let cur = "";
+  for (const line of t.split("\n")) {
+    if (cur && cur.length + line.length > 400) {
+      chunks.push(cur);
+      cur = "";
+    }
+    cur = cur ? `${cur}\n${line}` : line;
+  }
+  if (cur) chunks.push(cur);
+  const kws = [
+    ...new Set(keywords.map((k) => k.toLowerCase().trim()).filter((k) => k.length >= 3)),
+  ];
+  const scored = chunks.map((c, i) => {
+    const low = c.toLowerCase();
+    const hits = kws.reduce((n, k) => n + (low.includes(k) ? 1 : 0), 0);
+    const decision = (c.match(DECISION_WORDS) ?? []).length;
+    return { i, c, score: hits * 3 + Math.min(decision, 6) + (i === 0 ? 4 : 0) };
+  });
+  const picked = new Set<number>();
+  let used = 0;
+  for (const x of [...scored].sort((a, b) => b.score - a.score || a.i - b.i)) {
+    if (used + x.c.length > max) continue;
+    picked.add(x.i);
+    used += x.c.length + 1;
+  }
+  const out: string[] = [];
+  let last = -1;
+  for (const x of scored) {
+    if (!picked.has(x.i)) continue;
+    if (x.i !== last + 1) out.push("[…]");
+    out.push(x.c);
+    last = x.i;
+  }
+  if (last !== chunks.length - 1) out.push("[…]");
+  return `${out.join("\n")}\n[excerpt: ${fmt(used)} of ${fmt(t.length)} characters, the parts most relevant to buyer choice and this category's specs]`;
+}
+
 // ───────────────────────────── 1 · term labelling ─────────────────────────────
 
 export const TERM_LABEL_SYSTEM = composeSystemPrompt("label");
@@ -48,25 +155,32 @@ export function buildTermLabelUser(
   mining: TermMining,
   dims: DimensionCandidates,
   context: string,
+  budget: PromptBudget = BUDGETS.normal,
 ) {
   // No numbers: labelling doesn't need them. Skip the example when it's just the term itself.
-  const lines = terms.map((t) =>
-    t.example.toLowerCase().trim() === t.term ? t.term : `${t.term} | ${t.example}`,
-  );
+  const lines = terms
+    .slice(0, budget.labelTerms)
+    .map((t) => (t.example.toLowerCase().trim() === t.term ? t.term : `${t.term} | ${t.example}`));
   const dimLines: string[] = [];
   if (dims.ranking.length)
     dimLines.push(`CM ranking (most important first): ${dims.ranking.join(", ")}`);
   if (dims.listing.length)
     dimLines.push(
       "Listing specs (name — common values):",
-      ...dims.listing.map((d) => `${d.name} — ${d.values.join(", ")}`),
+      ...dims.listing
+        .slice(0, budget.maxSpecs)
+        .map((d) => `${d.name} — ${d.values.slice(0, budget.specValues + 1).join(", ")}`),
     );
   const parts = [
     `Category words (not qualifiers): ${mining.coreTerms.join(", ") || "(none detected)"}`,
   ];
   if (dimLines.length) parts.push(block("CATEGORY_DIMENSIONS", dimLines.join("\n")));
   else parts.push("No category dimensions were provided — use the fallback dimensions.");
-  if (context.trim()) parts.push(block("CATEGORY_CONTEXT_EXCERPT", clip(context, 1500)));
+  const ctx = excerpt(context, budget.labelContextChars, [
+    ...dims.ranking,
+    ...dims.listing.map((d) => d.name),
+  ]);
+  if (ctx) parts.push(block("CATEGORY_CONTEXT_EXCERPT", ctx));
   parts.push(block("TERMS", `term | example keyword\n${lines.join("\n")}`));
   return parts.join("\n");
 }
@@ -75,8 +189,14 @@ export function buildTermLabelUser(
 
 export const FIELD_MAP_SYSTEM = composeSystemPrompt("fields");
 
-export function buildFieldMapUser(summary: ReturnType<typeof specSummary>, listingCount: number) {
-  const lines = summary.map((f) => `${f.spec} | ${f.fillPct}% | ${f.samples.join(" / ")}`);
+export function buildFieldMapUser(
+  summary: ReturnType<typeof specSummary>,
+  listingCount: number,
+  budget: PromptBudget = BUDGETS.normal,
+) {
+  const lines = summary
+    .slice(0, budget.fieldSpecs)
+    .map((f) => `${f.spec} | ${f.fillPct}% | ${f.samples.join(" / ")}`);
   return [
     `${listingCount} listings.`,
     block("SPECS", `spec name | filled | samples\n${lines.join("\n")}`),
@@ -105,6 +225,7 @@ export interface DesignEvidence {
   listing: ListingProfile | null;
   demoListings?: boolean;
   uiDesign?: boolean;
+  budget?: PromptBudget;
 }
 
 function metricName(t: KeywordTable | undefined) {
@@ -128,10 +249,11 @@ function formatSourceOverview(tables: KeywordTable[]) {
 }
 
 const SHORT: Record<string, string> = { internal: "INT", serp: "SERP" };
-const MAX_VALUES = 12;
 const MINOR_COVERAGE = 1; // % — dimensions below this in every source get one summary line
 
-function formatDimensions(agg: Aggregation, tables: KeywordTable[]) {
+function formatDimensions(agg: Aggregation, tables: KeywordTable[], budget: PromptBudget) {
+  const MAX_VALUES = budget.maxValues;
+  const rateCols = (t: KeywordTable) => (budget.rates ? t.rateMetrics.slice(0, 2) : []);
   const sources = tables.map((t) => t.source);
   const tableOf = (s: string) => tables.find((t) => t.source === s)!;
   const out: string[] = [];
@@ -162,7 +284,7 @@ function formatDimensions(agg: Aggregation, tables: KeywordTable[]) {
       const t = tableOf(s);
       const c = [`${SHORT[s]} ${metricName(t)}`, `${SHORT[s]} share`];
       if (t.actionMetric) c.push(`${SHORT[s]} ${t.actionMetric}`);
-      for (const r of t.rateMetrics) c.push(`${SHORT[s]} ${r}`);
+      for (const r of rateCols(t)) c.push(`${SHORT[s]} ${r}`);
       return c;
     });
     out.push(`value | ${cols.join(" | ")}`);
@@ -172,7 +294,7 @@ function formatDimensions(agg: Aggregation, tables: KeywordTable[]) {
         const b = v.bySource[s];
         const c = b ? [fmt(b.demand), pctStr(b.share)] : ["–", "–"];
         if (t.actionMetric) c.push(b ? fmt(b.action) : "–");
-        for (const r of t.rateMetrics)
+        for (const r of rateCols(t))
           c.push(b && b.rates[r] !== undefined ? pctStr(b.rates[r]!) : "–");
         return c;
       });
@@ -197,9 +319,9 @@ function formatDimensions(agg: Aggregation, tables: KeywordTable[]) {
   return out.join("\n");
 }
 
-function formatRawTerms(mining: TermMining, tables: KeywordTable[]) {
+function formatRawTerms(mining: TermMining, tables: KeywordTable[], limit: number) {
   const sources = tables.map((t) => t.source);
-  const lines = mining.terms.slice(0, 80).map(
+  const lines = mining.terms.slice(0, limit).map(
     (t) =>
       `${t.term} | ${sources
         .map((s) => {
@@ -233,12 +355,10 @@ function formatLakh(n: number) {
   return `₹${fmt(n)}`;
 }
 
-const MAX_SPECS = 30;
-
-function formatListing(p: ListingProfile, demo = false) {
+function formatListing(p: ListingProfile, demo: boolean, budget: PromptBudget) {
   // Specs almost nobody fills are summarised by name only (a demo sample keeps more of them visible).
   const minFill = demo ? 1 : 5;
-  const shown = p.fields.filter((f) => f.fillPct >= minFill).slice(0, demo ? 40 : MAX_SPECS);
+  const shown = p.fields.filter((f) => f.fillPct >= minFill).slice(0, budget.maxSpecs);
   const rare = p.fields.filter((f) => !shown.includes(f));
   const lines = [
     `${p.count} listings profiled.`,
@@ -246,14 +366,17 @@ function formatListing(p: ListingProfile, demo = false) {
     ...shown.map(
       (f) =>
         `${f.key} | ${f.fillPct}% | ${f.distinct} | ${f.top
-          .slice(0, 5)
-          .map(([v, n]) => `${v.slice(0, 30)} (${n})`)
+          .slice(0, budget.specValues)
+          .map(([v, n]) => `${v.slice(0, budget.valueChars)} (${n})`)
           .join(", ")}`,
     ),
   ];
   if (rare.length)
     lines.push(
-      `Rarely filled (below ${minFill}% or beyond the top ${shown.length}): ${rare.map((f) => f.key).join(", ")}`,
+      `Rarely filled (below ${minFill}% or beyond the top ${shown.length}): ${rare
+        .slice(0, 40)
+        .map((f) => `${f.key} ${f.fillPct}%`)
+        .join(", ")}${rare.length > 40 ? `, +${rare.length - 40} more` : ""}`,
     );
   if (p.price) {
     const u = p.price.unit ? ` per ${p.price.unit}` : "";
@@ -268,6 +391,7 @@ function formatListing(p: ListingProfile, demo = false) {
 }
 
 export function buildDesignUser(ev: DesignEvidence) {
+  const budget = ev.budget ?? BUDGETS.normal;
   const parts: string[] = [];
   parts.push(`CATEGORY: ${ev.category ?? "(infer it from the evidence)"}`);
   const present = [
@@ -287,12 +411,12 @@ export function buildDesignUser(ev: DesignEvidence) {
         : "",
       "",
       ev.aggregation && ev.aggregation.dimensions.length
-        ? formatDimensions(ev.aggregation, ev.tables)
+        ? formatDimensions(ev.aggregation, ev.tables, budget)
         : ev.mining
-          ? formatRawTerms(ev.mining, ev.tables)
+          ? formatRawTerms(ev.mining, ev.tables, budget.rawTerms)
           : "",
       "",
-      formatTopKeywords(ev.tables),
+      formatTopKeywords(ev.tables, budget.topKeywords),
     ].join("\n");
     parts.push(
       "",
@@ -300,19 +424,33 @@ export function buildDesignUser(ev: DesignEvidence) {
       block("KEYWORD_EVIDENCE", body),
     );
   }
-  if (ev.context.trim())
-    parts.push("", "## B. CATEGORY CONTEXT", block("CONTEXT", clip(ev.context, 8000)));
+  if (ev.context.trim()) {
+    // Only the parts of a long context doc that talk about this category's specs and buyer choice.
+    const keywords = [
+      ...(ev.aggregation?.dimensions.flatMap((d) => [
+        d.name,
+        ...d.values.slice(0, 3).map((v) => v.value),
+      ]) ?? []),
+      ...(ev.listing?.fields.slice(0, 20).map((f) => f.key.replace(/^isq\./, "")) ?? []),
+      ...ev.specs.split(/[\n,;|:]/).map((x) => x.replace(/^\s*[-•*]?\s*\d+\s*[-.)]\s*/, "")),
+    ];
+    parts.push(
+      "",
+      "## B. CATEGORY CONTEXT",
+      block("CONTEXT", excerpt(ev.context, budget.contextChars, keywords)),
+    );
+  }
   if (ev.specs.trim())
     parts.push(
       "",
       "## C. SPEC IMPORTANCE RANKING (category manager)",
-      block("RANKING", clip(ev.specs, 3000)),
+      block("RANKING", clip(ev.specs, budget.rankingChars)),
     );
   if (ev.listing)
     parts.push(
       "",
       "## D. LISTING SPEC PROFILE (computed by code)",
-      block("LISTINGS", formatListing(ev.listing, ev.demoListings)),
+      block("LISTINGS", formatListing(ev.listing, Boolean(ev.demoListings), budget)),
     );
 
   if (ev.listing && ev.demoListings)
