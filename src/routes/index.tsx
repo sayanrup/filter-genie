@@ -6,6 +6,8 @@ import {
   describeKeywordTable,
   fileToRows,
   flattenListing,
+  heuristicFieldMap,
+  specSummary,
   textToRows,
   toKeywordTable,
   type Row,
@@ -266,10 +268,16 @@ function Index() {
   );
   const productsDetail = useMemo(() => {
     if (!inputs.listingRows.length) return "";
-    const keys = new Set<string>();
-    for (const r of inputs.listingRows.slice(0, 100))
-      for (const k of Object.keys(flattenListing(r))) keys.add(k);
-    return `${inputs.listingRows.length.toLocaleString()} listings · ${keys.size} distinct fields found`;
+    const flat = inputs.listingRows.slice(0, 500).map((r) => flattenListing(r));
+    const specs = specSummary(flat, heuristicFieldMap(flat), 1000, 0);
+    const groups = new Set(inputs.listingRows.map((r) => r["_group"]).filter(Boolean)).size;
+    return [
+      `${inputs.listingRows.length.toLocaleString()} listings`,
+      groups > 1 ? `${groups} groups` : "",
+      `${specs.length} spec fields detected (${specs.filter((s) => s.fillPct >= 30).length} filled on ≥30%)`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
   }, [inputs.listingRows]);
 
   const hasInput = Boolean(

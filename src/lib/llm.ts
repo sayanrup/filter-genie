@@ -268,9 +268,26 @@ export async function chatJson<T>(
     };
   } catch (err) {
     if (first.finishReason === "length") {
-      throw new Error(
-        "The model ran out of output space before finishing its answer. Try a model with a larger output limit, or trim the inputs.",
-      );
+      // Cut off mid-answer (the "Unterminated string in JSON" case): retry once with twice the room.
+      const bigger = await chat(settings, messages, {
+        ...opts,
+        json: true,
+        maxTokens: (opts.maxTokens ?? 4000) * 2,
+      });
+      usage = addUsage(usage, bigger.usage);
+      try {
+        const data = extractJson<T>(bigger.content);
+        return {
+          data,
+          raw: bigger.content,
+          usage,
+          messages: [...messages, { role: "assistant", content: bigger.content }],
+        };
+      } catch {
+        throw new Error(
+          "The model's answer was cut off twice before it finished. Pick a model with a larger output limit, or trim the inputs.",
+        );
+      }
     }
     const followUp: ChatMessage[] = [
       ...messages,

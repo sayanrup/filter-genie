@@ -232,7 +232,7 @@ function formatListing(p: ListingProfile) {
     const u = p.price.unit ? ` per ${p.price.unit}` : "";
     lines.push(
       "",
-      `PRICE (${p.price.n} listings with a price${u}): min ${formatLakh(p.price.min)} · 25th pct ${formatLakh(p.price.p25)} · median ${formatLakh(p.price.median)} · 75th pct ${formatLakh(p.price.p75)} · max ${formatLakh(p.price.max)}`,
+      `PRICE (${p.price.n} listings priced${u}${p.price.otherUnits ? `; ${p.price.otherUnits} more quote other units and are excluded` : ""}): min ${formatLakh(p.price.min)} · 25th pct ${formatLakh(p.price.p25)} · median ${formatLakh(p.price.median)} · 75th pct ${formatLakh(p.price.p75)} · max ${formatLakh(p.price.max)}`,
     );
   } else {
     lines.push("", "PRICE: not enough priced listings to compute a distribution.");

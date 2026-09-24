@@ -16,8 +16,10 @@ returns empty results.
 - Values are grouped case-insensitively; top 8 per spec are kept (the Evidence tab shows all 8).
 - In the prompt, to save tokens: only specs filled on ≥ 5% of listings (max 30) get a row with their top 5
   values; rarer specs are listed by name on one line.
-- Price: first number in the price field; min / 25th / median / 75th / max over listings with a price,
-  and the most common unit (from a unit field or the text after `/`).
+- Price: first number in the price field, with the unit from a unit field or the text after `/`.
+  Quartiles (min / 25th / median / 75th / max) use only listings quoting the **most common unit** —
+  mixing "per piece" and "per sq ft" prices would make the ranges meaningless; the rest are counted and
+  mentioned.
 
 ## Prompt
 

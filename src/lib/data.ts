@@ -56,6 +56,15 @@ function findRecordArray(obj: unknown, depth = 0): unknown[] | null {
   ]) {
     if (Array.isArray(rec[k])) return rec[k] as unknown[];
   }
+  // {"group-a": [...], "group-b": [...]} — e.g. one array per category: take them all, tagged by group.
+  const groups = Object.entries(rec).filter(
+    ([, v]) => Array.isArray(v) && v.length > 0 && v.every((x) => x && typeof x === "object"),
+  );
+  if (groups.length >= 2) {
+    return groups.flatMap(([group, v]) =>
+      (v as Record<string, unknown>[]).map((item) => ({ _group: group, ...item })),
+    );
+  }
   for (const v of Object.values(rec)) {
     const found = findRecordArray(v, depth + 1);
     if (found && found.length > 0) return found;
@@ -787,10 +796,24 @@ export function aggregate(tables: KeywordTable[], labels: TermLabel[]): Aggregat
 
 // ───────────────────────────── listings ─────────────────────────────
 
+// Name/value spec pairs, e.g. {"name": "Material", "value": "MS"} or IndiaMART's
+// {"MASTER_DESC": "Material", "OPTIONS_DESC": "PVC, Steel"}.
 const NAME_KEYS =
-  /^(name|key|label|attribute|attr|spec|specification|title|isq_?name|question|field|param(eter)?)$/i;
+  /^(name|key|label|attribute|attr|spec|specification|title|isq_?name|question|field|param(eter)?|master_?desc|master_?name|spec_?name|attr_?name)$/i;
 const VALUE_KEYS =
-  /^(value|val|values|answer|option|options|desc|description|detail|isq_?value|response)$/i;
+  /^(value|val|values|answer|option|options|desc|description|detail|isq_?value|response|options?_?desc|option_?value|spec_?value|attr_?value)$/i;
+
+/** Prefix for keys that came from a name/value spec array (ISQ). */
+export const SPEC_PREFIX = "isq.";
+
+/** An array of objects that are whole records (nested listings like "more_prod"), not attributes. */
+function isNestedRecordArray(arr: unknown[]) {
+  const objs = arr.filter((x) => x && typeof x === "object" && !Array.isArray(x)) as Record<
+    string,
+    unknown
+  >[];
+  return objs.length > 0 && objs.every((o) => Object.keys(o).length >= 10);
+}
 
 /** Flatten a nested listing record into "path": "value" pairs; name/value spec arrays become real spec keys. */
 export function flattenListing(
@@ -809,16 +832,19 @@ export function flattenListing(
       if (joined && prefix) out[prefix] = joined;
       return out;
     }
+    // Nested listings (other products of the same seller, etc.) would skew fill rates — skip them.
+    if (isNestedRecordArray(obj)) return out;
     for (const item of obj) {
       if (item && typeof item === "object" && !Array.isArray(item)) {
         const keys = Object.keys(item);
         const nk = keys.find((k) => NAME_KEYS.test(k));
-        const vk = keys.find((k) => VALUE_KEYS.test(k));
+        const vk = keys.find((k) => k !== nk && VALUE_KEYS.test(k));
         const rec = item as Record<string, unknown>;
         if (nk && vk && typeof rec[nk] === "string") {
           const v = rec[vk];
           const val = Array.isArray(v) ? v.join(", ") : v;
-          if (!isEmpty(val)) out[String(rec[nk]).trim()] = String(val).trim();
+          const name = String(rec[nk]).trim();
+          if (name && !isEmpty(val)) out[`${SPEC_PREFIX}${name}`] = String(val).trim();
           continue;
         }
       }
@@ -843,6 +869,8 @@ export interface ListingField {
 
 export interface PriceStats {
   n: number;
+  /** Priced listings left out because they quote a different unit. */
+  otherUnits: number;
   min: number;
   p25: number;
   median: number;
@@ -867,9 +895,15 @@ const PRICE_KEY = /price|mrp|\brate\b|cost/i;
 const NAME_KEY = /(^|[._\s])(name|title|product_?name|item_?name|heading)$/i;
 const CATEGORY_KEY = /(^|[._\s])(category|mcat|mcat_?name|subcategory|group|cat)$/i;
 const UNIT_KEY = /(^|[._\s])(unit|uom|price_?unit|moq_?unit)$/i;
+// Whole field name only: "city", "specs.city" — not "glusr_distance_city".
+const CITY_KEY = /^(.*\.)?(city|city_?orig|seller_?city|location)$/i;
 
-/** "specs.isq_material_type" → "Material Type". */
+/** "specs.isq_material_type" → "Material Type"; "isq.Material" → "Material". */
 export function canonicalSpecName(key: string): string {
+  if (key.startsWith(SPEC_PREFIX)) {
+    const name = key.slice(SPEC_PREFIX.length).replace(/\s+/g, " ").trim();
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  }
   const last = key.split(".").pop() ?? key;
   const cleaned = last
     .replace(/^(isq|spec|specs|attr|attribute|prop|property)[_\s-]+/i, "")
@@ -893,19 +927,37 @@ export function heuristicFieldMap(flat: Record<string, string>[]): Map<string, s
       l.n++;
       lengths.set(k, l);
     }
+  // When most listings carry a structured spec list (ISQ), those ARE the specs: every other raw
+  // field (ids, flags, ranks, seller metadata…) is noise, except the seller's city.
+  const withSpecs = flat.filter((r) =>
+    Object.keys(r).some((k) => k.startsWith(SPEC_PREFIX)),
+  ).length;
+  const specMode = withSpecs >= Math.max(1, flat.length * 0.3);
+
+  // Case/spacing variants of one spec name ("Surface treatment" / "Surface Treatment") merge in code.
+  const display = new Map<string, string>();
+  const unify = (name: string) => {
+    const k = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!display.has(k)) display.set(k, name);
+    return display.get(k)!;
+  };
+
   const map = new Map<string, string>();
   for (const [key, l] of lengths) {
     const avgLen = l.total / Math.max(l.n, 1);
     let role: string;
-    if (IGNORE_KEY.test(key)) role = "@ignore";
+    if (key.startsWith(SPEC_PREFIX)) role = canonicalSpecName(key);
+    else if (CITY_KEY.test(key)) role = "Seller City";
+    else if (IGNORE_KEY.test(key)) role = "@ignore";
     else if (NAME_KEY.test(key)) role = "@name";
     else if (CATEGORY_KEY.test(key)) role = "@category";
     else if (UNIT_KEY.test(key)) role = "@unit";
     else if (PRICE_KEY.test(key)) role = "@price";
+    else if (specMode || key === "_group") role = "@ignore";
     else if (avgLen > 80)
       role = "@ignore"; // free text, not an attribute
     else role = canonicalSpecName(key);
-    map.set(key, role);
+    map.set(key, role.startsWith("@") ? role : unify(role));
   }
   return map;
 }
@@ -931,12 +983,13 @@ export function profileListings(
     string,
     { sources: Set<string>; filledRows: number; values: Map<string, { label: string; n: number }> }
   >();
-  const prices: number[] = [];
-  const units = new Map<string, number>();
+  // Price and unit per listing: quartiles are only meaningful within one unit (piece vs sq ft).
+  const priced: { price: number; unit: string | null }[] = [];
 
   for (const rec of flat) {
     const seen = new Set<string>();
     let price: number | null = null;
+    let unit: string | null = null;
     for (const [key, raw] of Object.entries(rec)) {
       const role = roleOf(key);
       if (role === "@ignore" || role === "@name" || role === "@category") continue;
@@ -944,14 +997,14 @@ export function profileListings(
         if (price === null) {
           const m = raw.replace(/,/g, "").match(/\d+(\.\d+)?/);
           if (m) price = Number(m[0]);
-          const unit = raw.split("/")[1]?.trim().toLowerCase();
-          if (unit) units.set(unit, (units.get(unit) ?? 0) + 1);
+          const u = raw.split("/")[1]?.trim().toLowerCase();
+          if (u && !unit) unit = u;
         }
         continue;
       }
       if (role === "@unit") {
         const u = raw.trim().toLowerCase();
-        if (u) units.set(u, (units.get(u) ?? 0) + 1);
+        if (u) unit = u;
         continue;
       }
       let f = fields.get(role);
@@ -963,12 +1016,18 @@ export function profileListings(
       if (seen.has(role)) continue; // first mapped source wins for this listing
       seen.add(role);
       f.filledRows++;
-      const norm = raw.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 80);
-      const v = f.values.get(norm);
-      if (v) v.n++;
-      else f.values.set(norm, { label: raw.trim().slice(0, 80), n: 1 });
+      // ISQ values are multi-select ("PVC, Stainless Steel"): count each option on its own.
+      const parts = key.startsWith(SPEC_PREFIX) ? raw.split(",") : [raw];
+      for (const part of parts) {
+        const label = part.trim().slice(0, 80);
+        if (!label) continue;
+        const norm = label.toLowerCase().replace(/\s+/g, " ");
+        const v = f.values.get(norm);
+        if (v) v.n++;
+        else f.values.set(norm, { label, n: 1 });
+      }
     }
-    if (price !== null && price > 0) prices.push(price);
+    if (price !== null && price > 0) priced.push({ price, unit });
   }
 
   const out: ListingField[] = [...fields.entries()]
@@ -986,12 +1045,18 @@ export function profileListings(
     .sort((a, b) => b.filled - a.filled)
     .slice(0, 60);
 
-  prices.sort((a, b) => a - b);
-  const topUnit = [...units.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  const unitCounts = new Map<string, number>();
+  for (const p of priced) if (p.unit) unitCounts.set(p.unit, (unitCounts.get(p.unit) ?? 0) + 1);
+  const topUnit = [...unitCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  const prices = priced
+    .filter((p) => !topUnit || p.unit === topUnit || p.unit === null)
+    .map((p) => p.price)
+    .sort((a, b) => a - b);
   const price: PriceStats | null =
     prices.length >= 3
       ? {
           n: prices.length,
+          otherUnits: priced.length - prices.length,
           min: prices[0]!,
           p25: quantile(prices, 0.25),
           median: quantile(prices, 0.5),
@@ -1011,7 +1076,8 @@ export function profileListings(
 export function specSummary(
   flat: Record<string, string>[],
   map: Map<string, string>,
-  maxSpecs = 80,
+  maxSpecs = 60,
+  minFillPct = 2,
 ) {
   const stats = new Map<string, { rows: number; samples: string[]; sources: Set<string> }>();
   for (const rec of flat) {
@@ -1033,13 +1099,17 @@ export function specSummary(
       if (s.samples.length < 3 && !s.samples.includes(short)) s.samples.push(short);
     }
   }
-  return [...stats.entries()]
-    .sort((a, b) => b[1].rows - a[1].rows)
-    .slice(0, maxSpecs)
-    .map(([spec, s]) => ({
-      spec,
-      fillPct: pct(s.rows, flat.length),
-      samples: s.samples,
-      sources: [...s.sources],
-    }));
+  return (
+    [...stats.entries()]
+      .sort((a, b) => b[1].rows - a[1].rows)
+      // The long tail of one-off spec names isn't worth merging (and costs tokens).
+      .filter(([, s]) => pct(s.rows, flat.length) >= minFillPct)
+      .slice(0, maxSpecs)
+      .map(([spec, s]) => ({
+        spec,
+        fillPct: pct(s.rows, flat.length),
+        samples: s.samples,
+        sources: [...s.sources],
+      }))
+  );
 }
