@@ -1113,3 +1113,60 @@ export function specSummary(
       }))
   );
 }
+
+// ───────────────────────────── category dimensions ─────────────────────────────
+
+export interface DimensionCandidates {
+  /** Spec names from the category manager's ranking, in ranked order. */
+  ranking: string[];
+  /** Listing spec names with their most common values, by fill rate. */
+  listing: { name: string; fillPct: number; values: string[] }[];
+}
+
+/** "Green (top): 1-Size, 2-Material" → ["Size", "Material"]. */
+export function parseRankingNames(text: string): string[] {
+  const names: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const body = line.includes(":") ? line.slice(line.indexOf(":") + 1) : line;
+    for (const raw of body.split(/[,;|]/)) {
+      const name = raw
+        .replace(/^\s*[-•*]?\s*\d+\s*[-.)]\s*/, "")
+        .replace(/\(.*?\)/g, "")
+        .trim();
+      if (name.length >= 2 && name.length <= 40 && /[a-z]/i.test(name) && !names.includes(name))
+        names.push(name);
+    }
+  }
+  return names.slice(0, 30);
+}
+
+/**
+ * The category's own filter dimensions — used instead of a fixed list when labelling keyword terms,
+ * so keyword demand lands on the same names as the ranking and the listing specs.
+ */
+export function dimensionCandidates(
+  specsRanking: string,
+  listing: ListingProfile | null,
+): DimensionCandidates {
+  return {
+    ranking: parseRankingNames(specsRanking),
+    listing: (listing?.fields ?? [])
+      .filter((f) => f.fillPct >= 3)
+      .slice(0, 25)
+      .map((f) => ({ name: f.key, fillPct: f.fillPct, values: f.top.slice(0, 5).map(([v]) => v) })),
+  };
+}
+
+/** Point code-labelled sizes/places at the category's own dimension names when it has them. */
+export function alignAutoLabels(labels: TermLabel[], c: DimensionCandidates): TermLabel[] {
+  const names = [...c.listing.map((l) => l.name), ...c.ranking];
+  const sizeName = names.find((n) => /\b(size|dimension)/i.test(n));
+  const placeName = names.find((n) => /\b(city|location)\b/i.test(n));
+  return labels.map((l) =>
+    l.dimension === "Size / Capacity" && sizeName
+      ? { ...l, dimension: sizeName }
+      : l.dimension === "Location" && placeName
+        ? { ...l, dimension: placeName }
+        : l,
+  );
+}

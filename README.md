@@ -37,6 +37,16 @@ context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT �
 
 Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.
 
+**Order of evidence.** Filters start from what buyers search (keyword dimensions), are validated against the
+category context and the CM ranking, and only then checked against listing fill rates. The dimension names used
+to label keywords are **not a fixed list**: they come from the category itself — the specs in the CM ranking,
+the spec names sellers fill in the listings (with their values) and an excerpt of the context doc — so demand,
+ranking and fill rates all line up on the same names.
+
+**Demo listings.** The "Listings are a demo sample" checkbox (on by default) keeps filters with low listing
+fill rates in their tier and adds the fill rate to the rationale ("only 12% of sample listings fill this —
+needs ISQ push") instead of demoting them.
+
 ## Cost
 
 A typical run is **3 calls and about 5–9k input / 2–3k output tokens** — well under ₹0.10 on the default
