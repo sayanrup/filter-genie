@@ -187,6 +187,7 @@ function Index() {
   const [productsText, setProductsText] = useState("");
   // Listings are a demo sample for now: keep low-fill filters and flag them.
   const [demoListings, setDemoListings] = useState(true);
+  const [uiDesign, setUiDesign] = useState(true);
 
   const [serpFile, setSerpFile] = useState<Row[] | null>(null);
   const [internalFile, setInternalFile] = useState<Row[] | null>(null);
@@ -248,6 +249,7 @@ function Index() {
       specs: specsText,
       listingRows: productsFile ?? safeRows(productsText),
       demoListings,
+      uiDesign,
     }),
     [
       serpFile,
@@ -259,6 +261,7 @@ function Index() {
       productsFile,
       productsText,
       demoListings,
+      uiDesign,
     ],
   );
 
@@ -501,6 +504,12 @@ function Index() {
   const tierCount = (tier: string) => result?.filters.filter((f) => f.tier === tier).length ?? 0;
 
   const hasEvidence = Boolean(run && (run.evidence.tables.length || run.evidence.listing));
+  // Runs made with "Include UI design" off have no options or UI patterns to show.
+  const hasDesign = Boolean(
+    result?.filters.some(
+      (f) => f.values.length > 0 || (f.ui_pattern && f.ui_pattern !== "display only"),
+    ),
+  );
 
   const usageLine = useMemo(() => {
     if (!run) return "";
@@ -836,6 +845,20 @@ function Index() {
         </span>
       </label>
 
+      <label className="mt-2 flex items-start gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={uiDesign}
+          onChange={(e) => setUiDesign(e.target.checked)}
+        />
+        <span>
+          <strong className="text-foreground">Include UI design</strong> — UI pattern, filter
+          options and interaction rules for each filter. Untick to get only the filter list, tiers,
+          confidence and rationale (shorter answer, cheaper run).
+        </span>
+      </label>
+
       {/* Actions */}
       <div className="mt-5 flex flex-wrap items-center gap-2">
         {loading ? (
@@ -955,7 +978,10 @@ function Index() {
                   <h3 className="font-display text-sm font-semibold">{p.title}</h3>
                   {p.stage ? (
                     <div className="flex flex-wrap gap-1">
-                      {stageSkills(p.stage).map((s) => (
+                      {stageSkills(
+                        p.stage,
+                        p.stage === "design" && !uiDesign ? ["options"] : [],
+                      ).map((s) => (
                         <span
                           key={s.id}
                           className="rounded bg-primary-soft px-1.5 py-px font-mono text-[10px] text-primary"
@@ -1087,6 +1113,7 @@ function Index() {
           <div className="mb-3 flex flex-wrap items-center gap-1 border-b-2 border-border">
             {(["table", "preview", "evidence", "raw"] as const)
               .filter((t) => t !== "evidence" || hasEvidence)
+              .filter((t) => t !== "preview" || hasDesign)
               .map((t) => (
                 <button
                   key={t}
@@ -1124,16 +1151,21 @@ function Index() {
               <table className="w-full border-collapse text-sm">
                 <thead>
                   <tr>
-                    {["#", "Tier", "Filter", "UI pattern", "Values", "Confidence", "Why"].map(
-                      (h) => (
-                        <th
-                          key={h}
-                          className="label-caps border-b-2 border-border px-3 py-2.5 text-left whitespace-nowrap"
-                        >
-                          {h}
-                        </th>
-                      ),
-                    )}
+                    {[
+                      "#",
+                      "Tier",
+                      "Filter",
+                      ...(hasDesign ? ["UI pattern", "Values"] : []),
+                      "Confidence",
+                      "Why",
+                    ].map((h) => (
+                      <th
+                        key={h}
+                        className="label-caps border-b-2 border-border px-3 py-2.5 text-left whitespace-nowrap"
+                      >
+                        {h}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
@@ -1180,24 +1212,28 @@ function Index() {
                             </div>
                           ) : null}
                         </td>
-                        <td className="px-3 py-3 text-xs">{f.ui_pattern}</td>
-                        <td className="px-3 py-3">
-                          <div className="flex flex-wrap gap-1">
-                            {f.values.slice(0, 15).map((v, vi) => (
-                              <span
-                                key={`${v}-${vi}`}
-                                className="rounded border border-border bg-secondary px-1.5 py-px text-[11px]"
-                              >
-                                {v}
-                              </span>
-                            ))}
-                            {f.values.length > 15 ? (
-                              <span className="rounded border border-border px-1.5 py-px text-[11px] text-muted-foreground">
-                                +{f.values.length - 15}
-                              </span>
-                            ) : null}
-                          </div>
-                        </td>
+                        {hasDesign ? (
+                          <>
+                            <td className="px-3 py-3 text-xs">{f.ui_pattern}</td>
+                            <td className="px-3 py-3">
+                              <div className="flex flex-wrap gap-1">
+                                {f.values.slice(0, 15).map((v, vi) => (
+                                  <span
+                                    key={`${v}-${vi}`}
+                                    className="rounded border border-border bg-secondary px-1.5 py-px text-[11px]"
+                                  >
+                                    {v}
+                                  </span>
+                                ))}
+                                {f.values.length > 15 ? (
+                                  <span className="rounded border border-border px-1.5 py-px text-[11px] text-muted-foreground">
+                                    +{f.values.length - 15}
+                                  </span>
+                                ) : null}
+                              </div>
+                            </td>
+                          </>
+                        ) : null}
                         <td className="px-3 py-3">
                           <span
                             className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
@@ -1256,7 +1292,7 @@ function Index() {
                 </div>
               ) : null}
             </div>
-          ) : tab === "preview" ? (
+          ) : tab === "preview" && hasDesign ? (
             <SearchPreview result={result} initialDevice={device} onDeviceChange={setDevice} />
           ) : tab === "evidence" && hasEvidence ? (
             <EvidenceView run={run} />

@@ -24,6 +24,7 @@ import { addUsage, chatJson, type ChatMessage, type LlmSettings, type Usage } fr
 import {
   FIELD_MAP_SYSTEM,
   FILTER_DESIGN_SYSTEM,
+  FILTER_DESIGN_SYSTEM_NO_UI,
   TERM_LABEL_SYSTEM,
   buildDesignUser,
   buildFieldMapUser,
@@ -68,6 +69,8 @@ export interface PipelineInputs {
   listingRows: Row[];
   /** Listing data is a demo sample: keep low-fill filters and flag them instead of dropping them. */
   demoListings?: boolean;
+  /** Ask for UI patterns, option values and interaction rules (default on). Off = filters + tiers only. */
+  uiDesign?: boolean;
 }
 
 export type { StageId };
@@ -201,7 +204,10 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
     stage: "design",
     title: "3 · Master prompt — design the filter panel",
     messages: [
-      { role: "system", content: FILTER_DESIGN_SYSTEM },
+      {
+        role: "system",
+        content: inputs.uiDesign === false ? FILTER_DESIGN_SYSTEM_NO_UI : FILTER_DESIGN_SYSTEM,
+      },
       {
         role: "user",
         content: buildDesignUser({
@@ -216,6 +222,7 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
             ? profileListings(prep.flatListings, prep.fieldMap)
             : null,
           demoListings: Boolean(inputs.demoListings),
+          uiDesign: inputs.uiDesign !== false,
         }).concat(
           prep.modelTerms.length
             ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
@@ -418,7 +425,10 @@ const MAX_OPTIONS = 12;
  * Deterministic fixes instead of a second (full-price) model call. Returns a note per change so
  * nothing changes silently, plus warnings for what can't be fixed in code.
  */
-export function fixResult(r: FilterResult): { fixes: string[]; warnings: string[] } {
+export function fixResult(
+  r: FilterResult,
+  uiDesign = true,
+): { fixes: string[]; warnings: string[] } {
   const fixes: string[] = [];
   const warnings: string[] = [];
   const confScore: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
@@ -441,6 +451,17 @@ export function fixResult(r: FilterResult): { fixes: string[]; warnings: string[
   });
 
   for (const f of r.filters) {
+    if (!uiDesign) {
+      // Filters + tiers only: no options or UI patterns to check.
+      f.values = [];
+      f.ui_pattern = f.tier === "Tier 3" ? "display only" : "";
+      if (
+        !/\d/.test(f.rationale) &&
+        !/context|interview|ranking|ranked|\bCM\b|listing/i.test(f.rationale)
+      )
+        warnings.push(`The rationale for "${f.name}" cites no evidence.`);
+      continue;
+    }
     const junk = f.values.filter((v) => v.length < 2 || /^\d+(\.\d+)?$/.test(v));
     if (junk.length) {
       f.values = f.values.filter((v) => !junk.includes(v));
@@ -651,7 +672,10 @@ export async function runPipeline(
   // 4 · design
   onStep("design", "running");
   const messages: ChatMessage[] = [
-    { role: "system", content: FILTER_DESIGN_SYSTEM },
+    {
+      role: "system",
+      content: inputs.uiDesign === false ? FILTER_DESIGN_SYSTEM_NO_UI : FILTER_DESIGN_SYSTEM,
+    },
     {
       role: "user",
       content: buildDesignUser({
@@ -663,6 +687,7 @@ export async function runPipeline(
         specs: inputs.specs,
         listing,
         demoListings: Boolean(inputs.demoListings),
+        uiDesign: inputs.uiDesign !== false,
       }),
     },
   ];
@@ -683,7 +708,8 @@ export async function runPipeline(
   // 5 · link evidence and fix in code (no second model call)
   onStep("check", "running");
   const linkNotes = attachEvidence(result, links, aggregation, listing, inputs.demoListings);
-  const { fixes, warnings: left } = fixResult(result);
+  const { fixes, warnings: left } = fixResult(result, inputs.uiDesign !== false);
+  if (inputs.uiDesign === false) result.interaction_rules = [];
   warnings.push(...fixes.map((f) => `Auto-fixed: ${f}`), ...linkNotes, ...left);
   onStep("check", "done", fixes.length ? `${fixes.length} auto-fix(es)` : "all checks passed");
 
@@ -713,7 +739,8 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
     const userLines = (p.messages[1]?.content.match(/\n/g) ?? []).length;
     if (p.id === "label") outputTokens += 60 + userLines * 7;
     else if (p.id === "fields") outputTokens += 40 + userLines * 4;
-    else if (p.id === "design") outputTokens += 1800;
+    else if (p.id === "design")
+      outputTokens += p.messages[1]?.content.includes("UI DESIGN IS SWITCHED OFF") ? 1000 : 1800;
   }
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;
