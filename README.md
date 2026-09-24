@@ -37,6 +37,13 @@ context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT �
 
 Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.
 
+**Watch it work.** Each run shows one card per step: what it does, its status and time, model calls with
+tokens in/out and ₹ cost (or "no model call" / "reused · no cost"), and the step's numbers (terms mined,
+labelled share, specs kept, filters per tier, auto-fixes…). **See the working** opens the exact input (the
+prompt sent, or the data read) and output (the model's answer, or what code produced). **Re-run from here**
+asks the model afresh for that step and everything that depends on it, and reuses the answers above it —
+e.g. re-running the design step costs one call, and re-running the check step costs nothing.
+
 **Order of evidence.** Filters start from what buyers search (keyword dimensions), are validated against the
 category context and the CM ranking, and only then checked against listing fill rates. The dimension names used
 to label keywords are **not a fixed list**: they come from the category itself — the specs in the CM ranking,
@@ -129,6 +136,7 @@ The **Skill docs** toggle in that panel shows each markdown file in full.
 | `src/lib/filter-gen.ts` | The pipeline: prepare → label ∥ merge specs → design → link evidence & auto-fix; cache; cost estimate |
 | `src/lib/export.ts` | Markdown export for saved runs |
 | `src/components/SearchPreview.tsx` | Demo search page |
+| `src/components/StepCards.tsx` | "Watch it work" step cards: status, time, tokens, cost, input/output, re-run |
 | `src/skills/` | Skill docs and the prompt composer |
 | `src/routes/index.tsx` | The page |
 
