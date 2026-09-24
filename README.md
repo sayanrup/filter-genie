@@ -1,24 +1,133 @@
-# Filter Genie
+# Filter Genie — Search Filter Generator
 
-i want to build an artifact where if i put inputs it will provide search filters and thei options
+Turns category research into a ranked, tiered set of **search-page filters** for a B2B marketplace
+(IndiaMART-style): which filters to show, in what order, with which options — and which specs belong on
+the listing card instead.
 
-This project was built with [Lovable](https://lovable.dev).
+Every input is optional; drop a file or paste text into any of them:
 
-## Build with Lovable
+| # | Input | Typical source |
+|---|-------|----------------|
+| 1 | Google SERP keywords | Search Console export — query, clicks, impressions, position |
+| 2 | Internal search keywords | Site-search report — keyword, pageviews, enquiries, calls, CTR/conversion |
+| 3 | Category context document | Buyer/seller interview notes, display-attribute research, spec audits |
+| 4 | Spec importance ranking | The category manager's ranked specs / colour tiers |
+| 5 | Product listings | Any JSON / CSV / XLSX export (nested ISQ spec arrays are fine) |
 
-Continue developing this project in the [Lovable editor](https://lovable.dev/projects/e81429cb-a496-4fd1-9755-593892d3f10b).
+The app runs entirely in the browser with your own **OpenRouter** or **LiteLLM** key.
 
-- **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: every change made in Lovable is committed straight to this repository.
-- **Full ownership**: this code is yours. Push to `main` on GitHub and your changes sync back into Lovable, ready for your next prompt.
+## How a run works
+
+The model never does arithmetic, and it only sees what code can't decide on its own.
+
+```
+keywords (1, 2) ─▶ code: parse → detect columns → normalise → mine terms
+                        ├─ price words, places, sizes ──▶ labelled by code (free)
+                        └─ remaining top 150 terms ──▶ model · step 1: label → dimension + value
+                   code: total demand per dimension/value (coverage, top-value share)
+
+listings (5) ────▶ code: flatten JSON → field rules (ignore ids/urls, name, price, unit, spec names)
+                        └─ if ≥ 2 spec names ──▶ model · step 2: merge synonyms / drop non-specs
+                   code: fill % per spec, common values, price quartiles
+
+context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT → filters linked to evidence rows
+                   code: fill in coverage / share / fill % from the links, auto-fix (Tier 1 = 3–5,
+                         real options, Tier 3 display-only, ISQ blockers) and list every fix
+```
+
+Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.
+
+## Cost
+
+A typical run is **3 calls and about 5–9k input / 2–3k output tokens** — well under ₹0.10 on the default
+model. The button bar shows a live estimate for your current inputs. What keeps it low:
+
+| Saving | How |
+|--------|-----|
+| No arithmetic by the model | Code totals everything; the model gets compact tables, not raw rows |
+| Fewer terms to label | Price words, cities/states and sizes are labelled by code; only the top 150 other terms go to the model, with no numbers |
+| Short answers | Labels come back grouped (`dimension → value → [terms]`); spec mapping returns only merges; filters return evidence *links* and code fills the numbers |
+| Field mapping mostly free | Rules handle ids, URLs, names, prices, units and spec names; the model is called only to merge synonyms |
+| No repair call | Tier limits, option clean-up, display-only and ISQ blockers are fixed in code |
+| Reuse | Labelling and field-mapping answers are cached for the session — editing only the context doc or ranking and re-running costs one call |
+| Cheapest routing | On OpenRouter, requests use `provider.sort = price`; reasoning is off for steps 1–2 and low for step 3 (reasoning tokens bill as output) |
+| Stable prompt prefix | System prompts come first and don't change between runs, so providers with automatic prompt caching bill repeats at the cached rate |
+| Trimmed evidence | ≤ 12 values per dimension, minor dimensions on one line, top 10 keywords, specs filled on ≥ 5% of listings |
+
+If a provider rejects an optional parameter (JSON mode, reasoning, routing), the call is retried once without them.
+
+## Skill docs — the prompts live in `src/skills/`
+
+Every prompt is assembled from small markdown files, one per layer of the task, so you can improve one
+layer without touching the others:
+
+```
+system prompt for a stage = base.md + the "## Prompt" section of each skill doc listed for that stage
+```
+
+| File | Layer | Used in |
+|------|-------|---------|
+| `base.md` | Shared context and ground rules | every stage |
+| `01-parse-keyword-files.md` | Reading keyword exports, demand/action metrics | master prompt |
+| `02-derive-specs-from-keywords.md` | Mining terms from keywords; code auto-labels; model labels the rest | step 1 |
+| `03-demand-aggregation.md` | Coverage, top-value share, generic share | master prompt |
+| `04-parse-product-json.md` | Flattening product JSON; field rules; merging spec synonyms | step 2 |
+| `05-listing-spec-profile.md` | Fill rates, common values, price distribution (supply) | master prompt |
+| `06-context-and-ranking.md` | Reading the context doc and CM ranking | master prompt |
+| `07-filter-design-brief.md` | Master prompt role and goal | master prompt |
+| `08-scoring-and-tiering.md` | Scoring, confidence, tiers, ordering | master prompt |
+| `09-filter-options-and-ui.md` | Option lists, numeric ranges, UI pattern | master prompt |
+| `10-rationale-and-output.md` | Rationale, rules, blockers, JSON schema, worked example | master prompt |
+| `11-output-validation.md` | Code checks and automatic fixes (no prompt) | after step 3 |
+
+Each skill doc has:
+
+- a short header — what the layer does and which code implements it;
+- `## What the code does` (deterministic layers) — behaviour you can change in the named function;
+- `## Prompt` — the **only** part sent to the model. Everything else is for humans.
+
+The stage → skill mapping is in `src/skills/index.ts` (`STAGES`). To add a skill, create the `.md`,
+import it in `index.ts` and list it under a stage.
+
+**View prompts** (next to Generate) shows the fully assembled prompt of every stage — the base prompt plus
+the skill docs it's built from, with the file names — and the exact data sent. Before a run it previews
+from your current inputs; after a run it shows what was actually sent.
+The **Skill docs** toggle in that panel shows each markdown file in full.
+
+## Output
+
+- **Filter table** — tier, rank, name, UI pattern, options, confidence, rationale, supporting sources,
+  coverage / top-value share / listing fill % (filled in by code), and ISQ gaps.
+- **See it on a page** — a demo search page: Tier 1 in the filter bar, Tier 2 under "More filters",
+  Tier 3 specs shown on the product cards.
+- **Save results + download .md** — keeps runs on this device (reopen them from "View saved results").
+- **Evidence** — the dimension/value demand tables and the listing spec profile the master prompt received.
+- **Raw JSON**, **Export JSON**, **Export CSV**.
+- **Warnings** — every automatic fix, and anything code couldn't fix.
+
+## Code map
+
+| Path | What |
+|------|------|
+| `src/lib/data.ts` | Parsing, column detection, term mining, aggregation, listing flattening & profiling (no model) |
+| `src/lib/prompts.ts` | Builds each stage's user message (the data blocks) |
+| `src/lib/llm.ts` | OpenRouter/LiteLLM client: JSON mode, reasoning budget, price routing (with fallback), retry on 429/5xx |
+| `src/lib/filter-gen.ts` | The pipeline: prepare → label ∥ merge specs → design → link evidence & auto-fix; cache; cost estimate |
+| `src/lib/export.ts` | Markdown export for saved runs |
+| `src/components/SearchPreview.tsx` | Demo search page |
+| `src/skills/` | Skill docs and the prompt composer |
+| `src/routes/index.tsx` | The page |
 
 ## Development
 
-Prefer working locally? You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating).
+This project was built with [Lovable](https://lovable.dev) — continue in the
+[Lovable editor](https://lovable.dev/projects/e81429cb-a496-4fd1-9755-593892d3f10b), or locally:
 
 ```sh
-git clone <this-repository-url>
-cd <repository-name>
 npm i
-npm run dev
+npm run dev      # http://localhost:8080
+npm run lint
+npm run build
 ```
+
+Changes pushed to the connected branch sync back to Lovable.

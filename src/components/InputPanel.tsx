@@ -10,6 +10,8 @@ interface InputPanelProps {
   onTextChange: (value: string) => void;
   onFile: (file: File) => void;
   status?: { kind: "ok" | "error" | "busy"; message: string } | null;
+  /** What was detected in the data (columns, row counts) — shown under the paste box. */
+  detail?: string;
   tall?: boolean;
   className?: string;
 }
@@ -24,6 +26,7 @@ export function InputPanel({
   onTextChange,
   onFile,
   status,
+  detail,
   tall,
   className,
 }: InputPanelProps) {
@@ -103,6 +106,11 @@ export function InputPanel({
         placeholder={placeholder}
         className={`field resize-y leading-relaxed ${tall ? "min-h-32" : "min-h-20"}`}
       />
+      {detail ? (
+        <p className="mt-1.5 font-mono text-[10px] leading-relaxed text-muted-foreground">
+          {detail}
+        </p>
+      ) : null}
     </div>
   );
 }

@@ -29,8 +29,12 @@ interface DemoProduct {
 function buildProducts(result: FilterResult): DemoProduct[] {
   const category = result.category_name?.trim() || "Product";
   const filters = sortFilters(result.filters);
-  const primary = filters.find((f) => (f.values ?? []).length > 1) ?? filters[0];
-  const secondary = filters.find((f) => f !== primary && (f.values ?? []).length > 1);
+  const filterable = filters.filter((f) => f.tier !== "Tier 3");
+  const primary = filterable.find((f) => (f.values ?? []).length > 1) ?? filterable[0];
+  // Tier 3 specs are display-only: show one on the card, which is where they belong.
+  const secondary =
+    filters.find((f) => f.tier === "Tier 3" && (f.values ?? []).length > 0) ??
+    filterable.find((f) => f !== primary && (f.values ?? []).length > 1);
   const brands = ["Shree", "Aarav", "Kesar", "Navdeep", "Vikas", "Jyoti", "Rathi", "Sanghvi"];
   const cities = ["Delhi", "Mumbai", "Ahmedabad", "Jaipur", "Noida", "Pune", "Surat", "Indore"];
   const units = ["Piece", "Bag", "Kg", "Set", "Box"];
@@ -103,7 +107,11 @@ function FilterChip({
                 key={v}
                 className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-accent"
               >
-                <input type="checkbox" checked={selected.includes(v)} onChange={() => onSelect(v)} />
+                <input
+                  type="checkbox"
+                  checked={selected.includes(v)}
+                  onChange={() => onSelect(v)}
+                />
                 <span>{v}</span>
               </label>
             ))
@@ -130,18 +138,28 @@ export function SearchPreview({
   const [sheetOpen, setSheetOpen] = useState(false);
   const [selections, setSelections] = useState<Record<string, string[]>>({});
 
-  const filters = useMemo(() => sortFilters(result.filters), [result]);
+  // Tier 3 is "display only" — it never appears in the filter bar or sheet.
+  const filters = useMemo(
+    () => sortFilters(result.filters).filter((f) => f.tier !== "Tier 3"),
+    [result],
+  );
   const products = useMemo(() => buildProducts(result), [result]);
   const category = result.category_name?.trim() || "Product";
-  const primaryFilters = filters.slice(0, 5);
-  const restFilters = filters.slice(5);
+  const tier1 = filters.filter((f) => f.tier === "Tier 1");
+  const primaryFilters = (tier1.length ? tier1 : filters).slice(0, 5);
+  const restFilters = filters.filter((f) => !primaryFilters.includes(f));
+  const hasLocationFilter = filters.some(
+    (f) => /location/i.test(f.ui_pattern) || /location|city/i.test(f.name),
+  );
 
   function toggleValue(filterName: string, value: string) {
     setSelections((prev) => {
       const current = prev[filterName] ?? [];
       return {
         ...prev,
-        [filterName]: current.includes(value) ? current.filter((v) => v !== value) : [...current, value],
+        [filterName]: current.includes(value)
+          ? current.filter((v) => v !== value)
+          : [...current, value],
       };
     });
   }
@@ -205,7 +223,9 @@ export function SearchPreview({
                 setSheetOpen(false);
               }}
               className={`rounded-md px-3 py-1 text-xs font-semibold capitalize transition-colors ${
-                device === d ? "bg-card text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                device === d
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
               }`}
             >
               {d}
@@ -236,8 +256,14 @@ export function SearchPreview({
           {device === "desktop" ? (
             <div className="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-3">
               <span className="rounded-full border border-border px-2.5 py-1.5 text-xs">⚙</span>
-              <span className="rounded-full border border-border px-3 py-1.5 text-xs font-medium">◎ Near Me</span>
-              <span className="rounded-full border border-border px-3 py-1.5 text-xs font-medium">Delhi ▾</span>
+              <span className="rounded-full border border-border px-3 py-1.5 text-xs font-medium">
+                ◎ Near Me
+              </span>
+              {hasLocationFilter ? null : (
+                <span className="rounded-full border border-border px-3 py-1.5 text-xs font-medium">
+                  Delhi ▾
+                </span>
+              )}
               <div className="flex flex-wrap items-center gap-2 rounded-lg border-2 border-destructive/60 p-1.5">
                 {primaryFilters.map((f) => (
                   <FilterChip
@@ -252,7 +278,7 @@ export function SearchPreview({
               </div>
               {restFilters.length ? (
                 <span className="text-[11px] text-muted-foreground">
-                  +{restFilters.length} more in “All filters”
+                  +{restFilters.length} more in “More filters”
                 </span>
               ) : null}
             </div>
@@ -293,7 +319,11 @@ export function SearchPreview({
                     className="flex items-center gap-1 rounded-full bg-primary-soft px-2 py-0.5 text-[11px] text-primary"
                   >
                     {v}
-                    <button type="button" onClick={() => toggleValue(name, v)} aria-label={`Remove ${v}`}>
+                    <button
+                      type="button"
+                      onClick={() => toggleValue(name, v)}
+                      aria-label={`Remove ${v}`}
+                    >
                       ×
                     </button>
                   </span>
@@ -340,7 +370,9 @@ export function SearchPreview({
                             type="button"
                             onClick={() => toggleValue(f.name, v)}
                             className={`rounded-full border px-2.5 py-1 text-[11px] ${
-                              on ? "border-primary bg-primary-soft text-primary" : "border-border bg-secondary"
+                              on
+                                ? "border-primary bg-primary-soft text-primary"
+                                : "border-border bg-secondary"
                             }`}
                           >
                             {v}
