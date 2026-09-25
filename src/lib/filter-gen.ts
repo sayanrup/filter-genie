@@ -12,8 +12,11 @@ import {
   termsForModel,
   toKeywordTable,
   type Aggregation,
+  type DimensionStats,
   type KeywordTable,
+  type ListingField,
   type ListingProfile,
+  type PriceStats,
   type Row,
   type TermLabel,
   type TermMining,
@@ -35,6 +38,7 @@ import {
   TERM_LABEL_SYSTEM,
   BUDGETS,
   buildDesignUser,
+  formatLakh,
   type PromptBudget,
   buildFieldMapUser,
   buildTermLabelUser,
@@ -60,6 +64,10 @@ export interface FilterRow {
   listing_fill_pct?: number | null;
   needs_new_isq?: boolean;
   isq_note?: string | null;
+  /** The resolved evidence keys this filter is linked to (set by attachEvidence, never the model's
+   *  raw string) — lets the UI show the exact dimension/spec rows this filter's numbers came from. */
+  linked_dimension?: string | null;
+  linked_listing_spec?: string | null;
 }
 
 export interface FilterResult {
@@ -451,6 +459,84 @@ function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } 
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
+const OTHER_FLOOR_PCT = 3; // values below this share of a dimension fold into "Other" (never for Location)
+const MAX_DEFAULT_OPTIONS = 8;
+
+/** "1000-5000" style listing-price buckets in Indian format, sized to the real distribution in D. */
+function priceRanges(price: PriceStats): string[] {
+  const { min, p25, median, p75, max } = price;
+  const cuts = [...new Set([min, p25, median, p75, max])].sort((a, b) => a - b);
+  if (cuts.length < 2) return [];
+  const unit = price.unit ? `/${price.unit}` : "";
+  const ranges: string[] = [`Under ${formatLakh(cuts[0]!)}${unit}`];
+  for (let i = 0; i < cuts.length - 1; i++)
+    ranges.push(`${formatLakh(cuts[i]!)} – ${formatLakh(cuts[i + 1]!)}${unit}`);
+  ranges.push(`Above ${formatLakh(cuts[cuts.length - 1]!)}${unit}`);
+  return ranges;
+}
+
+/**
+ * "Values" and "ui_pattern" the model no longer has to write out: both follow deterministically
+ * from evidence code already holds (the dimension's own values, the listing spec's common values,
+ * tier, and whether the filter is Price/Location). The model may still send "values" itself to
+ * override this — e.g. to merge near-duplicates or phrase a range — see attachEvidence().
+ */
+function deriveOptions(
+  f: FilterRow,
+  dim: DimensionStats | undefined,
+  spec: ListingField | undefined,
+  price: PriceStats | null,
+  isPrice: boolean,
+  isPlace: boolean,
+): { values: string[]; ui_pattern: string } {
+  if (f.tier === "Tier 3") {
+    return { values: (spec?.top ?? []).slice(0, 4).map(([v]) => v), ui_pattern: "display only" };
+  }
+  if (isPrice) {
+    return {
+      values: price ? priceRanges(price) : [],
+      ui_pattern: "range slider with presets",
+    };
+  }
+  if (isPlace) {
+    const fromSpec = (spec?.top ?? []).map(([v]) => v);
+    const fromDim = (dim?.values ?? []).map((v) => v.value);
+    return {
+      values: [...new Set([...fromDim, ...fromSpec])].slice(0, 10),
+      ui_pattern: "location search",
+    };
+  }
+
+  let values: string[];
+  if (dim && dim.values.length) {
+    const total = dim.values.reduce(
+      (s, v) => s + Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0),
+      0,
+    );
+    const kept: string[] = [];
+    let folded = false;
+    for (const v of dim.values) {
+      const demand = Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0);
+      const share = total > 0 ? (demand / total) * 100 : 0;
+      if (kept.length < MAX_DEFAULT_OPTIONS && share >= OTHER_FLOOR_PCT) kept.push(v.value);
+      else folded = true;
+    }
+    values = folded ? [...kept, "Other"] : kept;
+  } else {
+    values = (spec?.top ?? []).slice(0, MAX_DEFAULT_OPTIONS).map(([v]) => v);
+  }
+  const numeric = values.length > 0 && values.every((v) => /^\d+(\.\d+)?\s*[a-z%]*$/i.test(v));
+  const ui_pattern =
+    values.length <= 1
+      ? "display only"
+      : numeric
+        ? "range buckets"
+        : values.length <= 4
+          ? "single-select"
+          : "multi-select checkboxes";
+  return { values, ui_pattern };
+}
+
 /**
  * Fill coverage / top-value share / fill % / sources from the evidence rows the model linked to.
  * Numbers come from code, never from the model. Falls back to matching the filter name.
@@ -461,6 +547,7 @@ export function attachEvidence(
   aggregation: Aggregation | null,
   listing: ListingProfile | null,
   demoListings = false,
+  uiDesign = true,
 ): string[] {
   const notes: string[] = [];
   const dims = new Map((aggregation?.dimensions ?? []).map((d) => [norm(d.name), d]));
@@ -486,6 +573,15 @@ export function attachEvidence(
     // Price comes from the listings' price field, not from a spec.
     const isPrice = /price|budget|cost/i.test(`${f.name} ${link.dimension ?? ""}`);
 
+    // "values"/"ui_pattern" are no longer asked of the model (fewer output tokens, faster runs):
+    // code derives them from the same evidence the model linked to. A model that still sends its
+    // own non-empty values is respected as an override (e.g. a merged/renamed option list).
+    if (uiDesign && f.values.length === 0) {
+      const derived = deriveOptions(f, dim, spec, listing?.price ?? null, isPrice, isPlace);
+      f.values = derived.values;
+      f.ui_pattern = derived.ui_pattern;
+    }
+
     const sources: string[] = [];
     if (dim) {
       let best: { coverage: number; topShare: number } | null = null;
@@ -501,6 +597,8 @@ export function attachEvidence(
       f.top_value_share_pct = null;
     }
     f.listing_fill_pct = spec ? spec.fillPct : null;
+    f.linked_dimension = dim?.name ?? null;
+    f.linked_listing_spec = spec?.key ?? null;
     // Low supply is kept visible, never silently dropped: make sure the rationale says so.
     if (listing && !isPrice && f.tier !== "Tier 3" && !/fill/i.test(f.rationale)) {
       const where = demoListings ? "sample listings" : "listings";
@@ -651,8 +749,9 @@ export async function runPipeline(
   // Labelling and spec merging don't depend on each other; the design step is always asked afresh
   // unless the re-run starts at the check step.
   const fresh = (id: "label" | "fields") => from === id || from === "prepare";
-  // Small tasks don't need reasoning; the design step gets a little.
-  const opts = (maxTokens: number, reasoning: "off" | "low") =>
+  // Small tasks don't need reasoning; the design step gets real reasoning room (skill 08 is a
+  // 7-step method applied per candidate, and a richer rationale needs room to think it through).
+  const opts = (maxTokens: number, reasoning: "off" | "low" | "medium") =>
     signal ? { maxTokens, reasoning, signal } : { maxTokens, reasoning };
   let usage: Usage = {};
   let calls = 0;
@@ -761,7 +860,7 @@ export async function runPipeline(
     title: string,
     build: (budget: PromptBudget) => ChatMessage[],
     maxTokens: number,
-    reasoning: "off" | "low",
+    reasoning: "off" | "low" | "medium",
     reuse: boolean,
   ) => {
     let compact = false;
@@ -968,8 +1067,11 @@ export async function runPipeline(
     "design",
     "3 · Master prompt — design the filter panel",
     designMessages,
-    uiDesign ? 4000 : 2500,
-    "low",
+    // No model-authored options/UI pattern (skill 09) frees up room that goes toward reasoning
+    // depth instead: richer, multi-part rationale and more specific interaction rules (skill 10)
+    // read better than a terse answer, so this is sized generously rather than minimised.
+    uiDesign ? 3200 : 2200,
+    "medium",
     from === "check",
   );
   const { result, links } = normalizeResult(designData);
@@ -1000,7 +1102,14 @@ export async function runPipeline(
 
   // 5 · link evidence and fix in code (no second model call)
   step("check", "running");
-  const linkNotes = attachEvidence(result, links, aggregation, listing, inputs.demoListings);
+  const linkNotes = attachEvidence(
+    result,
+    links,
+    aggregation,
+    listing,
+    inputs.demoListings,
+    inputs.uiDesign !== false,
+  );
   const { fixes, warnings: left } = fixResult(result, inputs.uiDesign !== false);
   if (inputs.uiDesign === false) result.interaction_rules = [];
   warnings.push(...fixes.map((f) => `Auto-fixed: ${f}`), ...linkNotes, ...left);
@@ -1067,7 +1176,10 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
     if (p.id === "label") outputTokens += 60 + userLines * 7;
     else if (p.id === "fields") outputTokens += 40 + userLines * 4;
     else if (p.id === "design")
-      outputTokens += p.messages[1]?.content.includes("UI DESIGN IS SWITCHED OFF") ? 1000 : 1800;
+      // No model-authored options/UI pattern (skill 09), but rationale is now 2-3 sentences with
+      // three required parts, interaction_rules are more detailed, and the model has room for a
+      // brief reasoning pass per candidate (skill 08) — sized for that, not for minimum output.
+      outputTokens += p.messages[1]?.content.includes("UI DESIGN IS SWITCHED OFF") ? 1400 : 2200;
   }
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;

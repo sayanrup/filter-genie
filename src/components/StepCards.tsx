@@ -32,7 +32,8 @@ function costLine(s: StepView, preset: ModelPreset | undefined) {
   const inT = s.usage?.prompt_tokens ?? 0;
   const outT = s.usage?.completion_tokens ?? 0;
   const parts = [`${s.calls} call`, `${fmtTokens(inT)} in`, `${fmtTokens(outT)} out`];
-  if (preset && (inT || outT)) parts.push(fmtInr(runCostInr(preset, inT, outT)));
+  if (preset?.tier === "FREE") parts.push("free");
+  else if (preset && (inT || outT)) parts.push(fmtInr(runCostInr(preset, inT, outT)));
   return parts.join(" · ");
 }
 
@@ -110,9 +111,11 @@ export function StepCards({
           {doneCount}/{steps.length} steps · {totals.calls} model call
           {totals.calls === 1 ? "" : "s"} · {fmtTokens(totals.inT)} in · {fmtTokens(totals.outT)}{" "}
           out
-          {preset && (totals.inT || totals.outT)
-            ? ` · ${fmtInr(runCostInr(preset, totals.inT, totals.outT))}`
-            : ""}
+          {preset?.tier === "FREE"
+            ? " · free"
+            : preset && (totals.inT || totals.outT)
+              ? ` · ${fmtInr(runCostInr(preset, totals.inT, totals.outT))}`
+              : ""}
         </div>
       </div>
 
