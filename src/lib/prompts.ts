@@ -207,11 +207,16 @@ export function buildFieldMapUser(
 
 export const FILTER_DESIGN_SYSTEM = composeSystemPrompt("design");
 
-/** "Include UI design" unticked: the options & UI-pattern skill is left out of the master prompt. */
+/**
+ * "Include UI design" unticked: skill 09 no longer contributes prompt text either way (options and
+ * UI patterns are always code-derived, see skill 09), so this is the same system prompt as
+ * FILTER_DESIGN_SYSTEM — kept as a separate export so callers don't need to know that, and so
+ * excluding "options" here still works if a future skill 09 rewrite adds prompt text back.
+ */
 export const FILTER_DESIGN_SYSTEM_NO_UI = composeSystemPrompt("design", ["options"]);
 
 export const NO_UI_NOTE =
-  'UI DESIGN IS SWITCHED OFF for this run: decide only which filters exist, their tier, rank, confidence and rationale. Return "ui_pattern": "", "values": [] for every filter and "interaction_rules": []. Do not spend any output on options.';
+  'UI DESIGN IS SWITCHED OFF for this run: decide only which filters exist, their tier, rank, confidence and rationale. Return "interaction_rules": [] and do not spend any output reasoning about options or UI patterns — those are not part of your output.';
 
 // ───────────────────────────── design-stage user message ─────────────────────────────
 
@@ -349,7 +354,8 @@ function formatTopKeywords(tables: KeywordTable[], n = 10) {
     .join("\n\n");
 }
 
-function formatLakh(n: number) {
+/** ₹ in Indian units (Lakh / Crore) — also used to build default price-range option labels. */
+export function formatLakh(n: number) {
   if (n >= 1e7) return `₹${(n / 1e7).toFixed(2).replace(/\.?0+$/, "")} Crore`;
   if (n >= 1e5) return `₹${(n / 1e5).toFixed(2).replace(/\.?0+$/, "")} Lakh`;
   return `₹${fmt(n)}`;

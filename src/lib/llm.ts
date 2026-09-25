@@ -1,4 +1,4 @@
-export type Provider = "openrouter" | "litellm";
+export type Provider = "openrouter" | "groq" | "litellm";
 
 export interface LlmSettings {
   provider: Provider;
@@ -9,13 +9,17 @@ export interface LlmSettings {
 
 export const DEFAULT_BASE_URLS: Record<Provider, string> = {
   openrouter: "https://openrouter.ai/api/v1",
+  // Groq's API is OpenAI-compatible (chat/completions, same request/response shape), so it needs
+  // no special handling in chat() beyond skipping OpenRouter-only params (already gated below).
+  groq: "https://api.groq.com/openai/v1",
   litellm: "http://localhost:4000/v1",
 };
 
 export interface ModelPreset {
   id: string;
   name: string;
-  tier?: "DEFAULT" | "BETTER" | "BEST";
+  provider: Provider;
+  tier?: "DEFAULT" | "BETTER" | "BEST" | "FREE";
   inputCost: number;
   outputCost: number;
 }
@@ -24,6 +28,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
   {
     id: "qwen/qwen3.8-flash",
     name: "Qwen 3.8 Flash",
+    provider: "openrouter",
     tier: "DEFAULT",
     inputCost: 0.03,
     outputCost: 0.13,
@@ -31,6 +36,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
   {
     id: "deepseek/deepseek-v4-flash",
     name: "DeepSeek V4 Flash",
+    provider: "openrouter",
     tier: "BETTER",
     inputCost: 0.07,
     outputCost: 0.14,
@@ -38,21 +44,57 @@ export const MODEL_PRESETS: ModelPreset[] = [
   {
     id: "deepseek/deepseek-v4.1-flash",
     name: "DeepSeek V4.1 Flash",
+    provider: "openrouter",
     tier: "BEST",
     inputCost: 0.15,
     outputCost: 0.6,
   },
-  { id: "z-ai/glm-5.3-flash", name: "GLM 5.3 Flash", inputCost: 0.15, outputCost: 0.5 },
+  {
+    id: "z-ai/glm-5.3-flash",
+    name: "GLM 5.3 Flash",
+    provider: "openrouter",
+    inputCost: 0.15,
+    outputCost: 0.5,
+  },
   {
     id: "google/gemini-3.1-flash-lite",
     name: "Gemini 3.1 Flash Lite",
+    provider: "openrouter",
     inputCost: 0.25,
     outputCost: 1.5,
+  },
+  // Groq: free-tier inference, and unusually fast — good for testing prompt changes quickly without
+  // spending anything. Pricing is 0 because the free tier has no per-token cost (rate-limited instead).
+  // Groq retired the Llama models from its free/developer tier (Aug 2026) — these are its current
+  // free-tier chat models as of Sep 2026 (console.groq.com/docs/models); re-check if this breaks again.
+  {
+    id: "openai/gpt-oss-120b",
+    name: "GPT-OSS 120B (Groq)",
+    provider: "groq",
+    tier: "FREE",
+    inputCost: 0,
+    outputCost: 0,
+  },
+  {
+    id: "openai/gpt-oss-20b",
+    name: "GPT-OSS 20B (Groq)",
+    provider: "groq",
+    tier: "FREE",
+    inputCost: 0,
+    outputCost: 0,
+  },
+  {
+    id: "qwen/qwen3.6-27b",
+    name: "Qwen 3.6 27B (Groq)",
+    provider: "groq",
+    tier: "FREE",
+    inputCost: 0,
+    outputCost: 0,
   },
 ];
 
 /** Typical run when no inputs are loaded yet (label + spec merge + design). */
-export const EST_RUN_TOKENS = { input: 6500, output: 2400 };
+export const EST_RUN_TOKENS = { input: 6500, output: 3200 };
 
 export const USD_TO_INR = 84;
 
@@ -81,9 +123,10 @@ export interface CallOptions {
   json?: boolean;
   /**
    * Thinking budget on reasoning-capable models (OpenRouter only). Reasoning tokens are billed as
-   * output, so small labelling tasks turn it off and the design step keeps it low.
+   * output: small labelling tasks turn it off; the design step uses "medium" so it has room to
+   * reason through several candidate filters against skill 08's 7-step method before answering.
    */
-  reasoning?: "off" | "low";
+  reasoning?: "off" | "low" | "medium";
   signal?: AbortSignal;
   /** Give up on an attempt after this long (default scales with maxTokens). */
   timeoutMs?: number;
@@ -102,13 +145,15 @@ const CONTEXT_ERROR =
 
 export const isContextError = (msg: string) => CONTEXT_ERROR.test(msg);
 
+
 export interface CallResult {
   content: string;
   usage: Usage;
   finishReason: string | null;
 }
 
-const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+// 429 has its own handling above (honours the provider's actual retry-after time) — not listed here.
+const RETRYABLE = new Set([408, 500, 502, 503, 504]);
 
 function sleep(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -118,6 +163,34 @@ function sleep(ms: number, signal?: AbortSignal) {
       reject(new DOMException("Aborted", "AbortError"));
     });
   });
+}
+
+// "Please try again in 41.82s" / "retry after 1m2s" / "try again in 500ms" — providers put the real
+// wait time in the message text, not just (or instead of) a Retry-After header.
+const RETRY_AFTER_TEXT = /(?:try again|retry)[^\d]{0,15}(\d+(?:\.\d+)?)\s*(ms|s|m)\b/i;
+
+/**
+ * How long to actually wait before retrying a 429, from the provider's own answer: the
+ * Retry-After header (seconds, or an HTTP date) first, then the wait time embedded in the error
+ * message text (Groq's style). Falls back to a short default when neither is present. Capped so
+ * one rate-limited call can't block the whole run for minutes.
+ */
+function rateLimitDelayMs(resp: Response, errMsg: string | undefined): number {
+  const CAP_MS = 45_000;
+  const header = resp.headers.get("retry-after");
+  if (header) {
+    const secs = Number(header);
+    if (Number.isFinite(secs)) return Math.min(Math.max(secs, 0) * 1000, CAP_MS);
+    const at = Date.parse(header);
+    if (!Number.isNaN(at)) return Math.min(Math.max(at - Date.now(), 0), CAP_MS);
+  }
+  const m = errMsg?.match(RETRY_AFTER_TEXT);
+  if (m) {
+    const n = Number(m[1]);
+    const unitMs = m[2]!.toLowerCase() === "ms" ? 1 : m[2]!.toLowerCase() === "m" ? 60_000 : 1000;
+    if (Number.isFinite(n)) return Math.min(n * unitMs, CAP_MS);
+  }
+  return 3000;
 }
 
 function contentToText(content: unknown): string {
@@ -136,14 +209,34 @@ export async function chat(
   opts: CallOptions = {},
 ): Promise<CallResult> {
   const base = (settings.baseUrl || DEFAULT_BASE_URLS[settings.provider]).replace(/\/+$/, "");
+  // Trim so an invisible leading/trailing space or newline from a paste never turns into a
+  // silently-invalid key (the field is masked, so that kind of whitespace isn't visible to check).
+  const apiKey = settings.apiKey.trim();
+  if (!apiKey) {
+    throw new Error(
+      "No API key set (the field is empty or only whitespace) — the request would be sent without authentication.",
+    );
+  }
+  // Catches the API key and server address fields being swapped: a URL is never a valid key,
+  // and sending it as one produces a confusing "Missing Authentication header" from the provider.
+  if (/^https?:\/\//i.test(apiKey)) {
+    throw new Error(
+      "The API key field contains a URL, not a key — it looks like it was swapped with the server address. Paste your actual API key there instead.",
+    );
+  }
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${settings.apiKey}`,
+    Authorization: `Bearer ${apiKey}`,
   };
   if (settings.provider === "openrouter") {
-    headers["HTTP-Referer"] =
-      typeof window !== "undefined" ? window.location.origin : "https://filter-generator.app";
-    headers["X-Title"] = "Search Filter Generator";
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+    // OpenRouter can reject a request with a confusing "Missing Authentication header" error
+    // when HTTP-Referer is a localhost/private address it doesn't recognise — so these optional
+    // attribution headers are only sent for a real, public origin.
+    if (origin && !/^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\]|.*\.local(:|$))/i.test(origin)) {
+      headers["HTTP-Referer"] = origin;
+      headers["X-Title"] = "Search Filter Generator";
+    }
   }
 
   // Optional parameters: dropped together if the provider rejects the request as invalid.
@@ -155,6 +248,7 @@ export async function chat(
   let retriedTransient = false;
   let retriedTimeout = false;
   let retriedContext = false;
+  let rateLimitRetries = 0;
   const timeoutMs = opts.timeoutMs ?? 90_000 + maxTokens * 15;
 
   for (;;) {
@@ -173,6 +267,8 @@ export async function chat(
         // makes some models look "stuck" (and it bills as output).
         if (opts.reasoning === "off") body["reasoning"] = { enabled: false };
         else if (opts.reasoning === "low") body["reasoning"] = { max_tokens: 1024, exclude: true };
+        else if (opts.reasoning === "medium")
+          body["reasoning"] = { max_tokens: 3000, exclude: true };
       }
     }
     const sentOptional = useOptional && Object.keys(body).length > 4;
@@ -219,7 +315,9 @@ export async function chat(
         throw new Error(
           settings.provider === "litellm"
             ? `Could not reach your LiteLLM server at ${base}. Check the address is running and allows requests from this page (CORS).`
-            : "Could not reach OpenRouter. Check your connection and that the key is valid.",
+            : settings.provider === "groq"
+              ? "Could not reach Groq. Check your connection and that the key is valid."
+              : "Could not reach OpenRouter. Check your connection and that the key is valid.",
         );
       }
     } finally {
@@ -247,6 +345,14 @@ export async function chat(
         useOptional = false;
         continue;
       }
+      // Rate limit (per-minute tokens or requests): the provider names an exact wait time (header or
+      // message text, e.g. Groq's "Please try again in 41.82s") — honour it instead of guessing, and
+      // allow a couple of waits since a busy run can legitimately queue up several limited steps.
+      if (resp.status === 429 && rateLimitRetries < 2) {
+        rateLimitRetries++;
+        await sleep(rateLimitDelayMs(resp, errMsg), opts.signal);
+        continue;
+      }
       if (RETRYABLE.has(resp.status) && !retriedTransient) {
         retriedTransient = true;
         await sleep(2500, opts.signal);
@@ -255,6 +361,11 @@ export async function chat(
       if (!data) {
         throw new Error(
           `Server returned status ${resp.status} with an unreadable response. Check the key and model name.`,
+        );
+      }
+      if (resp.status === 429) {
+        throw new Error(
+          `Still rate-limited after waiting: ${errMsg || "too many requests"}. Wait a bit longer and try again, or (on Groq) add a card for the Dev Tier's higher limits.`,
         );
       }
       throw new Error(errMsg || `Request failed with status ${resp.status}`);

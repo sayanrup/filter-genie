@@ -14,7 +14,11 @@ Every input is optional; drop a file or paste text into any of them:
 | 4 | Spec importance ranking | The category manager's ranked specs / colour tiers |
 | 5 | Product listings | Any JSON / CSV / XLSX export (nested ISQ spec arrays are fine) |
 
-The app runs entirely in the browser with your own **OpenRouter** or **LiteLLM** key.
+The app runs entirely in the browser with your own **OpenRouter**, **Groq** or **LiteLLM** key. Groq's
+free tier (e.g. GPT-OSS 120B) has no per-token cost and is unusually fast, so it's a good way to test
+prompt changes without spending anything. Groq retires and adds free-tier models on its own schedule
+(it dropped Llama entirely from that tier in 2026) — check console.groq.com/docs/models if a Groq
+model preset in this app ever comes back "does not exist."
 
 ## How a run works
 
@@ -31,8 +35,10 @@ listings (5) ────▶ code: flatten JSON → field rules (ignore ids/urls
                    code: fill % per spec, common values, price quartiles
 
 context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT → filters linked to evidence rows
-                   code: fill in coverage / share / fill % from the links, auto-fix (Tier 1 = 3–5,
-                         real options, Tier 3 display-only, ISQ blockers) and list every fix
+                                          (judgement only — which filter, which tier, why; no options)
+                   code: fill in coverage / share / fill %, options and UI pattern from the links,
+                         auto-fix (Tier 1 = 3–5, real options, Tier 3 display-only, ISQ blockers)
+                         and list every fix
 ```
 
 Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.
@@ -54,26 +60,32 @@ ranking and fill rates all line up on the same names.
 fill rates in their tier and adds the fill rate to the rationale ("only 12% of sample listings fill this —
 needs ISQ push") instead of demoting them.
 
-**Include UI design.** Ticked by default. Untick it to get only the filter list — tiers, order, confidence and
-rationale — without UI patterns, option values or interaction rules. Skill 09 is then left out of the master
-prompt and the answer is shorter, so the run costs less; the table hides the UI columns and the page preview.
+**Include UI design.** Ticked by default. Filter options and UI pattern are always built by code from
+the same evidence the model already links to (top keyword values, common listing values, price
+quartiles) — the model never retypes an option list, so it spends its output budget on judgement and a
+thorough rationale instead, regardless of this toggle. Untick it to also drop interaction rules and get
+just the filter list — tiers, order, confidence and rationale; the table hides the UI columns and the
+page preview.
 
 ## Cost
 
-A typical run is **3 calls and about 5–9k input / 2–3k output tokens** — well under ₹0.10 on the default
-model. The button bar shows a live estimate for your current inputs. What keeps it low:
+A typical run is **3 calls and about 5–9k input / around 3k output tokens** — well under ₹0.20 on the
+default model, or free on Groq. The button bar shows a live estimate for your current inputs. The design
+step is deliberately sized for a **thorough, well-justified answer over a minimal one** — it no longer
+authors option lists (code does that from evidence, see skill 09), and that saved room goes toward a
+fuller rationale, more specific interaction rules and real reasoning room, not toward a smaller bill.
+What still keeps the *unavoidable* cost down, without shrinking the answer's quality:
 
 | Saving | How |
 |--------|-----|
 | No arithmetic by the model | Code totals everything; the model gets compact tables, not raw rows |
 | Fewer terms to label | Price words, cities/states and sizes are labelled by code; only the top 150 other terms go to the model, with no numbers |
-| Short answers | Labels come back grouped (`dimension → value → [terms]`); spec mapping returns only merges; filters return evidence *links* and code fills the numbers |
+| No option lists to write | Filters return evidence *links*; code fills the numbers, the options and the UI pattern from them — the model spends its output budget on judgement and rationale instead |
 | Field mapping mostly free | Rules handle ids, URLs, names, prices, units and spec names; the model is called only to merge synonyms |
 | No repair call | Tier limits, option clean-up, display-only and ISQ blockers are fixed in code |
 | Reuse | Labelling and field-mapping answers are cached for the session — editing only the context doc or ranking and re-running costs one call |
-| Cheapest routing | On OpenRouter, requests use `provider.sort = price`; reasoning is off for steps 1–2 and capped at 1,024 tokens for step 3 (reasoning tokens bill as output, and uncapped thinking is what makes some models hang) |
+| Cheapest routing | On OpenRouter, requests use `provider.sort = price`; reasoning is off for steps 1–2 and a "medium" budget (~3,000 tokens) for step 3, enough to reason through skill 08's method per candidate |
 | Stable prompt prefix | System prompts come first and don't change between runs, so providers with automatic prompt caching bill repeats at the cached rate |
-| Trimmed evidence | ≤ 8 values per dimension, minor dimensions on one line, top 8 keywords, ≤ 25 specs with 4 values each |
 | Relevant context only | A long context doc is cut to the ~4,500 characters that mention this category's specs and buyer choice, not just its first page |
 | Fits small models | Output room sized per step; if a provider says the prompt is too long, it's re-sent in a compact form automatically; stuck calls time out and retry on another provider |
 
@@ -86,6 +98,16 @@ model. The button bar shows a live estimate for your current inputs. What keeps 
 | DeepSeek V4.1 Flash | $0.15 / $0.60 | best results so far |
 | GLM 5.3 Flash | $0.15 / $0.50 | strong, widely used flash model |
 | Gemini 3.1 Flash Lite | $0.25 / $1.50 | long context, fast |
+
+**Groq** (free tier, no per-token cost, rate-limited instead — good for testing without spending
+anything; Groq changes its free-tier lineup on its own schedule, so treat these as current as of
+Sep 2026, not permanent):
+
+| Preset | Notes |
+|--------|-------|
+| GPT-OSS 120B | strongest free option, still fast |
+| GPT-OSS 20B | fastest, lighter judgement |
+| Qwen 3.6 27B | alternative if GPT-OSS is rate-limited |
 
 If a provider rejects an optional parameter (JSON mode, reasoning, routing), the call is retried once without them.
 
@@ -109,7 +131,7 @@ system prompt for a stage = base.md + the "## Prompt" section of each skill doc 
 | `06-context-and-ranking.md` | Reading the context doc and CM ranking | master prompt |
 | `07-filter-design-brief.md` | Master prompt role and goal | master prompt |
 | `08-scoring-and-tiering.md` | Scoring, confidence, tiers, ordering | master prompt |
-| `09-filter-options-and-ui.md` | Option lists, numeric ranges, UI pattern | master prompt |
+| `09-filter-options-and-ui.md` | Option lists & UI pattern — code only now, no prompt (see the file) | after step 3 |
 | `10-rationale-and-output.md` | Rationale, rules, blockers, JSON schema, worked example | master prompt |
 | `11-output-validation.md` | Code checks and automatic fixes (no prompt) | after step 3 |
 

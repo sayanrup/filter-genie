@@ -34,6 +34,7 @@ import {
 import { SKILLS, stageSkills } from "@/skills";
 import { StepCards, type StepView } from "@/components/StepCards";
 import { SearchPreview } from "@/components/SearchPreview";
+import { FilterDetailRow } from "@/components/FilterDetail";
 import { buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
 export const Route = createFileRoute("/")({
@@ -206,6 +207,7 @@ function Index() {
   const [run, setRun] = useState<PipelineRun | null>(null);
   const [tab, setTab] = useState<Tab>("table");
   const [device, setDevice] = useState<Device>("desktop");
+  const [expandedFilter, setExpandedFilter] = useState<string | null>(null);
   const [saved, setSaved] = useState<SavedRun[]>([]);
   const [showSaved, setShowSaved] = useState(false);
   const [saveNote, setSaveNote] = useState("");
@@ -319,9 +321,17 @@ function Index() {
   const estINR = preset
     ? runCostInr(preset, estimate.inputTokens, estimate.outputTokens).toFixed(2)
     : null;
+  const providerPresets = MODEL_PRESETS.filter((m) => m.provider === settings.provider);
 
   function setProvider(provider: Provider) {
-    setSettings((prev) => ({ ...prev, provider, baseUrl: DEFAULT_BASE_URLS[provider] }));
+    setSettings((prev) => ({
+      ...prev,
+      provider,
+      baseUrl: DEFAULT_BASE_URLS[provider],
+      // A model id from one provider is meaningless (and will 404 or auth-fail) against another
+      // provider's endpoint, so switching providers falls back to that provider's first preset.
+      model: MODEL_PRESETS.find((m) => m.provider === provider)?.id ?? prev.model,
+    }));
     setTestStatus(null);
   }
 
@@ -404,6 +414,7 @@ function Index() {
       setRun(result);
       setSavedLine("");
       setTab("table");
+      setExpandedFilter(null);
     } catch (err) {
       setError((err as Error).name === "AbortError" ? "Stopped." : (err as Error).message);
       setSteps((prev) => prev.map((s) => (s.status === "running" ? { ...s, status: "error" } : s)));
@@ -485,6 +496,7 @@ function Index() {
     setSavedLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
     setDevice(entry.device ?? "desktop");
     setTab(entry.tab === "evidence" ? "table" : (entry.tab ?? "table"));
+    setExpandedFilter(null);
     setShowSaved(false);
   }
 
@@ -521,12 +533,29 @@ function Index() {
     ),
   );
 
+  // A one-line rollup so trust/gaps in a run are visible without reading every row.
+  const filterSummary = useMemo(() => {
+    if (!result?.filters.length) return null;
+    const fs = result.filters;
+    const byConfidence = { High: 0, Medium: 0, Low: 0 } as Record<string, number>;
+    let needsIsq = 0;
+    let noEvidence = 0;
+    for (const f of fs) {
+      byConfidence[f.confidence] = (byConfidence[f.confidence] ?? 0) + 1;
+      if (f.needs_new_isq) needsIsq++;
+      if (f.tier !== "Tier 3" && !f.linked_dimension && !f.linked_listing_spec) noEvidence++;
+    }
+    return { total: fs.length, byConfidence, needsIsq, noEvidence };
+  }, [result]);
+
   const usageLine = useMemo(() => {
     if (!run) return "";
     if (savedLine) return savedLine;
     const { prompt_tokens: pin, completion_tokens: pout } = run.usage;
     let cost = "";
-    if (preset && pin && pout) {
+    if (preset?.tier === "FREE") {
+      cost = " · free";
+    } else if (preset && pin && pout) {
       const usd = (preset.inputCost * pin) / 1e6 + (preset.outputCost * pout) / 1e6;
       cost = ` · ~$${usd.toFixed(5)} (₹${(usd * USD_TO_INR).toFixed(2)})`;
     }
@@ -619,7 +648,7 @@ function Index() {
         <div className="mb-3 flex flex-wrap items-center gap-2">
           <h2 className="font-display text-sm font-semibold">Your AI key</h2>
           <div className="ml-auto inline-flex rounded-lg border border-border bg-secondary p-0.5">
-            {(["openrouter", "litellm"] as Provider[]).map((p) => (
+            {(["openrouter", "groq", "litellm"] as Provider[]).map((p) => (
               <button
                 key={p}
                 type="button"
@@ -630,7 +659,7 @@ function Index() {
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
-                {p === "openrouter" ? "OpenRouter" : "LiteLLM"}
+                {p === "openrouter" ? "OpenRouter" : p === "groq" ? "Groq" : "LiteLLM"}
               </button>
             ))}
           </div>
@@ -639,13 +668,23 @@ function Index() {
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
             <label className="label-caps mb-1 block" htmlFor="api-key">
-              {settings.provider === "openrouter" ? "OpenRouter key" : "LiteLLM key"}
+              {settings.provider === "openrouter"
+                ? "OpenRouter key"
+                : settings.provider === "groq"
+                  ? "Groq key"
+                  : "LiteLLM key"}
             </label>
             <input
               id="api-key"
               type="password"
               className="field"
-              placeholder={settings.provider === "openrouter" ? "sk-or-v1-…" : "sk-…"}
+              placeholder={
+                settings.provider === "openrouter"
+                  ? "sk-or-v1-…"
+                  : settings.provider === "groq"
+                    ? "gsk_…"
+                    : "sk-…"
+              }
               value={settings.apiKey}
               onChange={(e) => setSettings((s) => ({ ...s, apiKey: e.target.value }))}
             />
@@ -674,7 +713,7 @@ function Index() {
               onChange={(e) => setSettings((s) => ({ ...s, model: e.target.value }))}
             />
             <datalist id="model-presets">
-              {MODEL_PRESETS.map((m) => (
+              {providerPresets.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name}
                 </option>
@@ -720,12 +759,20 @@ function Index() {
             configured there.
           </p>
         ) : null}
+        {settings.provider === "groq" ? (
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            Free tier, no cost per token (rate-limited instead) — get a key at{" "}
+            <span className="font-mono">console.groq.com/keys</span>. Good for testing prompt
+            changes quickly without spending anything.
+          </p>
+        ) : null}
       </section>
 
       {/* Model price strip */}
       <div className="mb-5 flex gap-2 overflow-x-auto pb-1">
-        {MODEL_PRESETS.map((m) => {
+        {providerPresets.map((m) => {
           const active = m.id === settings.model;
+          const free = m.tier === "FREE";
           return (
             <button
               key={m.id}
@@ -745,7 +792,9 @@ function Index() {
                         ? "bg-success-soft text-success"
                         : m.tier === "BETTER"
                           ? "bg-warning-soft text-warning"
-                          : "bg-primary-soft text-primary"
+                          : m.tier === "FREE"
+                            ? "bg-success-soft text-success"
+                            : "bg-primary-soft text-primary"
                     }`}
                   >
                     {m.tier}
@@ -753,12 +802,20 @@ function Index() {
                 ) : null}
                 <span className="text-xs font-semibold">{m.name}</span>
               </div>
-              <div className="mt-1 font-mono text-[11px] text-muted-foreground">
-                ${m.inputCost} in · ${m.outputCost} out
-              </div>
-              <div className="font-mono text-[11px] font-semibold">
-                ~₹{runCostInr(m, estimate.inputTokens, estimate.outputTokens).toFixed(2)}/run
-              </div>
+              {free ? (
+                <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+                  no per-token cost
+                </div>
+              ) : (
+                <>
+                  <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+                    ${m.inputCost} in · ${m.outputCost} out
+                  </div>
+                  <div className="font-mono text-[11px] font-semibold">
+                    ~₹{runCostInr(m, estimate.inputTokens, estimate.outputTokens).toFixed(2)}/run
+                  </div>
+                </>
+              )}
             </button>
           );
         })}
@@ -927,10 +984,10 @@ function Index() {
         >
           Clear all
         </button>
-        {estINR ? (
+        {preset ? (
           <span className="font-mono text-[11px] text-muted-foreground">
-            ~₹{estINR}/run · {estimate.calls} model call{estimate.calls === 1 ? "" : "s"} · ~
-            {(estimate.inputTokens / 1000).toFixed(1)}k in /{" "}
+            {preset.tier === "FREE" ? "free" : `~₹${estINR}/run`} · {estimate.calls} model call
+            {estimate.calls === 1 ? "" : "s"} · ~{(estimate.inputTokens / 1000).toFixed(1)}k in /{" "}
             {(estimate.outputTokens / 1000).toFixed(1)}k out tokens
           </span>
         ) : null}
@@ -1091,6 +1148,46 @@ function Index() {
             </div>
           ) : null}
 
+          {filterSummary ? (
+            <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg border border-border bg-card px-4 py-2.5 text-xs">
+              <span className="text-muted-foreground">
+                <strong className="text-foreground">{filterSummary.total}</strong> filters
+              </span>
+              <span className="h-3 w-px bg-border" />
+              {(["High", "Medium", "Low"] as const).map((c) =>
+                filterSummary.byConfidence[c] ? (
+                  <span key={c} className="flex items-center gap-1">
+                    <span
+                      className={`size-1.5 rounded-full ${
+                        c === "High" ? "bg-success" : c === "Medium" ? "bg-warning" : "bg-destructive"
+                      }`}
+                    />
+                    <strong>{filterSummary.byConfidence[c]}</strong>
+                    <span className="text-muted-foreground">{c.toLowerCase()} confidence</span>
+                  </span>
+                ) : null,
+              )}
+              {filterSummary.needsIsq ? (
+                <>
+                  <span className="h-3 w-px bg-border" />
+                  <span className="text-destructive">
+                    <strong>{filterSummary.needsIsq}</strong> need{" "}
+                    {filterSummary.needsIsq === 1 ? "s" : ""} a new ISQ
+                  </span>
+                </>
+              ) : null}
+              {filterSummary.noEvidence ? (
+                <>
+                  <span className="h-3 w-px bg-border" />
+                  <span className="text-muted-foreground">
+                    <strong className="text-foreground">{filterSummary.noEvidence}</strong> with no
+                    linked evidence
+                  </span>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+
           <div className="mb-3 flex flex-wrap items-center gap-1 border-b-2 border-border">
             {(["table", "preview", "evidence", "raw"] as const)
               .filter((t) => t !== "evidence" || hasEvidence)
@@ -1155,12 +1252,19 @@ function Index() {
                       (a, b) =>
                         (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank,
                     )
-                    .map((f, i) => (
-                      <tr
-                        key={`${f.name}-${i}`}
-                        className="border-b border-border align-top last:border-0"
-                      >
-                        <td className="px-3 py-3 font-semibold">{i + 1}</td>
+                    .flatMap((f, i) => {
+                      const key = `${f.name}-${i}`;
+                      const open = expandedFilter === key;
+                      const row = (
+                        <tr
+                          key={key}
+                          onClick={() => setExpandedFilter(open ? null : key)}
+                          className={`cursor-pointer border-b border-border align-top transition-colors last:border-0 hover:bg-accent/50 ${
+                            open ? "border-b-0 bg-accent/40" : ""
+                          }`}
+                          title={open ? "Click to collapse" : "Click to see the full reasoning"}
+                        >
+                          <td className="px-3 py-3 font-semibold">{i + 1}</td>
                         <td className="px-3 py-3">
                           <span
                             className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider whitespace-nowrap ${
@@ -1228,23 +1332,42 @@ function Index() {
                             {f.confidence}
                           </span>
                         </td>
-                        <td className="max-w-72 px-3 py-3 text-xs text-muted-foreground">
-                          {f.rationale}
-                          {f.sources?.length ? (
-                            <div className="mt-1 flex flex-wrap gap-1">
-                              {f.sources.map((s) => (
-                                <span
-                                  key={s}
-                                  className="rounded bg-secondary px-1 py-px font-mono text-[9px] uppercase"
-                                >
-                                  {s}
-                                </span>
-                              ))}
+                          <td className="max-w-72 px-3 py-3 text-xs text-muted-foreground">
+                            <div className="flex items-start gap-1.5">
+                              <span
+                                className={`mt-0.5 shrink-0 text-[9px] text-muted-foreground/70 transition-transform ${open ? "rotate-90" : ""}`}
+                              >
+                                ▶
+                              </span>
+                              <span>{f.rationale}</span>
                             </div>
-                          ) : null}
-                        </td>
-                      </tr>
-                    ))}
+                            {f.sources?.length ? (
+                              <div className="mt-1 ml-3.5 flex flex-wrap gap-1">
+                                {f.sources.map((s) => (
+                                  <span
+                                    key={s}
+                                    className="rounded bg-secondary px-1 py-px font-mono text-[9px] uppercase"
+                                  >
+                                    {s}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : null}
+                          </td>
+                        </tr>
+                      );
+                      return open
+                        ? [
+                            row,
+                            <FilterDetailRow
+                              key={`${key}-detail`}
+                              filter={f}
+                              evidence={run.evidence}
+                              colSpan={hasDesign ? 7 : 5}
+                            />,
+                          ]
+                        : [row];
+                    })}
                 </tbody>
               </table>
 
