@@ -25,6 +25,17 @@ All in code — **no second model call** (a repair turn would resend the whole p
 | Rationale with no number and no named source | **warning only** |
 | needs_new_isq without a matching blocker | a blocker is added from `isq_note` |
 
+## Fitting the model (before any answer)
+
+- **Output room** — `max_tokens` is sized to the job (labelling ≈ 10 per term up to 2,500; spec merge 1,000;
+  design 4,000, or 2,500 with UI design off) so input + reserved output fits small-context providers.
+- **Too long for the model** — if the provider says the prompt exceeds its context, the call is retried with
+  less output room on any provider; if it still doesn't fit, the prompt is rebuilt with the **compact budget**
+  (shorter context excerpt, fewer values/specs/terms) and a warning says so. The step card shows "compact prompt".
+- **Stuck calls** — each attempt has a timeout (≈ 90 s + 15 ms per output token). A timed-out call is retried
+  once without cheapest-provider routing, then fails with a clear message. Design-step thinking is capped at
+  1,024 reasoning tokens.
+
 Every automatic fix is listed under "Check these before using the output" so nothing changes silently.
 
 Before the checks the answer is normalised: tiers like `1`/`"Tier 1"` → `Tier 1`, confidence casing fixed.

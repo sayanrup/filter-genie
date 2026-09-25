@@ -20,13 +20,22 @@ import {
   type TermStat,
   type DimensionCandidates,
 } from "./data";
-import { addUsage, chatJson, type ChatMessage, type LlmSettings, type Usage } from "./llm";
+import {
+  ContextLimitError,
+  addUsage,
+  chatJson,
+  type ChatMessage,
+  type LlmSettings,
+  type Usage,
+} from "./llm";
 import {
   FIELD_MAP_SYSTEM,
   FILTER_DESIGN_SYSTEM,
   FILTER_DESIGN_SYSTEM_NO_UI,
   TERM_LABEL_SYSTEM,
+  BUDGETS,
   buildDesignUser,
+  type PromptBudget,
   buildFieldMapUser,
   buildTermLabelUser,
 } from "./prompts";
@@ -215,22 +224,55 @@ export function prepare(inputs: PipelineInputs): Prepared {
 /** The field-mapping call only helps when there are at least two specs that might be synonyms. */
 const needsFieldCall = (prep: Prepared) => prep.specs.length >= 2;
 
-function labelMessages(prep: Prepared): ChatMessage[] {
+function labelMessages(prep: Prepared, budget: PromptBudget = BUDGETS.normal): ChatMessage[] {
   return [
     { role: "system", content: TERM_LABEL_SYSTEM },
     {
       role: "user",
-      content: buildTermLabelUser(prep.modelTerms, prep.mining!, prep.dims, prep.context),
+      content: buildTermLabelUser(prep.modelTerms, prep.mining!, prep.dims, prep.context, budget),
     },
   ];
 }
 
-function fieldMessages(prep: Prepared): ChatMessage[] {
+function fieldMessages(prep: Prepared, budget: PromptBudget = BUDGETS.normal): ChatMessage[] {
   return [
     { role: "system", content: FIELD_MAP_SYSTEM },
-    { role: "user", content: buildFieldMapUser(prep.specs, prep.flatListings.length) },
+    { role: "user", content: buildFieldMapUser(prep.specs, prep.flatListings.length, budget) },
   ];
 }
+
+/**
+ * Run a model step with the normal prompt budget; if the provider says the prompt is too long,
+ * rebuild it with the compact budget and try once more.
+ */
+async function withBudget<T>(
+  run: (budget: PromptBudget) => Promise<T>,
+  onCompact: () => void,
+): Promise<T> {
+  try {
+    return await run(BUDGETS.normal);
+  } catch (err) {
+    if (!(err instanceof ContextLimitError)) throw err;
+    onCompact();
+    try {
+      return await run(BUDGETS.compact);
+    } catch (err2) {
+      if (!(err2 instanceof ContextLimitError)) throw err2;
+      throw new Error(
+        `${err2.message} Even the compact prompt doesn't fit this model's context window. Pick a model with a larger context (e.g. Gemini 3.1 Flash Lite or DeepSeek V4.1 Flash), or shorten the context document.`,
+      );
+    }
+  }
+}
+
+const STEP_NAME = {
+  label: "keyword-labelling",
+  fields: "spec-merging",
+  design: "master (filter design)",
+} as const;
+
+const COMPACT_NOTE = (step: string) =>
+  `The ${step} prompt was too long for this model, so it was re-sent in compact form (shorter context excerpt, fewer values and specs).`;
 
 /** Prompts as they'd be sent, before any model call (for the "View prompts" panel). */
 export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
@@ -710,6 +752,42 @@ export async function runPipeline(
     });
   }
 
+  /**
+   * One model step: reuses this session's cached answer when allowed, and re-sends the prompt in
+   * compact form if the provider says it's too long for the model.
+   */
+  const ask = async (
+    id: "label" | "fields" | "design",
+    title: string,
+    build: (budget: PromptBudget) => ChatMessage[],
+    maxTokens: number,
+    reasoning: "off" | "low",
+    reuse: boolean,
+  ) => {
+    let compact = false;
+    const out = await withBudget(
+      async (budget) => {
+        const messages = build(budget);
+        onStep(id, { input: messagesText(messages) });
+        const key = cacheKey(settings, messages);
+        const hit = reuse ? stageCache.get(key) : undefined;
+        if (hit !== undefined) return { data: hit, cached: true, usage: {} as Usage, messages };
+        const res = await chatJson<unknown>(settings, messages, opts(maxTokens, reasoning));
+        usage = addUsage(usage, res.usage);
+        calls++;
+        remember(key, res.data);
+        return { data: res.data, cached: false, usage: res.usage, messages };
+      },
+      () => {
+        compact = true;
+        warnings.push(COMPACT_NOTE(STEP_NAME[id]));
+      },
+    );
+    prompts.push({ id, stage: id, title, messages: out.messages });
+    return { ...out, compact };
+  };
+  const compactTag = (c: boolean) => (c ? " · compact prompt" : "");
+
   // 2 + 3 · labelling and spec-name merging run in parallel
   const labelTask = async (): Promise<{ labels: TermLabel[]; category: string | null }> => {
     if (!prep.mining || prep.modelTerms.length === 0) {
@@ -719,23 +797,22 @@ export async function runPipeline(
       });
       return { labels: auto, category: null };
     }
-    const messages = labelMessages(prep);
-    prompts.push({ id: "label", stage: "label", title: "1 · Label keyword terms", messages });
-    const key = cacheKey(settings, messages);
     const known = new Set(prep.modelTerms.map((t) => t.term));
-    step("label", "running", { input: messagesText(messages) });
+    step("label", "running");
     try {
-      let data = fresh("label") ? undefined : stageCache.get(key);
-      const cached = Boolean(data);
-      let stepUsage: Usage = {};
-      if (!cached) {
-        const res = await chatJson<unknown>(settings, messages, opts(2500, "off"));
-        stepUsage = res.usage;
-        usage = addUsage(usage, res.usage);
-        calls++;
-        data = res.data;
-        remember(key, data);
-      }
+      const {
+        data,
+        cached,
+        usage: stepUsage,
+        compact,
+      } = await ask(
+        "label",
+        "1 · Label keyword terms",
+        (b) => labelMessages(prep, b),
+        Math.min(2500, 400 + prep.modelTerms.length * 10),
+        "off",
+        !fresh("label"),
+      );
       const labels = parseLabels(data, known);
       const dims = new Set(labels.map((l) => l.dimension));
       const category = (data as any)?.category_name;
@@ -743,7 +820,7 @@ export async function runPipeline(
         calls: cached ? 0 : 1,
         cached,
         usage: stepUsage,
-        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}`,
+        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
         stats: [
           { label: "terms sent", value: prep.modelTerms.length },
           { label: "labelled", value: labels.length },
@@ -809,34 +886,28 @@ export async function runPipeline(
       });
       return profile;
     }
-    const messages = fieldMessages(prep);
-    prompts.push({
-      id: "fields",
-      stage: "fields",
-      title: "2 · Merge listing spec names",
-      messages,
-    });
-    const key = cacheKey(settings, messages);
-    step("fields", "running", { input: messagesText(messages) });
+    step("fields", "running");
     try {
-      let data = fresh("fields") ? undefined : stageCache.get(key);
-      const cached = Boolean(data);
-      let stepUsage: Usage = {};
-      if (!cached) {
-        const res = await chatJson<unknown>(settings, messages, opts(1500, "off"));
-        stepUsage = res.usage;
-        usage = addUsage(usage, res.usage);
-        calls++;
-        data = res.data;
-        remember(key, data);
-      }
+      const {
+        data,
+        cached,
+        usage: stepUsage,
+        compact,
+      } = await ask(
+        "fields",
+        "2 · Merge listing spec names",
+        (b) => fieldMessages(prep, b),
+        1000,
+        "off",
+        !fresh("fields"),
+      );
       const { map, changes } = applySpecMerges(prep.fieldMap, data);
       const profile = profileListings(prep.flatListings, map);
       step("fields", "done", {
         calls: cached ? 0 : 1,
         cached,
         usage: stepUsage,
-        detail: `${profile.fields.length} specs · ${changes} field(s) merged or dropped${cached ? " · reused (no cost)" : ""}`,
+        detail: `${profile.fields.length} specs · ${changes} field(s) merged or dropped${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
         stats: [
           { label: "spec names sent", value: prep.specs.length },
           { label: "merged or dropped", value: changes },
@@ -867,11 +938,9 @@ export async function runPipeline(
   };
 
   // 4 · design
-  const messages: ChatMessage[] = [
-    {
-      role: "system",
-      content: inputs.uiDesign === false ? FILTER_DESIGN_SYSTEM_NO_UI : FILTER_DESIGN_SYSTEM,
-    },
+  const uiDesign = inputs.uiDesign !== false;
+  const designMessages = (budget: PromptBudget): ChatMessage[] => [
+    { role: "system", content: uiDesign ? FILTER_DESIGN_SYSTEM : FILTER_DESIGN_SYSTEM_NO_UI },
     {
       role: "user",
       content: buildDesignUser({
@@ -883,30 +952,26 @@ export async function runPipeline(
         specs: inputs.specs,
         listing,
         demoListings: Boolean(inputs.demoListings),
-        uiDesign: inputs.uiDesign !== false,
+        uiDesign,
+        budget,
       }),
     },
   ];
-  prompts.push({
-    id: "design",
-    stage: "design",
-    title: "3 · Master prompt — design the filter panel",
-    messages,
-  });
-  step("design", "running", { input: messagesText(messages) });
+  step("design", "running");
   // The design answer is only reused when re-running from the check step.
-  const designKey = cacheKey(settings, messages);
-  let designData = from === "check" ? stageCache.get(designKey) : undefined;
-  const designCached = designData !== undefined;
-  let designUsage: Usage = {};
-  if (!designCached) {
-    const design = await chatJson<unknown>(settings, messages, opts(6000, "low"));
-    designUsage = design.usage;
-    usage = addUsage(usage, design.usage);
-    calls++;
-    designData = design.data;
-    remember(designKey, designData);
-  }
+  const {
+    data: designData,
+    cached: designCached,
+    usage: designUsage,
+    compact: designCompact,
+  } = await ask(
+    "design",
+    "3 · Master prompt — design the filter panel",
+    designMessages,
+    uiDesign ? 4000 : 2500,
+    "low",
+    from === "check",
+  );
   const { result, links } = normalizeResult(designData);
   if (result.filters.length === 0) {
     step("design", "error", {
@@ -920,7 +985,7 @@ export async function runPipeline(
     calls: designCached ? 0 : 1,
     cached: designCached,
     usage: designUsage,
-    detail: `${result.filters.length} filters proposed${designCached ? " · reused (no cost)" : ""}`,
+    detail: `${result.filters.length} filters proposed${designCached ? " · reused (no cost)" : ""}${compactTag(designCompact)}`,
     stats: [
       { label: "filters", value: result.filters.length },
       { label: "Tier 1", value: tierN("Tier 1") },

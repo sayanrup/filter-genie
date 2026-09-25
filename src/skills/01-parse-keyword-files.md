@@ -24,7 +24,7 @@ To support a new report layout, extend the regex lists `DEMAND_PATTERNS` / `ACTI
 
 ## Prompt
 
-EVIDENCE A · KEYWORD DEMAND — real search keywords for this category from up to two sources:
-- Internal site search = on-platform buying intent; the PRIMARY signal for filter design.
-- Google SERP (Search Console) = external demand; use it to confirm or fill gaps. When the two disagree, say so in the rationale.
-For each source the evidence names its "demand metric" (e.g. Pageviews or Clicks — how many buyers), its "action metric" when present (e.g. Enquiries, Calls — how many buyers acted), and any rate metrics (CTR, conversion %, demand-weighted). A value with a high action/demand ratio matters more than its raw demand suggests.
+EVIDENCE A · KEYWORD DEMAND from up to two sources:
+- INT = internal site search: on-platform buying intent, the PRIMARY signal.
+- SERP = Google Search Console: external demand; confirms or fills gaps. Say so in the rationale when the two disagree.
+Each source names its demand metric (buyers, e.g. Pageviews, Clicks), its action metric if any (buyers who acted, e.g. Enquiries, Calls) and rate metrics (CTR, conversion %, demand-weighted). A value with a high action/demand ratio matters more than its raw demand suggests.

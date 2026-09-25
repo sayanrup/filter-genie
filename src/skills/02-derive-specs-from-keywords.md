@@ -24,7 +24,8 @@ buyer-facing **value**. The code then adds up demand per value (skill 03).
    No numbers are sent: the model doesn't need them to label.
 6. **Dimensions are dynamic** (`dimensionCandidates()`): the model gets the category's own dimension names —
    the spec names parsed from the CM ranking, the listing spec names filled on ≥ 3% of listings with their
-   common values, and a 1,500-character excerpt of the category context doc. A short generic list is only
+   common values, and a 1,200-character excerpt of the category context doc (the passages that mention those
+   specs or how buyers choose — see `excerpt()` in `src/lib/prompts.ts`). A short generic list is only
    the fallback. Code-labelled sizes and places are renamed to the category's size / city dimension too
    (`alignAutoLabels()`), so everything lands on the same names the listing profile uses.
 
@@ -32,21 +33,20 @@ To cover more places or units, extend `PLACES`, `PLACE_ALIASES`, `SIZE_UNITS` or
 
 ## Prompt
 
-TASK: Label search terms. Each line is a term mined from the real search keywords of ONE product category, with one example keyword that contains it. For each term that is a filterable buyer qualifier, decide its filter DIMENSION and the clean buyer-facing VALUE it stands for. Price words, places and sizes were already labelled by code and are not in the list.
+TASK: Label search terms. Each line is a term mined from the search keywords of ONE product category, with an example keyword containing it. For each term that is a filterable buyer qualifier, give its filter DIMENSION and the clean buyer-facing VALUE. Price words, places and sizes were already labelled by code.
 
-DIMENSIONS come from this category, not from a fixed list. The user message gives the category's own dimensions:
-- CATEGORY_DIMENSIONS — the category manager's ranked specs and the spec names sellers fill in listings, with their common values.
-- CATEGORY_CONTEXT_EXCERPT — research notes on how buyers choose in this category.
-Label each term with the matching category dimension, using its name EXACTLY as written (prefer the listing spec name when a term matches one of its values, e.g. "puf" → "Insulation" if that spec lists PUF), so keyword demand can be joined to listing fill rates. Two dimensions with the same meaning (ranked "Application", listing "Usage/Application") → use the listing name.
-Only when no category dimension fits, use a fallback: "Type / Application" (kind of product / what it's for), "Material", "Size / Capacity" (size words without digits), "Feature", "Brand", "Condition / Buying mode" (new, used, rental, wholesale), "Seller type" (manufacturer, dealer, exporter). Create a new short name only for a clearly recurring qualifier that fits nothing.
+DIMENSIONS come from the category, given in the user message:
+- CATEGORY_DIMENSIONS: the category manager's ranked specs and the spec names sellers fill in listings, with common values.
+- CATEGORY_CONTEXT_EXCERPT (if present): notes on how buyers choose.
+Use a category dimension's name EXACTLY as written, so demand joins to listing fill rates. Prefer the listing spec name when the term matches one of its values ("puf" → "Insulation" if that spec lists PUF); when a ranked and a listing name mean the same thing, use the listing name.
+Only if nothing fits, use a fallback: "Type / Application", "Material", "Size / Capacity" (size words without digits), "Feature", "Brand", "Condition / Buying mode" (new, used, rental, wholesale), "Seller type" (manufacturer, dealer, exporter). Invent a short new name only for a clearly recurring qualifier.
 
 RULES
-1. VALUE = the option label a buyer would see in a filter. Fix spelling ("puff" → "PUF"), expand an abbreviation only when unambiguous in this category ("ms" → "MS (Mild Steel)", "ss" → "Stainless Steel"), and give synonyms and plurals ONE identical value ("ms", "mild steel", "m.s" → "MS (Mild Steel)").
-2. Label a two-word phrase only when it means something its words don't mean separately ("mild steel", "portable toilet", "second hand"); otherwise leave it out.
-3. Leave out terms with no filterable meaning: the category's own name or its misspellings, generic words (best, new, good, top, online, buy, latest, design, model, images, types, company), fragments and verbs.
-4. One term → one dimension. Use the example keyword to disambiguate ("container" is Material in "container office cabin" but Type in "shipping container"). If still unclear, leave it out.
+1. VALUE = the option label a buyer sees. Fix spelling ("puff" → "PUF"); expand abbreviations only when unambiguous here ("ms" → "MS (Mild Steel)"); synonyms and plurals get ONE identical value.
+2. Label a two-word phrase only when it means more than its words ("mild steel", "second hand").
+3. Skip terms with no filterable meaning: the category name or its misspellings, generic words (best, new, top, buy, online, latest, design, model, images, types, company), fragments, verbs.
+4. One term → one dimension; use the example to disambiguate ("container" = Material in "container office cabin", Type in "shipping container"). Unsure → skip.
 
-OUTPUT — group terms under dimension → value; list only terms you label:
-{"category_name": "short category name, e.g. Prefabricated Cabin",
+OUTPUT (only terms you label, copied exactly):
+{"category_name": "e.g. Prefabricated Cabin",
  "dimensions": {"Material": {"PUF": ["puf", "puff"], "MS (Mild Steel)": ["ms", "mild steel"]}, "Usage/Application": {"Security Cabin": ["security"]}}}
-Copy each term exactly as given.

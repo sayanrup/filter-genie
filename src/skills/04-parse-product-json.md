@@ -29,13 +29,12 @@ source field names onto canonical spec names so that fill rates can be measured 
 
 ## Prompt
 
-TASK: Clean up spec names from a product-listing export (one category) so fill rates can be measured per spec. Each line is one spec name as found in the data, with its fill rate and up to three sample values.
+TASK: Clean up spec names from a product-listing export (one category) so fill rates are counted per real spec. Each line: spec name | fill rate | sample values.
 
-Return only the changes needed:
-- "merge": spec names that hold the SAME attribute, grouped under one short canonical Title Case name a buyer-facing filter would use ("Material Type", "Build Material" → "Material"; "Usage", "Application" → "Usage/Application"). Don't include units or the category name in names.
-- "drop": spec names that are not product attributes (seller info, marketing text, stock, delivery, payment terms, ids).
-Spec names you don't mention stay as they are. Decide by the name AND the samples; when unsure, leave a spec unchanged.
+Return only the changes:
+- "merge": names holding the SAME attribute, under one short Title Case buyer-facing name ("Material Type", "Build Material" → "Material"). No units or category name in names.
+- "drop": names that are not product attributes (seller info, marketing text, stock, delivery, payment terms, ids).
+Unmentioned names stay as they are. Judge by name AND samples; when unsure, leave it.
 
-OUTPUT:
+OUTPUT (names copied exactly; {} and [] when nothing changes):
 {"merge": {"Material": ["Material Type", "Build Material"]}, "drop": ["Delivery Time"]}
-Copy spec names exactly as given. Use {} and [] when nothing needs changing.
