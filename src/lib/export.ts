@@ -1,3 +1,4 @@
+import { comparisonMarkdown, type ContextComparison } from "./compare";
 import type { FilterResult } from "./filter-gen";
 
 /** Inputs as stored with a saved run: keyword/listing rows are JSON strings, docs are plain text. */
@@ -27,8 +28,10 @@ export function buildMarkdown(opts: {
   device?: string;
   /** Extra markdown section placed before the inputs (e.g. the with/without-context comparison). */
   extra?: string;
+  /** Say the inputs are the same as an earlier part of the file instead of repeating them. */
+  sameInputsNote?: string;
 }) {
-  const { name, savedAt, model, result, inputs, device, extra } = opts;
+  const { name, savedAt, model, result, inputs, device, extra, sameInputsNote } = opts;
   const order: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
   const filters = [...result.filters].sort(
     (a, b) => (order[a.tier] ?? 9) - (order[b.tier] ?? 9) || a.rank - b.rank,
@@ -61,17 +64,54 @@ export function buildMarkdown(opts: {
     md += `\n## Blockers\n\n${result.blockers.map((b) => `- ${b}`).join("\n")}\n`;
   }
 
+  if (extra) md += `\n${extra.trim()}\n`;
+
   md += `\n## Inputs used\n\n`;
-  const any = inputs.serp || inputs.internal || inputs.context || inputs.specs || inputs.products;
-  if (!any) md += `_No inputs were stored with this run._\n\n`;
-  md += fence("1. Google SERP keywords", inputs.serp, "json");
-  md += fence("2. Internal search keywords", inputs.internal, "json");
-  md += fence("3. Category context document", inputs.context, "text");
-  md += fence("4. Spec importance ranking", inputs.specs, "text");
-  md += fence("5. Product listings", inputs.products, "json");
+  const any =
+    sameInputsNote ||
+    inputs.serp ||
+    inputs.internal ||
+    inputs.context ||
+    inputs.specs ||
+    inputs.products;
+  if (sameInputsNote) md += `_${sameInputsNote}_\n\n`;
+  else if (!any) md += `_No inputs were stored with this run._\n\n`;
+  if (!sameInputsNote) {
+    md += fence("1. Google SERP keywords", inputs.serp, "json");
+    md += fence("2. Internal search keywords", inputs.internal, "json");
+    md += fence("3. Category context document", inputs.context, "text");
+    md += fence("4. Spec importance ranking", inputs.specs, "text");
+    md += fence("5. Product listings", inputs.products, "json");
+  }
 
   md += `## Raw result JSON\n\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\`\n`;
   return md;
+}
+
+/** Everything a Generate produced with a category context: both results and how similar they are. */
+export function buildFullMarkdown(opts: {
+  name: string;
+  savedAt: string;
+  model: string;
+  result: FilterResult;
+  withoutResult: FilterResult;
+  comparison: ContextComparison;
+  inputs: InputBundle;
+  device?: string;
+}) {
+  const { withoutResult, comparison, ...rest } = opts;
+  const withPart = buildMarkdown({
+    ...rest,
+    name: `${opts.name} — with context`,
+    extra: comparisonMarkdown(comparison),
+  });
+  const withoutPart = buildMarkdown({
+    ...rest,
+    name: `${opts.name} — without context`,
+    result: withoutResult,
+    sameInputsNote: "Same inputs as the with-context run above, with the category context removed.",
+  });
+  return `${withPart}\n\n---\n\n${withoutPart}`;
 }
 
 export function slugify(value: string) {
