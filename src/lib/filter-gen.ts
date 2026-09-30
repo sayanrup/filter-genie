@@ -43,6 +43,7 @@ import {
   buildFieldMapUser,
   buildTermLabelUser,
 } from "./prompts";
+import { compareContext, parseReferenceIsq, type ContextComparison } from "./compare";
 import type { StageId } from "@/skills";
 
 export * from "./llm";
@@ -92,12 +93,37 @@ export interface PipelineInputs {
 
 export type { StageId };
 
-export type StepId = "prepare" | "label" | "fields" | "design" | "check";
+export type StepId = "prepare" | "label" | "fields" | "design" | "check" | "compare";
 export type StepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
 export interface StepStat {
   label: string;
   value: string | number;
+}
+
+export interface StepSplit {
+  title: string;
+  unit: string;
+  code: number;
+  model: number;
+  /** Not labelled by either (the model left it out, or it fell below the model's term cap). */
+  none: number;
+}
+
+/** Labelling work by owner, counted per term and per unit of search demand. */
+function labelSplit(mining: TermMining | null, modelLabels: TermLabel[]): StepSplit[] {
+  if (!mining) return [];
+  const byModel = new Set(modelLabels.map((l) => l.term));
+  const terms: StepSplit = { title: "Terms", unit: "terms", code: 0, model: 0, none: 0 };
+  const demand: StepSplit = { title: "Search demand", unit: "demand", code: 0, model: 0, none: 0 };
+  for (const t of mining.terms) {
+    if (t.auto === "skip") continue;
+    const d = Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0);
+    const who = t.auto ? "code" : byModel.has(t.term) ? "model" : "none";
+    terms[who]++;
+    demand[who] += d;
+  }
+  return [terms, demand];
 }
 
 export interface Step {
@@ -115,6 +141,8 @@ export interface Step {
   /** The model answer came from this session's cache (no cost). */
   cached?: boolean;
   stats?: StepStat[];
+  /** Who did the work: how much of something was handled by code, by the model, or by neither. */
+  split?: StepSplit[];
   /** What went into the step: the prompt sent, or a summary of the data read. */
   input?: string;
   /** What came out: the model's answer, or a summary of what code produced. */
@@ -145,6 +173,10 @@ export interface PipelineRun {
   usage: Usage;
   calls: number;
   prompts: PromptRecord[];
+  /** The same run made without the category context (only when a context was given). */
+  withoutContext?: PipelineRun;
+  /** How alike the with- and without-context filters are, and how each matches your ISQs. */
+  comparison?: ContextComparison;
 }
 
 export const INITIAL_STEPS: Step[] = [
@@ -181,6 +213,13 @@ export const INITIAL_STEPS: Step[] = [
     label: "Check & fix the output",
     description:
       "Code fills in coverage, share and fill rates from the evidence links, then enforces the tier rules and cleans options. No repair call.",
+    status: "pending",
+  },
+  {
+    id: "compare",
+    label: "Compare with vs without context",
+    description:
+      "Repeats the filter design with the category context removed, then compares the two sets of filters (ISQs) and checks each against the ISQs you gave. Skipped when no context was given.",
     status: "pending",
   },
 ];
@@ -744,7 +783,9 @@ export async function runPipeline(
   inputs: PipelineInputs,
   hooks: RunHooks,
 ): Promise<PipelineRun> {
-  const { onStep, signal, from } = hooks;
+  const { onStep, signal } = hooks;
+  // "compare" re-runs only the comparison; this run just reuses its cached answers, as for "check".
+  const from = hooks.from === "compare" ? "check" : hooks.from;
   // Re-running from a step asks the model afresh for that step (from "prepare": for every step).
   // Labelling and spec merging don't depend on each other; the design step is always asked afresh
   // unless the re-run starts at the check step.
@@ -893,6 +934,7 @@ export async function runPipeline(
       step("label", "skipped", {
         calls: 0,
         detail: prep.mining ? "all terms labelled by code" : "no keyword data",
+        split: labelSplit(prep.mining, []),
       });
       return { labels: auto, category: null };
     }
@@ -931,6 +973,7 @@ export async function runPipeline(
             ? [{ label: "category", value: category }]
             : []),
         ],
+        split: labelSplit(prep.mining, labels),
         output: JSON.stringify(data, null, 2),
       });
       return {
@@ -944,6 +987,7 @@ export async function runPipeline(
       );
       step("label", "error", {
         detail: "used code labels only",
+        split: labelSplit(prep.mining, []),
         output: (err as Error).message,
       });
       return { labels: auto, category: null };
@@ -1184,4 +1228,94 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;
   return { calls: prompts.length, inputTokens, outputTokens };
+}
+
+// ───────────────────────────── with vs without context ─────────────────────────────
+
+/**
+ * The normal run (with the category context), then the same run without it and a comparison of the
+ * two. The second run reuses cached answers where its prompts match, so only the design step (and
+ * the labelling prompt, which also quotes the context) cost new model calls.
+ */
+export async function runAll(
+  settings: LlmSettings,
+  inputs: PipelineInputs,
+  hooks: RunHooks,
+): Promise<PipelineRun> {
+  const main = await runPipeline(settings, inputs, hooks);
+  const { onStep, signal } = hooks;
+  const t0 = performance.now();
+  const done = (patch: Partial<Step>) =>
+    onStep("compare", { ...patch, ms: Math.round(performance.now() - t0) });
+
+  if (!inputs.context.trim()) {
+    onStep("compare", {
+      status: "skipped",
+      calls: 0,
+      detail: "no category context given — paste one to compare with vs without",
+    });
+    return main;
+  }
+  onStep("compare", { status: "running" });
+  try {
+    // A re-run from the compare step asks the design model afresh, like any re-run from a step.
+    const from: StepId | undefined = hooks.from === "compare" ? "design" : hooks.from;
+    const without = await runPipeline(
+      settings,
+      { ...inputs, context: "" },
+      { onStep: () => {}, ...(signal ? { signal } : {}), ...(from ? { from } : {}) },
+    );
+    const given = parseReferenceIsq(inputs.specs);
+    const fromListing =
+      main.evidence.listing?.fields.slice(0, 15).map((f) => f.key.replace(/^isq\./, "")) ?? [];
+    const comparison = compareContext(
+      without.result,
+      main.result,
+      given.length ? given : fromListing,
+    );
+    const ref = comparison.refWith && comparison.refWithout;
+    done({
+      status: "done",
+      calls: without.calls,
+      usage: without.usage,
+      detail: `${comparison.overlapPct}% of filters are the same with and without context`,
+      stats: [
+        { label: "filters with context", value: main.result.filters.length },
+        { label: "filters without context", value: without.result.filters.length },
+        { label: "in both", value: comparison.shared.length },
+        { label: "overlap", value: `${comparison.overlapPct}%` },
+        { label: "found without context", value: `${comparison.recallPct}%` },
+        {
+          label: "same tier",
+          value: comparison.shared.length ? `${comparison.sameTierPct}%` : "–",
+        },
+        ...(ref
+          ? [
+              {
+                label: "of your ISQs found (with)",
+                value: `${comparison.refWith!.covered.length}/${comparison.refWith!.reference}`,
+              },
+              {
+                label: "of your ISQs found (without)",
+                value: `${comparison.refWithout!.covered.length}/${comparison.refWithout!.reference}`,
+              },
+            ]
+          : []),
+      ],
+      input: `Category context: ${inputs.context.length.toLocaleString()} characters (removed for the second run). Everything else identical.`,
+      output: [
+        `Only with context: ${comparison.onlyWith.join(", ") || "none"}`,
+        `Only without context: ${comparison.onlyWithout.join(", ") || "none"}`,
+        ...comparison.shared.map(
+          (x) => `  ${x.without} (${x.tierWithout}) ~ ${x.withCtx} (${x.tierWith})`,
+        ),
+      ].join("\n"),
+    });
+    return { ...main, withoutContext: without, comparison };
+  } catch (err) {
+    if ((err as Error).name === "AbortError") throw err;
+    main.warnings.push(`Could not compare with vs without context: ${(err as Error).message}`);
+    done({ status: "error", detail: "comparison failed", output: (err as Error).message });
+    return main;
+  }
 }

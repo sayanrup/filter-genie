@@ -12,7 +12,9 @@ export const DEFAULT_BASE_URLS: Record<Provider, string> = {
   // Groq's API is OpenAI-compatible (chat/completions, same request/response shape), so it needs
   // no special handling in chat() beyond skipping OpenRouter-only params (already gated below).
   groq: "https://api.groq.com/openai/v1",
-  litellm: "http://localhost:4000/v1",
+  // IndiaMART LLM Gateway (LiteLLM, OpenAI-compatible, Bearer access key). It answers CORS
+  // preflights with allow-origin: *, so the browser can call it directly, including from localhost.
+  litellm: "https://imllm.intermesh.net/v1",
 };
 
 export interface ModelPreset {
@@ -20,8 +22,11 @@ export interface ModelPreset {
   name: string;
   provider: Provider;
   tier?: "DEFAULT" | "BETTER" | "BEST" | "FREE";
+  /** USD per 1M tokens. */
   inputCost: number;
   outputCost: number;
+  /** False when the gateway lists the model but publishes no price for it. */
+  costKnown?: boolean;
 }
 
 export const MODEL_PRESETS: ModelPreset[] = [
@@ -63,6 +68,22 @@ export const MODEL_PRESETS: ModelPreset[] = [
     inputCost: 0.25,
     outputCost: 1.5,
   },
+  // LLM Gateway: only models your key was granted work — the id must match exactly (the docs show
+  // both "qwen/qwen3-32b" and "openrouter/qwen/qwen3-32b"), so edit the field if yours differs.
+  {
+    id: "qwen/qwen3-32b",
+    name: "Qwen3 32B (Gateway)",
+    provider: "litellm",
+    inputCost: 0,
+    outputCost: 0,
+  },
+  {
+    id: "openrouter/qwen/qwen3-32b",
+    name: "Qwen3 32B via OpenRouter (Gateway)",
+    provider: "litellm",
+    inputCost: 0,
+    outputCost: 0,
+  },
   // Groq: free-tier inference, and unusually fast — good for testing prompt changes quickly without
   // spending anything. Pricing is 0 because the free tier has no per-token cost (rate-limited instead).
   // Groq retired the Llama models from its free/developer tier (Aug 2026) — these are its current
@@ -93,10 +114,154 @@ export const MODEL_PRESETS: ModelPreset[] = [
   },
 ];
 
+const PRICE_TABLE_URL =
+  "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+
+type PriceTable = Record<string, { input_cost_per_token?: number; output_cost_per_token?: number }>;
+let priceTablePromise: Promise<PriceTable | null> | null = null;
+
+/** LiteLLM's public list-price table (fetched once per page load; null if it can't be reached). */
+function loadPriceTable() {
+  priceTablePromise ??= fetch(PRICE_TABLE_URL)
+    .then((r) => (r.ok ? (r.json() as Promise<PriceTable>) : null))
+    .catch(() => null);
+  return priceTablePromise;
+}
+
+/**
+ * Best-effort list price (USD per 1M tokens) for a gateway model id. The gateway blocks its own
+ * /model/info, so ids like "flex/openai/gpt-5.4" or "openrouter/google/gemini-3.6-flash" are matched
+ * against the public table by peeling routing prefixes and ":free"/":nitro" suffixes.
+ */
+export function lookupListPrice(table: PriceTable, id: string): { in: number; out: number } | null {
+  if (/:free$/.test(id)) return { in: 0, out: 0 };
+  const bare = id.replace(/:[a-z]+$/i, "");
+  const parts = bare.split("/");
+  const candidates = new Set<string>([bare]);
+  for (let i = 1; i < parts.length; i++) {
+    const rest = parts.slice(i).join("/");
+    candidates.add(rest);
+    for (const pfx of ["openrouter", "vertex_ai", "gemini", "anthropic", "openai", "groq"]) {
+      candidates.add(`${pfx}/${rest}`);
+    }
+  }
+  for (const c of candidates) {
+    const row = table[c];
+    if (
+      row &&
+      typeof row.input_cost_per_token === "number" &&
+      typeof row.output_cost_per_token === "number"
+    ) {
+      return { in: row.input_cost_per_token * 1e6, out: row.output_cost_per_token * 1e6 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Models the key can use on the gateway (GET /models), with per-token prices from LiteLLM's
+ * /model/info when the gateway exposes it. Prices are USD per 1M tokens; missing ones are flagged
+ * costKnown: false instead of being shown as free.
+ */
+export async function fetchGatewayModels(settings: LlmSettings): Promise<ModelPreset[]> {
+  const base = (settings.baseUrl || DEFAULT_BASE_URLS.litellm).replace(/\/+$/, "");
+  const apiKey = settings.apiKey.trim();
+  if (!apiKey) throw new Error("Enter your gateway key first.");
+  const headers = { Authorization: `Bearer ${apiKey}` };
+
+  const listResp = await fetch(`${base}/models`, { headers }).catch(() => {
+    throw new Error(`Could not reach ${base}. Check the address and your network.`);
+  });
+  const list = await listResp.json().catch(() => null);
+  if (!listResp.ok) {
+    throw new Error(list?.error?.message ?? `Gateway returned status ${listResp.status}.`);
+  }
+  const ids: string[] = (list?.data ?? []).map((m: { id: string }) => m.id).filter(Boolean);
+
+  // LiteLLM serves /model/info at the server root (and also under /v1); try both, ignore failures.
+  const root = base.replace(/\/v1$/, "");
+  const prices = new Map<string, { in: number; out: number }>();
+  for (const url of [`${root}/model/info`, `${base}/model/info`]) {
+    try {
+      const r = await fetch(url, { headers });
+      if (!r.ok) continue;
+      const j = await r.json();
+      for (const row of j?.data ?? []) {
+        const inp = row?.model_info?.input_cost_per_token;
+        const out = row?.model_info?.output_cost_per_token;
+        if (typeof inp === "number" || typeof out === "number") {
+          prices.set(row.model_name, { in: (inp ?? 0) * 1e6, out: (out ?? 0) * 1e6 });
+        }
+      }
+      if (prices.size) break;
+    } catch {
+      /* CORS or not exposed — costs stay unknown */
+    }
+  }
+
+  // The gateway usually blocks /model/info (403), so fall back to public list prices.
+  const table = prices.size ? null : await loadPriceTable();
+  return ids.sort().map((id) => {
+    const known = MODEL_PRESETS.find((m) => m.provider !== "litellm" && m.id === id);
+    const p =
+      prices.get(id) ??
+      (known ? { in: known.inputCost, out: known.outputCost } : null) ??
+      (table ? lookupListPrice(table, id) : null) ??
+      undefined;
+    return {
+      id,
+      name: id,
+      provider: "litellm" as const,
+      inputCost: p ? Number(p.in.toFixed(4)) : 0,
+      outputCost: p ? Number(p.out.toFixed(4)) : 0,
+      costKnown: !!p,
+    };
+  });
+}
+
+export interface KeyBalance {
+  alias: string | null;
+  spend: number;
+  maxBudget: number | null;
+  remaining: number | null;
+  rpmLimit: number | null;
+  tpmLimit: number | null;
+  expires: string | null;
+}
+
+/** The key's own spend and limits (LiteLLM GET /key/info, answered for the calling key). */
+export async function fetchKeyBalance(settings: LlmSettings): Promise<KeyBalance> {
+  const base = (settings.baseUrl || DEFAULT_BASE_URLS.litellm).replace(/\/+$/, "");
+  const apiKey = settings.apiKey.trim();
+  if (!apiKey) throw new Error("Enter your gateway key first.");
+  const r = await fetch(`${base.replace(/\/v1$/, "")}/key/info`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  }).catch(() => {
+    throw new Error("Could not reach the gateway to read the key balance.");
+  });
+  const j = await r.json().catch(() => null);
+  const info = j?.info;
+  if (!r.ok || !info) throw new Error("The gateway didn't return balance info for this key.");
+  const spend = Number(info.spend ?? 0);
+  const max = typeof info.max_budget === "number" ? info.max_budget : null;
+  return {
+    alias: info.key_alias ?? null,
+    spend,
+    maxBudget: max,
+    remaining: max === null ? null : Math.max(max - spend, 0),
+    rpmLimit: info.rpm_limit ?? null,
+    tpmLimit: info.tpm_limit ?? null,
+    expires: info.expires ?? null,
+  };
+}
+
 /** Typical run when no inputs are loaded yet (label + spec merge + design). */
 export const EST_RUN_TOKENS = { input: 6500, output: 3200 };
 
 export const USD_TO_INR = 84;
+
+/** Per-run spend the user is comfortable with, in ₹ — models under it are flagged in the pickers. */
+export const RUN_BUDGET_INR = 0.7;
 
 export function runCostInr(
   m: ModelPreset,
@@ -144,7 +309,6 @@ const CONTEXT_ERROR =
   /context (length|window|limit)|maximum context|too many tokens|prompt is too long|input (is )?too (long|large)|exceeds? (the )?(max|maximum|limit|context)|token limit|reduce the length|max_tokens.*(exceed|too large)|input.{0,40}(limit|threshold)/i;
 
 export const isContextError = (msg: string) => CONTEXT_ERROR.test(msg);
-
 
 export interface CallResult {
   content: string;
@@ -233,7 +397,10 @@ export async function chat(
     // OpenRouter can reject a request with a confusing "Missing Authentication header" error
     // when HTTP-Referer is a localhost/private address it doesn't recognise — so these optional
     // attribution headers are only sent for a real, public origin.
-    if (origin && !/^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\]|.*\.local(:|$))/i.test(origin)) {
+    if (
+      origin &&
+      !/^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\]|.*\.local(:|$))/i.test(origin)
+    ) {
       headers["HTTP-Referer"] = origin;
       headers["X-Title"] = "Search Filter Generator";
     }

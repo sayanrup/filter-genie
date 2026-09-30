@@ -33,7 +33,8 @@ function costLine(s: StepView, preset: ModelPreset | undefined) {
   const outT = s.usage?.completion_tokens ?? 0;
   const parts = [`${s.calls} call`, `${fmtTokens(inT)} in`, `${fmtTokens(outT)} out`];
   if (preset?.tier === "FREE") parts.push("free");
-  else if (preset && (inT || outT)) parts.push(fmtInr(runCostInr(preset, inT, outT)));
+  else if (preset && preset.costKnown !== false && (inT || outT))
+    parts.push(fmtInr(runCostInr(preset, inT, outT)));
   return parts.join(" · ");
 }
 
@@ -49,6 +50,47 @@ function StatusIcon({ status }: { status: Step["status"] }) {
     <span className={`${base} bg-secondary text-muted-foreground`}>
       {status === "skipped" ? "–" : ""}
     </span>
+  );
+}
+
+/** Stacked bars: how much of the work code did, how much the model did, and what neither covered. */
+function WorkSplit({ split }: { split: NonNullable<Step["split"]> }) {
+  const pct = (n: number, total: number) => (total ? Math.round((n / total) * 100) : 0);
+  return (
+    <div className="mt-3 grid max-w-xl gap-2.5">
+      {split.map((row) => {
+        const total = row.code + row.model + row.none;
+        if (!total) return null;
+        return (
+          <div key={row.title}>
+            <div className="mb-1 flex justify-between text-xs text-muted-foreground">
+              <span>{row.title}</span>
+              <span className="font-mono">{total.toLocaleString()} total</span>
+            </div>
+            <div className="flex h-3 overflow-hidden rounded-full bg-secondary">
+              <div className="bg-success" style={{ width: `${(row.code / total) * 100}%` }} />
+              <div className="bg-primary" style={{ width: `${(row.model / total) * 100}%` }} />
+              <div className="bg-border" style={{ width: `${(row.none / total) * 100}%` }} />
+            </div>
+            <div className="mt-1 flex flex-wrap gap-x-3 font-mono text-[11px] text-muted-foreground">
+              <span>
+                <span className="text-success">■</span> code {row.code.toLocaleString()} (
+                {pct(row.code, total)}%)
+              </span>
+              <span>
+                <span className="text-primary">■</span> prompt {row.model.toLocaleString()} (
+                {pct(row.model, total)}%)
+              </span>
+              {row.none ? (
+                <span>
+                  ■ unlabelled {row.none.toLocaleString()} ({pct(row.none, total)}%)
+                </span>
+              ) : null}
+            </div>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -113,7 +155,7 @@ export function StepCards({
           out
           {preset?.tier === "FREE"
             ? " · free"
-            : preset && (totals.inT || totals.outT)
+            : preset && preset.costKnown !== false && (totals.inT || totals.outT)
               ? ` · ${fmtInr(runCostInr(preset, totals.inT, totals.outT))}`
               : ""}
         </div>
@@ -139,6 +181,7 @@ export function StepCards({
                     {s.detail ? (
                       <p className="mt-1 font-mono text-[11px] text-muted-foreground">{s.detail}</p>
                     ) : null}
+                    {s.split?.length ? <WorkSplit split={s.split} /> : null}
                     {s.stats?.length ? (
                       <div className="mt-3 flex flex-wrap gap-1.5">
                         {s.stats.map((st) => (

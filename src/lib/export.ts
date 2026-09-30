@@ -25,8 +25,10 @@ export function buildMarkdown(opts: {
   result: FilterResult;
   inputs: InputBundle;
   device?: string;
+  /** Extra markdown section placed before the inputs (e.g. the with/without-context comparison). */
+  extra?: string;
 }) {
-  const { name, savedAt, model, result, inputs, device } = opts;
+  const { name, savedAt, model, result, inputs, device, extra } = opts;
   const order: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
   const filters = [...result.filters].sort(
     (a, b) => (order[a.tier] ?? 9) - (order[b.tier] ?? 9) || a.rank - b.rank,
