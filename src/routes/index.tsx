@@ -718,7 +718,14 @@ function Index() {
 
       {showSaved ? (
         <section className="panel mb-5 p-4">
-          <h2 className="font-display mb-2 text-sm font-semibold">Saved results</h2>
+          <h2 className="font-display mb-1 text-sm font-semibold">Saved results</h2>
+          <p
+            className={`mb-2 text-[11px] ${sharedStorageEnabled ? "text-success" : "text-warning"}`}
+          >
+            {sharedStorageEnabled
+              ? "Shared: saved on the website, everyone with the link sees these."
+              : "Not shared: shared storage isn't set up (VITE_FIREBASE_API_KEY / VITE_FIREBASE_PROJECT_ID missing), so saves stay in this browser only."}
+          </p>
           {saved.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               Nothing saved yet. Generate filters, then use “Save results + download .md” (or “Save
