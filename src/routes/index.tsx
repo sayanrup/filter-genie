@@ -43,6 +43,7 @@ import { SearchPreview } from "@/components/SearchPreview";
 import { FilterTable } from "@/components/FilterTable";
 import { Similarity } from "@/components/ContextCompare";
 import { resultHasDesign, type ContextComparison } from "@/lib/compare";
+import { addShared, listShared, removeShared, sharedStorageEnabled } from "@/lib/saved-store";
 import { buildFullMarkdown, buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
 // Read from the gitignored .env.local so the key never lands in the repo (which syncs to Lovable).
@@ -240,6 +241,18 @@ function Index() {
     } catch {
       /* storage unavailable or malformed */
     }
+    // The website's shared list wins when it is set up; this browser's copy is the fallback.
+    if (!sharedStorageEnabled) return;
+    listShared<SavedRun>()
+      .then((list) => {
+        setSaved(list);
+        try {
+          localStorage.setItem(SAVED_KEY, JSON.stringify(list));
+        } catch {
+          /* cache only */
+        }
+      })
+      .catch(() => setSaveNote("Couldn't reach shared storage — showing this browser's saves."));
   }, []);
 
   useEffect(() => {
@@ -565,13 +578,22 @@ function Index() {
         : {}),
     };
     persistSaved([entry, ...saved]);
-    setSaveNote(
-      entry.withoutResult
-        ? `Saved "${entry.name}": with and without context, plus how similar`
-        : `Saved "${entry.name}"`,
-    );
+    const what = entry.withoutResult
+      ? `"${entry.name}": with and without context, plus how similar`
+      : `"${entry.name}"`;
+    if (sharedStorageEnabled) {
+      setSaveNote(`Saving ${what} to the website…`);
+      addShared(entry)
+        .then(() => setSaveNote(`Saved ${what} — everyone with the link can open it`))
+        .catch((err: Error) =>
+          setSaveNote(`Saved on this device only — the website couldn't store it (${err.message})`),
+        )
+        .finally(() => setTimeout(() => setSaveNote(""), 6000));
+    } else {
+      setSaveNote(`Saved ${what} on this device`);
+      setTimeout(() => setSaveNote(""), 3500);
+    }
     downloadMarkdown(entry);
-    setTimeout(() => setSaveNote(""), 3500);
   }
 
   function openSaved(entry: SavedRun) {
@@ -601,6 +623,10 @@ function Index() {
 
   function deleteSaved(id: string) {
     persistSaved(saved.filter((s) => s.id !== id));
+    if (sharedStorageEnabled)
+      removeShared(id).catch((err: Error) =>
+        setSaveNote(`Couldn't delete it on the website (${err.message})`),
+      );
   }
 
   function clearAll() {
