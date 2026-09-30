@@ -42,8 +42,10 @@ import { StepCards, type StepView } from "@/components/StepCards";
 import { SearchPreview } from "@/components/SearchPreview";
 import { FilterTable } from "@/components/FilterTable";
 import { Similarity } from "@/components/ContextCompare";
-import { comparisonMarkdown, resultHasDesign } from "@/lib/compare";
-import { buildMarkdown, slugify, type InputBundle } from "@/lib/export";
+import { resultHasDesign, type ContextComparison } from "@/lib/compare";
+import { addShared, listShared, removeShared, sharedStorageEnabled } from "@/lib/saved-store";
+import { downloadWorkbook } from "@/lib/export-xlsx";
+import { buildFullMarkdown, buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
 // Read from the gitignored .env.local so the key never lands in the repo (which syncs to Lovable).
 const SAVED_GATEWAY_KEY: string = import.meta.env["VITE_GATEWAY_KEY_ABHIJAY"] ?? "";
@@ -88,6 +90,9 @@ interface SavedRun {
   inputs: InputBundle;
   tab?: Tab;
   device?: Device;
+  /** Set when a category context was given: the same run without it, and how alike they are. */
+  withoutResult?: PipelineRun["result"];
+  comparison?: ContextComparison;
 }
 
 const EMPTY_BUNDLE: InputBundle = { serp: "", internal: "", context: "", specs: "", products: "" };
@@ -104,8 +109,8 @@ function rowsFromBundle(json: string): Row[] | null {
 
 /** A saved run only keeps the result and inputs; evidence is recomputed on the next Generate. */
 function runFromSaved(entry: SavedRun): PipelineRun {
-  return {
-    result: entry.result,
+  const plain = (result: PipelineRun["result"]): PipelineRun => ({
+    result,
     evidence: {
       category: null,
       tables: [],
@@ -118,6 +123,12 @@ function runFromSaved(entry: SavedRun): PipelineRun {
     usage: {},
     calls: 0,
     prompts: [],
+  });
+  return {
+    ...plain(entry.result),
+    ...(entry.withoutResult && entry.comparison
+      ? { withoutContext: plain(entry.withoutResult), comparison: entry.comparison }
+      : {}),
   };
 }
 
@@ -221,6 +232,8 @@ function Index() {
   const [saved, setSaved] = useState<SavedRun[]>([]);
   const [showSaved, setShowSaved] = useState(false);
   const [saveNote, setSaveNote] = useState("");
+  // Shared storage: null = not checked yet, "" = working, otherwise why it isn't.
+  const [sharedError, setSharedError] = useState<string | null>(null);
   const [savedLine, setSavedLine] = useState("");
   const abortRef = useRef<AbortController | null>(null);
 
@@ -231,6 +244,22 @@ function Index() {
     } catch {
       /* storage unavailable or malformed */
     }
+    // The website's shared list wins when it is set up; this browser's copy is the fallback.
+    if (!sharedStorageEnabled) {
+      setSharedError("VITE_FIREBASE_API_KEY / VITE_FIREBASE_PROJECT_ID aren't set");
+      return;
+    }
+    listShared<SavedRun>()
+      .then((list) => {
+        setSharedError("");
+        setSaved(list);
+        try {
+          localStorage.setItem(SAVED_KEY, JSON.stringify(list));
+        } catch {
+          /* cache only */
+        }
+      })
+      .catch((err: Error) => setSharedError(err.message));
   }, []);
 
   useEffect(() => {
@@ -519,72 +548,73 @@ function Index() {
     }
   }
 
-  function downloadMarkdown(entry: SavedRun, extra?: string) {
-    const md = buildMarkdown({
+  function downloadMarkdown(entry: SavedRun) {
+    const common = {
       name: entry.name,
       savedAt: entry.savedAt,
       model: entry.model,
-      result: entry.result,
       inputs: entry.inputs ?? EMPTY_BUNDLE,
       device: entry.device ?? "desktop",
-      ...(extra ? { extra } : {}),
-    });
+    };
+    const md =
+      entry.withoutResult && entry.comparison
+        ? buildFullMarkdown({
+            ...common,
+            result: entry.result,
+            withoutResult: entry.withoutResult,
+            comparison: entry.comparison,
+          })
+        : buildMarkdown({ ...common, result: entry.result });
     download(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.md`, "text/markdown", md);
   }
 
-  /** Save one run (its result plus the inputs it was made from) and download its .md. */
-  function saveRun(r: PipelineRun, suffix: string, context: string, extra?: string): SavedRun {
-    const base = r.result.category_name || "Untitled category";
+  /** The same content as an Excel workbook: filters with / without context, rules, and similarity. */
+  function downloadExcel(entry: SavedRun) {
+    downloadWorkbook(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.xlsx`, {
+      result: entry.result,
+      ...(entry.withoutResult ? { withoutResult: entry.withoutResult } : {}),
+      ...(entry.comparison ? { comparison: entry.comparison } : {}),
+    });
+  }
+
+  /** Saves everything Generate produced (with context, without, and how similar) and downloads it. */
+  function saveResult() {
+    if (!baseRun) return;
     const entry: SavedRun = {
-      id: `${Date.now()}-${suffix || "run"}`,
-      name: suffix ? `${base} — ${suffix}` : base,
+      id: `${Date.now()}`,
+      name: baseRun.result.category_name || "Untitled category",
       savedAt: new Date().toISOString(),
       model: settings.model,
-      result: r.result,
-      inputs: { ...currentBundle(), context },
+      result: baseRun.result,
+      inputs: currentBundle(),
       tab,
       device,
+      ...(baseRun.withoutContext && baseRun.comparison
+        ? { withoutResult: baseRun.withoutContext.result, comparison: baseRun.comparison }
+        : {}),
     };
-    downloadMarkdown(entry, extra);
-    return entry;
-  }
-
-  /** Name suffix and context of the result on screen (only differs when a comparison was run). */
-  function variantOf(which: "with" | "without") {
-    if (!baseRun?.comparison) return { suffix: "", context: inputs.context, extra: undefined };
-    return which === "without"
-      ? {
-          suffix: "without context",
-          context: "",
-          extra: comparisonMarkdown(baseRun.comparison, "without"),
-        }
-      : {
-          suffix: "with context",
-          context: inputs.context,
-          extra: comparisonMarkdown(baseRun.comparison, "with"),
-        };
-  }
-
-  function saveResult() {
-    if (!run) return;
-    const v = variantOf(variant === "without" ? "without" : "with");
-    const entry = saveRun(run, v.suffix, v.context, v.extra);
     persistSaved([entry, ...saved]);
-    setSaveNote(`Saved "${entry.name}"`);
-    setTimeout(() => setSaveNote(""), 3500);
-  }
-
-  function saveBoth() {
-    if (!baseRun?.withoutContext) return;
-    const w = variantOf("with");
-    const wo = variantOf("without");
-    const entries = [
-      saveRun(baseRun.withoutContext, wo.suffix, wo.context, wo.extra),
-      saveRun(baseRun, w.suffix, w.context, w.extra),
-    ];
-    persistSaved([...entries, ...saved]);
-    setSaveNote("Saved with and without context");
-    setTimeout(() => setSaveNote(""), 3500);
+    const what = entry.withoutResult
+      ? `"${entry.name}": with and without context, plus how similar`
+      : `"${entry.name}"`;
+    if (sharedStorageEnabled) {
+      setSaveNote(`Saving ${what} to the website…`);
+      addShared(entry)
+        .then(() => {
+          setSharedError("");
+          setSaveNote(`Saved ${what} — everyone with the link can open it`);
+        })
+        .catch((err: Error) => {
+          setSharedError(err.message);
+          setSaveNote(`Saved on this device only — the website couldn't store it (${err.message})`);
+        })
+        .finally(() => setTimeout(() => setSaveNote(""), 6000));
+    } else {
+      setSaveNote(`Saved ${what} on this device`);
+      setTimeout(() => setSaveNote(""), 3500);
+    }
+    downloadMarkdown(entry);
+    downloadExcel(entry);
   }
 
   function openSaved(entry: SavedRun) {
@@ -603,6 +633,7 @@ function Index() {
     setProductsText("");
     setProductsStatus(restored(i.products));
     setRun(runFromSaved(entry));
+    setVariant("with");
     setSteps([]);
     setError("");
     setSavedLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
@@ -613,6 +644,10 @@ function Index() {
 
   function deleteSaved(id: string) {
     persistSaved(saved.filter((s) => s.id !== id));
+    if (sharedStorageEnabled)
+      removeShared(id).catch((err: Error) =>
+        setSaveNote(`Couldn't delete it on the website (${err.message})`),
+      );
   }
 
   function clearAll() {
@@ -704,10 +739,20 @@ function Index() {
 
       {showSaved ? (
         <section className="panel mb-5 p-4">
-          <h2 className="font-display mb-2 text-sm font-semibold">Saved results</h2>
+          <h2 className="font-display mb-1 text-sm font-semibold">Saved results</h2>
+          <p
+            className={`mb-2 text-[11px] ${sharedError === "" ? "text-success" : sharedError ? "text-warning" : "text-muted-foreground"}`}
+          >
+            {sharedError === ""
+              ? "Shared: saved on the website, everyone with the link sees these."
+              : sharedError
+                ? `Not shared: the website's storage failed (${sharedError}). Saves stay in this browser only.`
+                : "Checking the website's shared storage…"}
+          </p>
           {saved.length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              Nothing saved yet. Generate filters, then use “Save results + download .md”.
+              Nothing saved yet. Generate filters, then use “Save results + download .md” (or “Save
+              everything” when a context was given).
             </p>
           ) : (
             <ul className="divide-y divide-border">
@@ -718,6 +763,7 @@ function Index() {
                     <div className="font-mono text-[11px] text-muted-foreground">
                       {new Date(s.savedAt).toLocaleString()} · {s.result.filters.length} filters ·{" "}
                       {s.model}
+                      {s.withoutResult ? " · with + without context" : ""}
                     </div>
                   </div>
                   <div className="ml-auto flex gap-2">
@@ -734,6 +780,13 @@ function Index() {
                       className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
                     >
                       Download .md
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadExcel(s)}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                    >
+                      Download .xlsx
                     </button>
                     <button
                       type="button"
@@ -1306,12 +1359,13 @@ function Index() {
                 </button>
               ))}
             </div>
+            {saveNote ? <span className="ml-auto text-xs text-success">{saveNote}</span> : null}
             <button
               type="button"
-              onClick={saveBoth}
-              className="ml-auto rounded-lg border border-border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-secondary"
+              onClick={saveResult}
+              className=" rounded-lg border border-border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-secondary"
             >
-              Save both + download .md
+              Save everything + download .md
             </button>
           </div>
           {variant === "similar" ? <Similarity cmp={baseRun.comparison} /> : null}
@@ -1427,7 +1481,9 @@ function Index() {
                         : "Raw JSON"}
                 </button>
               ))}
-            <div className="mb-2 ml-auto flex items-center gap-2">
+            <div
+              className={`mb-2 ml-auto flex items-center gap-2 ${baseRun?.comparison ? "hidden" : ""}`}
+            >
               {saveNote ? <span className="text-xs text-success">{saveNote}</span> : null}
               <button
                 type="button"

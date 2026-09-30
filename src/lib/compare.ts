@@ -159,41 +159,34 @@ export function resultHasDesign(result: FilterResult | null | undefined) {
 const cell = (v: string) => v.replace(/\|/g, "\\|");
 const list = (names: string[]) => (names.length ? names.map(cell).join(", ") : "none");
 
-/** The with/without-context comparison as a markdown section for the saved .md. */
-export function comparisonMarkdown(cmp: ContextComparison, variant: "with" | "without"): string {
-  let md = `## With vs without category context
-
-`;
-  md += `_This file is the **${variant} context** run; the other run was compared against it._
-
-`;
-  md += `- **Overlap:** ${cmp.overlapPct}% (${cmp.shared.length} filters in both runs)
-`;
-  md += `- **Found without context:** ${cmp.recallPct}% of the with-context filters
-`;
-  md += `- **Same tier:** ${cmp.shared.length ? `${cmp.sameTierPct}%` : "n/a"} of shared filters
-`;
-  md += `- **Only with context:** ${list(cmp.onlyWith)}
-`;
-  md += `- **Only without context:** ${list(cmp.onlyWithout)}
-`;
-  const ref = variant === "with" ? cmp.refWith : cmp.refWithout;
-  if (ref) {
-    md += `
-**Against the ISQs you gave:** ${ref.covered.length}/${ref.reference} found
-`;
-    md += `- Missed: ${list(ref.missed)}
-- Extra: ${list(ref.extra)}
-`;
+/** The with/without-context comparison as a markdown section for a saved .md. */
+export function comparisonMarkdown(cmp: ContextComparison): string {
+  const lines = [
+    "## With vs without category context",
+    "",
+    `- **Overlap:** ${cmp.overlapPct}% (${cmp.shared.length} filters in both runs)`,
+    `- **Found without context:** ${cmp.recallPct}% of the with-context filters`,
+    `- **Same tier:** ${cmp.shared.length ? `${cmp.sameTierPct}%` : "n/a"} of shared filters`,
+    `- **Only with context:** ${list(cmp.onlyWith)}`,
+    `- **Only without context:** ${list(cmp.onlyWithout)}`,
+  ];
+  const refs: [string, RefCoverage | null][] = [
+    ["with context", cmp.refWith],
+    ["without context", cmp.refWithout],
+  ];
+  for (const [label, ref] of refs) {
+    if (!ref) continue;
+    lines.push(
+      "",
+      `**Against the ISQs you gave, ${label}:** ${ref.covered.length}/${ref.reference} found`,
+      `- Missed: ${list(ref.missed)}`,
+      `- Extra: ${list(ref.extra)}`,
+    );
   }
   if (cmp.shared.length) {
-    md += `
-| Without context | Tier | With context | Tier |
-|---|---|---|---|
-`;
-    for (const s of cmp.shared)
-      md += `| ${cell(s.without)} | ${s.tierWithout} | ${cell(s.withCtx)} | ${s.tierWith} |
-`;
+    lines.push("", "| Without context | Tier | With context | Tier |", "|---|---|---|---|");
+    for (const x of cmp.shared)
+      lines.push(`| ${cell(x.without)} | ${x.tierWithout} | ${cell(x.withCtx)} | ${x.tierWith} |`);
   }
-  return md;
+  return `${lines.join("\n")}\n`;
 }

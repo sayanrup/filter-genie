@@ -1,0 +1,13 @@
+rules_version = '2';
+
+// Shared saved results for the Search Filter Generator.
+// Anyone who opens the website can read, add and delete saved results (no login).
+// Paste this in Firebase console → Firestore Database → Rules → Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /saved_runs/{id} {
+      allow read, create, delete: if true;
+      allow update: if false;
+    }
+  }
+}
