@@ -12,17 +12,23 @@ import {
   toKeywordTable,
   type Row,
 } from "@/lib/data";
+import { ModelPicker } from "@/components/ModelPicker";
 import {
   DEFAULT_BASE_URLS,
   INITIAL_STEPS,
   MODEL_PRESETS,
+  fetchGatewayModels,
+  fetchKeyBalance,
+  type KeyBalance,
+  RUN_BUDGET_INR,
+  type ModelPreset,
   USD_TO_INR,
   chat,
   EST_RUN_TOKENS,
   estimateRun,
   previewPrompts,
   runCostInr,
-  runPipeline,
+  runAll,
   type FilterRow,
   type LlmSettings,
   type PipelineInputs,
@@ -34,8 +40,13 @@ import {
 import { SKILLS, stageSkills } from "@/skills";
 import { StepCards, type StepView } from "@/components/StepCards";
 import { SearchPreview } from "@/components/SearchPreview";
-import { FilterDetailRow } from "@/components/FilterDetail";
+import { FilterTable } from "@/components/FilterTable";
+import { Similarity } from "@/components/ContextCompare";
+import { comparisonMarkdown, resultHasDesign } from "@/lib/compare";
 import { buildMarkdown, slugify, type InputBundle } from "@/lib/export";
+
+// Read from the gitignored .env.local so the key never lands in the repo (which syncs to Lovable).
+const SAVED_GATEWAY_KEY: string = import.meta.env["VITE_GATEWAY_KEY_ABHIJAY"] ?? "";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -109,8 +120,6 @@ function runFromSaved(entry: SavedRun): PipelineRun {
     prompts: [],
   };
 }
-
-const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
 
 function safeRows(text: string): Row[] {
   try {
@@ -204,10 +213,11 @@ function Index() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [steps, setSteps] = useState<StepView[]>([]);
-  const [run, setRun] = useState<PipelineRun | null>(null);
+  const [baseRun, setRun] = useState<PipelineRun | null>(null);
+  // Which result is on screen: the normal run, the same run without context, or their comparison.
+  const [variant, setVariant] = useState<"with" | "without" | "similar">("with");
   const [tab, setTab] = useState<Tab>("table");
   const [device, setDevice] = useState<Device>("desktop");
-  const [expandedFilter, setExpandedFilter] = useState<string | null>(null);
   const [saved, setSaved] = useState<SavedRun[]>([]);
   const [showSaved, setShowSaved] = useState(false);
   const [saveNote, setSaveNote] = useState("");
@@ -306,22 +316,69 @@ function Index() {
   );
   const promptRecords: PromptRecord[] = !showPrompt
     ? []
-    : run?.prompts.length
-      ? run.prompts
+    : baseRun?.prompts.length
+      ? baseRun.prompts
       : previewRecords;
-  const estimate = useMemo(
-    () =>
-      previewRecords.length
-        ? estimateRun(previewRecords)
-        : { calls: 3, inputTokens: EST_RUN_TOKENS.input, outputTokens: EST_RUN_TOKENS.output },
-    [previewRecords],
-  );
+  // With a category context the run is repeated without it (labelling + design; the rest is cached).
+  const estimate = useMemo(() => {
+    if (!previewRecords.length)
+      return { calls: 3, inputTokens: EST_RUN_TOKENS.input, outputTokens: EST_RUN_TOKENS.output };
+    const withoutCtx = deferredInputs.context.trim()
+      ? previewPrompts({ ...deferredInputs, context: "" }).filter((r) => r.id !== "fields")
+      : [];
+    return estimateRun([...previewRecords, ...withoutCtx]);
+  }, [previewRecords, deferredInputs]);
 
-  const preset = MODEL_PRESETS.find((m) => m.id === settings.model);
-  const estINR = preset
-    ? runCostInr(preset, estimate.inputTokens, estimate.outputTokens).toFixed(2)
-    : null;
-  const providerPresets = MODEL_PRESETS.filter((m) => m.provider === settings.provider);
+  const [balance, setBalance] = useState<KeyBalance | null>(null);
+  const [balanceError, setBalanceError] = useState("");
+  const [balanceBusy, setBalanceBusy] = useState(false);
+
+  // Keeps the balance on screen: fetched automatically whenever the gateway key/address changes,
+  // and again after each run (spend changes). A failed refresh keeps the last known balance.
+  const refreshBalance = useRef<() => void>(() => {});
+  useEffect(() => {
+    if (settings.provider !== "litellm" || !settings.apiKey.trim()) {
+      setBalance(null);
+      setBalanceError("");
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      setBalanceBusy(true);
+      fetchKeyBalance(settings)
+        .then((b) => {
+          if (cancelled) return;
+          setBalance(b);
+          setBalanceError("");
+        })
+        .catch((e: Error) => !cancelled && setBalanceError(e.message))
+        .finally(() => !cancelled && setBalanceBusy(false));
+    };
+    refreshBalance.current = load;
+    const t = setTimeout(load, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only key, address and provider matter
+  }, [settings.provider, settings.apiKey, settings.baseUrl]);
+  useEffect(() => {
+    if (!loading) refreshBalance.current();
+  }, [loading]);
+  const [gatewayModels, setGatewayModels] = useState<ModelPreset[]>([]);
+  const allPresets = useMemo(
+    () => [
+      ...gatewayModels,
+      ...MODEL_PRESETS.filter((m) => !(m.provider === "litellm" && gatewayModels.length)),
+    ],
+    [gatewayModels],
+  );
+  const preset = allPresets.find((m) => m.id === settings.model);
+  const estINR =
+    preset && preset.costKnown !== false
+      ? runCostInr(preset, estimate.inputTokens, estimate.outputTokens).toFixed(2)
+      : null;
+  const providerPresets = allPresets.filter((m) => m.provider === settings.provider);
 
   function setProvider(provider: Provider) {
     setSettings((prev) => ({
@@ -352,6 +409,23 @@ function Index() {
     } catch (err) {
       setRows(null);
       setStatus({ kind: "error", message: (err as Error).message });
+    }
+  }
+
+  async function loadGatewayModels() {
+    setTestStatus({ kind: "busy", message: "Loading models for this key…" });
+    refreshBalance.current();
+    try {
+      const models = await fetchGatewayModels(settings);
+      if (!models.length) throw new Error("The gateway returned no models for this key.");
+      setGatewayModels(models);
+      const priced = models.filter((m) => m.costKnown).length;
+      setTestStatus({
+        kind: "ok",
+        message: `${models.length} models available · ${priced} with published prices`,
+      });
+    } catch (err) {
+      setTestStatus({ kind: "error", message: (err as Error).message });
     }
   }
 
@@ -395,7 +469,7 @@ function Index() {
     setRun(null);
     setSteps(INITIAL_STEPS.map((s) => ({ ...s })));
     try {
-      const result = await runPipeline(settings, inputs, {
+      const result = await runAll(settings, inputs, {
         signal: controller.signal,
         ...(from ? { from } : {}),
         onStep: (id, patch) =>
@@ -412,9 +486,9 @@ function Index() {
           ),
       });
       setRun(result);
+      setVariant("with");
       setSavedLine("");
       setTab("table");
-      setExpandedFilter(null);
     } catch (err) {
       setError((err as Error).name === "AbortError" ? "Stopped." : (err as Error).message);
       setSteps((prev) => prev.map((s) => (s.status === "running" ? { ...s, status: "error" } : s)));
@@ -445,7 +519,7 @@ function Index() {
     }
   }
 
-  function downloadMarkdown(entry: SavedRun) {
+  function downloadMarkdown(entry: SavedRun, extra?: string) {
     const md = buildMarkdown({
       name: entry.name,
       savedAt: entry.savedAt,
@@ -453,25 +527,63 @@ function Index() {
       result: entry.result,
       inputs: entry.inputs ?? EMPTY_BUNDLE,
       device: entry.device ?? "desktop",
+      ...(extra ? { extra } : {}),
     });
     download(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.md`, "text/markdown", md);
   }
 
-  function saveResult() {
-    if (!run) return;
+  /** Save one run (its result plus the inputs it was made from) and download its .md. */
+  function saveRun(r: PipelineRun, suffix: string, context: string, extra?: string): SavedRun {
+    const base = r.result.category_name || "Untitled category";
     const entry: SavedRun = {
-      id: `${Date.now()}`,
-      name: run.result.category_name || "Untitled category",
+      id: `${Date.now()}-${suffix || "run"}`,
+      name: suffix ? `${base} — ${suffix}` : base,
       savedAt: new Date().toISOString(),
       model: settings.model,
-      result: run.result,
-      inputs: currentBundle(),
+      result: r.result,
+      inputs: { ...currentBundle(), context },
       tab,
       device,
     };
+    downloadMarkdown(entry, extra);
+    return entry;
+  }
+
+  /** Name suffix and context of the result on screen (only differs when a comparison was run). */
+  function variantOf(which: "with" | "without") {
+    if (!baseRun?.comparison) return { suffix: "", context: inputs.context, extra: undefined };
+    return which === "without"
+      ? {
+          suffix: "without context",
+          context: "",
+          extra: comparisonMarkdown(baseRun.comparison, "without"),
+        }
+      : {
+          suffix: "with context",
+          context: inputs.context,
+          extra: comparisonMarkdown(baseRun.comparison, "with"),
+        };
+  }
+
+  function saveResult() {
+    if (!run) return;
+    const v = variantOf(variant === "without" ? "without" : "with");
+    const entry = saveRun(run, v.suffix, v.context, v.extra);
     persistSaved([entry, ...saved]);
     setSaveNote(`Saved "${entry.name}"`);
-    downloadMarkdown(entry);
+    setTimeout(() => setSaveNote(""), 3500);
+  }
+
+  function saveBoth() {
+    if (!baseRun?.withoutContext) return;
+    const w = variantOf("with");
+    const wo = variantOf("without");
+    const entries = [
+      saveRun(baseRun.withoutContext, wo.suffix, wo.context, wo.extra),
+      saveRun(baseRun, w.suffix, w.context, w.extra),
+    ];
+    persistSaved([...entries, ...saved]);
+    setSaveNote("Saved with and without context");
     setTimeout(() => setSaveNote(""), 3500);
   }
 
@@ -496,7 +608,6 @@ function Index() {
     setSavedLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
     setDevice(entry.device ?? "desktop");
     setTab(entry.tab === "evidence" ? "table" : (entry.tab ?? "table"));
-    setExpandedFilter(null);
     setShowSaved(false);
   }
 
@@ -522,16 +633,12 @@ function Index() {
     setShowPrompt(false);
   }
 
+  const run = variant === "without" && baseRun?.withoutContext ? baseRun.withoutContext : baseRun;
   const result = run?.result ?? null;
   const tierCount = (tier: string) => result?.filters.filter((f) => f.tier === tier).length ?? 0;
 
   const hasEvidence = Boolean(run && (run.evidence.tables.length || run.evidence.listing));
-  // Runs made with "Include UI design" off have no options or UI patterns to show.
-  const hasDesign = Boolean(
-    result?.filters.some(
-      (f) => f.values.length > 0 || (f.ui_pattern && f.ui_pattern !== "display only"),
-    ),
-  );
+  const hasDesign = resultHasDesign(result);
 
   // A one-line rollup so trust/gaps in a run are visible without reading every row.
   const filterSummary = useMemo(() => {
@@ -705,20 +812,12 @@ function Index() {
             <label className="label-caps mb-1 block" htmlFor="model">
               Model
             </label>
-            <input
+            <ModelPicker
               id="model"
-              list="model-presets"
-              className="field"
               value={settings.model}
-              onChange={(e) => setSettings((s) => ({ ...s, model: e.target.value }))}
+              models={providerPresets}
+              onChange={(model) => setSettings((s) => ({ ...s, model }))}
             />
-            <datalist id="model-presets">
-              {providerPresets.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
-            </datalist>
           </div>
         </div>
 
@@ -730,6 +829,24 @@ function Index() {
           >
             Test connection
           </button>
+          {settings.provider === "litellm" && SAVED_GATEWAY_KEY ? (
+            <button
+              type="button"
+              onClick={() => setSettings((s) => ({ ...s, apiKey: SAVED_GATEWAY_KEY }))}
+              className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground transition-colors hover:bg-accent"
+            >
+              Use Abhijay Rawat's key
+            </button>
+          ) : null}
+          {settings.provider === "litellm" ? (
+            <button
+              type="button"
+              onClick={loadGatewayModels}
+              className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground transition-colors hover:bg-accent"
+            >
+              Load my models
+            </button>
+          ) : null}
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
             <input
               type="checkbox"
@@ -753,10 +870,56 @@ function Index() {
           ) : null}
         </div>
 
+        {settings.provider === "litellm" && (balance || balanceError || balanceBusy) ? (
+          <div className="mt-3 rounded-md border border-border bg-secondary/60 px-3 py-2 text-xs">
+            <div className="font-semibold">
+              {balance?.alias ?? "Gateway key"}
+              {!balance && balanceBusy ? (
+                <span className="ml-2 font-normal text-muted-foreground">checking balance…</span>
+              ) : null}
+              {balanceError ? (
+                <span className="ml-2 font-normal text-destructive">
+                  {balanceError}{" "}
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => refreshBalance.current()}
+                  >
+                    retry
+                  </button>
+                </span>
+              ) : null}
+              {balance && balance.remaining !== null ? (
+                <span
+                  className={`ml-2 font-mono ${balance.remaining < 2 ? "text-destructive" : "text-success"}`}
+                >
+                  ${balance.remaining.toFixed(2)} left (~₹
+                  {(balance.remaining * USD_TO_INR).toFixed(0)})
+                </span>
+              ) : null}
+            </div>
+            {balance ? (
+              <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                ${balance.spend.toFixed(2)} spent
+                {balance.maxBudget !== null
+                  ? ` of $${balance.maxBudget.toFixed(2)}`
+                  : " · no budget cap"}
+                {balance.rpmLimit ? ` · ${balance.rpmLimit} req/min` : ""}
+                {balance.tpmLimit ? ` · ${balance.tpmLimit.toLocaleString()} tokens/min` : ""}
+                {balance.expires ? ` · expires ${balance.expires.slice(0, 10)}` : ""}
+              </div>
+            ) : null}
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              Models marked ✓ estimate under ₹{RUN_BUDGET_INR} per run. Prices are public list
+              prices (the gateway hides its own), so treat them as estimates; your dashboard is the
+              source of truth.
+            </div>
+          </div>
+        ) : null}
         {settings.provider === "litellm" ? (
           <p className="mt-2 text-[11px] text-muted-foreground">
-            Point this at your LiteLLM gateway address and use the model name exactly as it is
-            configured there.
+            IndiaMART LLM Gateway (<span className="font-mono">imllm.intermesh.net/v1</span>): paste
+            your gateway access key and use a model name your key was granted, exactly as given.
           </p>
         ) : null}
         {settings.provider === "groq" ? (
@@ -802,7 +965,11 @@ function Index() {
                 ) : null}
                 <span className="text-xs font-semibold">{m.name}</span>
               </div>
-              {free ? (
+              {m.costKnown === false ? (
+                <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+                  price not published
+                </div>
+              ) : free ? (
                 <div className="mt-1 font-mono text-[11px] text-muted-foreground">
                   no per-token cost
                 </div>
@@ -813,6 +980,9 @@ function Index() {
                   </div>
                   <div className="font-mono text-[11px] font-semibold">
                     ~₹{runCostInr(m, estimate.inputTokens, estimate.outputTokens).toFixed(2)}/run
+                    {runCostInr(m, estimate.inputTokens, estimate.outputTokens) <= RUN_BUDGET_INR
+                      ? " ✓"
+                      : ""}
                   </div>
                 </>
               )}
@@ -1107,8 +1277,49 @@ function Index() {
         />
       ) : null}
 
-      {run && result ? (
+      {baseRun?.comparison ? (
         <section className="mt-6">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <h2 className="font-display text-base font-semibold">Result</h2>
+            <div className="flex gap-1 rounded-lg bg-secondary p-1">
+              {(
+                [
+                  ["with", `With context (${baseRun.result.filters.length})`],
+                  [
+                    "without",
+                    `Without context (${baseRun.withoutContext?.result.filters.length ?? 0})`,
+                  ],
+                  ["similar", `How similar (${baseRun.comparison.overlapPct}%)`],
+                ] as const
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setVariant(id)}
+                  className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                    variant === id
+                      ? "bg-card text-primary shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={saveBoth}
+              className="ml-auto rounded-lg border border-border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-secondary"
+            >
+              Save both + download .md
+            </button>
+          </div>
+          {variant === "similar" ? <Similarity cmp={baseRun.comparison} /> : null}
+        </section>
+      ) : null}
+
+      {run && result && variant !== "similar" ? (
+        <section className={baseRun?.comparison ? "mt-2" : "mt-6"}>
           <div className="mb-4 flex flex-wrap gap-3">
             {[
               { label: "Total filters", value: result.filters.length, tone: "" },
@@ -1159,7 +1370,11 @@ function Index() {
                   <span key={c} className="flex items-center gap-1">
                     <span
                       className={`size-1.5 rounded-full ${
-                        c === "High" ? "bg-success" : c === "Medium" ? "bg-warning" : "bg-destructive"
+                        c === "High"
+                          ? "bg-success"
+                          : c === "Medium"
+                            ? "bg-warning"
+                            : "bg-destructive"
                       }`}
                     />
                     <strong>{filterSummary.byConfidence[c]}</strong>
@@ -1225,177 +1440,7 @@ function Index() {
           </div>
 
           {tab === "table" ? (
-            <div className="panel overflow-x-auto">
-              <table className="w-full border-collapse text-sm">
-                <thead>
-                  <tr>
-                    {[
-                      "#",
-                      "Tier",
-                      "Filter",
-                      ...(hasDesign ? ["UI pattern", "Values"] : []),
-                      "Confidence",
-                      "Why",
-                    ].map((h) => (
-                      <th
-                        key={h}
-                        className="label-caps border-b-2 border-border px-3 py-2.5 text-left whitespace-nowrap"
-                      >
-                        {h}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {[...result.filters]
-                    .sort(
-                      (a, b) =>
-                        (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank,
-                    )
-                    .flatMap((f, i) => {
-                      const key = `${f.name}-${i}`;
-                      const open = expandedFilter === key;
-                      const row = (
-                        <tr
-                          key={key}
-                          onClick={() => setExpandedFilter(open ? null : key)}
-                          className={`cursor-pointer border-b border-border align-top transition-colors last:border-0 hover:bg-accent/50 ${
-                            open ? "border-b-0 bg-accent/40" : ""
-                          }`}
-                          title={open ? "Click to collapse" : "Click to see the full reasoning"}
-                        >
-                          <td className="px-3 py-3 font-semibold">{i + 1}</td>
-                        <td className="px-3 py-3">
-                          <span
-                            className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider whitespace-nowrap ${
-                              f.tier === "Tier 1"
-                                ? "bg-success-soft text-success"
-                                : f.tier === "Tier 2"
-                                  ? "bg-warning-soft text-warning"
-                                  : "bg-danger-soft text-destructive"
-                            }`}
-                          >
-                            {f.tier}
-                          </span>
-                        </td>
-                        <td className="px-3 py-3">
-                          <strong>{f.name}</strong>
-                          <div className="mt-1 flex flex-wrap gap-x-2 font-mono text-[10px] text-muted-foreground">
-                            {f.coverage_pct != null ? (
-                              <span>coverage {f.coverage_pct}%</span>
-                            ) : null}
-                            {f.top_value_share_pct != null ? (
-                              <span>top value {f.top_value_share_pct}%</span>
-                            ) : null}
-                            {f.listing_fill_pct != null ? (
-                              <span>filled {f.listing_fill_pct}%</span>
-                            ) : null}
-                          </div>
-                          {f.needs_new_isq ? (
-                            <div className="mt-1 text-[10px] text-destructive">
-                              ⚠ {f.isq_note || "Needs a new listing field"}
-                            </div>
-                          ) : null}
-                        </td>
-                        {hasDesign ? (
-                          <>
-                            <td className="px-3 py-3 text-xs">{f.ui_pattern}</td>
-                            <td className="px-3 py-3">
-                              <div className="flex flex-wrap gap-1">
-                                {f.values.slice(0, 15).map((v, vi) => (
-                                  <span
-                                    key={`${v}-${vi}`}
-                                    className="rounded border border-border bg-secondary px-1.5 py-px text-[11px]"
-                                  >
-                                    {v}
-                                  </span>
-                                ))}
-                                {f.values.length > 15 ? (
-                                  <span className="rounded border border-border px-1.5 py-px text-[11px] text-muted-foreground">
-                                    +{f.values.length - 15}
-                                  </span>
-                                ) : null}
-                              </div>
-                            </td>
-                          </>
-                        ) : null}
-                        <td className="px-3 py-3">
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
-                              f.confidence === "High"
-                                ? "bg-success-soft text-success"
-                                : f.confidence === "Medium"
-                                  ? "bg-warning-soft text-warning"
-                                  : "bg-danger-soft text-destructive"
-                            }`}
-                          >
-                            {f.confidence}
-                          </span>
-                        </td>
-                          <td className="max-w-72 px-3 py-3 text-xs text-muted-foreground">
-                            <div className="flex items-start gap-1.5">
-                              <span
-                                className={`mt-0.5 shrink-0 text-[9px] text-muted-foreground/70 transition-transform ${open ? "rotate-90" : ""}`}
-                              >
-                                ▶
-                              </span>
-                              <span>{f.rationale}</span>
-                            </div>
-                            {f.sources?.length ? (
-                              <div className="mt-1 ml-3.5 flex flex-wrap gap-1">
-                                {f.sources.map((s) => (
-                                  <span
-                                    key={s}
-                                    className="rounded bg-secondary px-1 py-px font-mono text-[9px] uppercase"
-                                  >
-                                    {s}
-                                  </span>
-                                ))}
-                              </div>
-                            ) : null}
-                          </td>
-                        </tr>
-                      );
-                      return open
-                        ? [
-                            row,
-                            <FilterDetailRow
-                              key={`${key}-detail`}
-                              filter={f}
-                              evidence={run.evidence}
-                              colSpan={hasDesign ? 7 : 5}
-                            />,
-                          ]
-                        : [row];
-                    })}
-                </tbody>
-              </table>
-
-              {result.interaction_rules?.length || result.blockers?.length ? (
-                <div className="grid gap-4 border-t border-border p-4 sm:grid-cols-2">
-                  {result.interaction_rules?.length ? (
-                    <div>
-                      <h3 className="label-caps mb-1">Interaction rules</h3>
-                      <ul className="list-disc pl-4 text-xs leading-relaxed">
-                        {result.interaction_rules.map((r, i) => (
-                          <li key={i}>{r}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                  {result.blockers?.length ? (
-                    <div>
-                      <h3 className="label-caps mb-1 text-destructive">Blockers</h3>
-                      <ul className="list-disc pl-4 text-xs leading-relaxed text-destructive">
-                        {result.blockers.map((b, i) => (
-                          <li key={i}>{b}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
+            <FilterTable result={result} evidence={run.evidence} hasDesign={hasDesign} />
           ) : tab === "preview" && hasDesign ? (
             <SearchPreview result={result} initialDevice={device} onDeviceChange={setDevice} />
           ) : tab === "evidence" && hasEvidence ? (
