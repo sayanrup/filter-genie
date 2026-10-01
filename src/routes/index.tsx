@@ -28,7 +28,7 @@ import {
   estimateRun,
   previewPrompts,
   runCostInr,
-  runAll,
+  runPipeline,
   type FilterRow,
   type LlmSettings,
   type PipelineInputs,
@@ -43,7 +43,14 @@ import { SearchPreview } from "@/components/SearchPreview";
 import { FilterTable } from "@/components/FilterTable";
 import { Similarity } from "@/components/ContextCompare";
 import { resultHasDesign, type ContextComparison } from "@/lib/compare";
-import { addShared, listShared, removeShared, sharedStorageEnabled } from "@/lib/saved-store";
+import {
+  addShared,
+  listShared,
+  removeShared,
+  sharedStorageEnabled,
+  withoutRows,
+} from "@/lib/saved-store";
+import publishedResults from "@/data/published-results.json";
 import { downloadWorkbook } from "@/lib/export-xlsx";
 import { buildFullMarkdown, buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
@@ -97,6 +104,9 @@ interface SavedRun {
 
 const EMPTY_BUNDLE: InputBundle = { serp: "", internal: "", context: "", specs: "", products: "" };
 
+/** Results published with the site (src/data/published-results.json): everyone sees them, none can be deleted. */
+const PUBLISHED = publishedResults as unknown as SavedRun[];
+
 function rowsFromBundle(json: string): Row[] | null {
   if (!json) return null;
   try {
@@ -130,6 +140,37 @@ function runFromSaved(entry: SavedRun): PipelineRun {
       ? { withoutContext: plain(entry.withoutResult), comparison: entry.comparison }
       : {}),
   };
+}
+
+/**
+ * The website's runs plus this browser's. A run the website stored without its inputs (too large)
+ * gets them back from the browser's copy, and runs only this browser has (the website couldn't take
+ * them) are kept instead of being wiped by the website's list.
+ */
+function mergeSaved(local: SavedRun[], shared: SavedRun[]): SavedRun[] {
+  const localById = new Map(local.map((s) => [s.id, s]));
+  const sharedIds = new Set(shared.map((s) => s.id));
+  const fromShared = shared.map((s) => {
+    const mine = localById.get(s.id);
+    if (!mine?.inputs) return s;
+    if (!s.inputs) return { ...s, inputs: mine.inputs };
+    // Rows dropped on the website but still held here: restore just those, keep the rest.
+    return {
+      ...s,
+      inputs: {
+        ...s.inputs,
+        serp: s.inputs.serp || mine.inputs.serp,
+        internal: s.inputs.internal || mine.inputs.internal,
+        products: s.inputs.products || mine.inputs.products,
+      },
+    };
+  });
+  return newestFirst([...fromShared, ...local.filter((s) => !sharedIds.has(s.id))]);
+}
+
+/** Saved runs in descending order of when they were saved: the newest on top. */
+function newestFirst(list: SavedRun[]): SavedRun[] {
+  return [...list].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
 }
 
 function safeRows(text: string): Row[] {
@@ -240,11 +281,11 @@ function Index() {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(SAVED_KEY);
-      if (raw) setSaved(JSON.parse(raw));
+      if (raw) setSaved(newestFirst(JSON.parse(raw)));
     } catch {
       /* storage unavailable or malformed */
     }
-    // The website's shared list wins when it is set up; this browser's copy is the fallback.
+    // The website's shared list is used when it is set up, merged with this browser's copy.
     if (!sharedStorageEnabled) {
       setSharedError("VITE_FIREBASE_API_KEY / VITE_FIREBASE_PROJECT_ID aren't set");
       return;
@@ -252,9 +293,19 @@ function Index() {
     listShared<SavedRun>()
       .then((list) => {
         setSharedError("");
-        setSaved(list);
+        // Read the browser's copy again: it holds the full inputs of runs the website only kept
+        // in part, and the runs the website couldn't store at all.
+        let local: SavedRun[] = [];
         try {
-          localStorage.setItem(SAVED_KEY, JSON.stringify(list));
+          const raw = localStorage.getItem(SAVED_KEY);
+          if (raw) local = JSON.parse(raw);
+        } catch {
+          /* storage unavailable or malformed */
+        }
+        const merged = mergeSaved(local, list);
+        setSaved(merged);
+        try {
+          localStorage.setItem(SAVED_KEY, JSON.stringify(merged));
         } catch {
           /* cache only */
         }
@@ -498,7 +549,7 @@ function Index() {
     setRun(null);
     setSteps(INITIAL_STEPS.map((s) => ({ ...s })));
     try {
-      const result = await runAll(settings, inputs, {
+      const result = await runPipeline(settings, inputs, {
         signal: controller.signal,
         ...(from ? { from } : {}),
         onStep: (id, patch) =>
@@ -539,12 +590,26 @@ function Index() {
     };
   }
 
-  function persistSaved(next: SavedRun[]) {
+  /**
+   * Keeps the list in this browser. When the browser's quota is hit, the newest run is stored without
+   * its keyword/listing files (context and ISQ ranking stay). Says what was kept for the newest run.
+   */
+  function persistSaved(next: SavedRun[]): "full" | "no-rows" | "failed" {
     setSaved(next);
     try {
       localStorage.setItem(SAVED_KEY, JSON.stringify(next));
+      return "full";
     } catch {
-      setSaveNote("Saved, but this device's storage is full — download the .md to keep it.");
+      /* over the quota: retry without the newest run's big files */
+    }
+    try {
+      localStorage.setItem(
+        SAVED_KEY,
+        JSON.stringify(next.map((s, i) => (i === 0 ? withoutRows(s) : s))),
+      );
+      return "no-rows";
+    } catch {
+      return "failed";
     }
   }
 
@@ -577,7 +642,16 @@ function Index() {
     });
   }
 
-  /** Saves everything Generate produced (with context, without, and how similar) and downloads it. */
+  /** The whole saved run as JSON: results with per-value confidence, and the inputs. Nothing is cut. */
+  function downloadJson(entry: SavedRun) {
+    download(
+      `${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.json`,
+      "application/json",
+      JSON.stringify(entry, null, 2),
+    );
+  }
+
+  /** Saves what Generate produced in this browser (and the website). Nothing is downloaded: the saved list has the download buttons. */
   function saveResult() {
     if (!baseRun) return;
     const entry: SavedRun = {
@@ -593,28 +667,41 @@ function Index() {
         ? { withoutResult: baseRun.withoutContext.result, comparison: baseRun.comparison }
         : {}),
     };
-    persistSaved([entry, ...saved]);
+    const local = persistSaved([entry, ...saved]);
     const what = entry.withoutResult
       ? `"${entry.name}": with and without context, plus how similar`
       : `"${entry.name}"`;
+    // Say what didn't fit, so a saved run that comes back without its files isn't a surprise.
+    const localNote =
+      local === "no-rows"
+        ? " The keyword and listing files didn't fit in this browser's storage; the context and ISQ ranking were kept."
+        : local === "failed"
+          ? " This browser's storage is full, so it isn't kept here — download it from the saved list to keep it."
+          : "";
     if (sharedStorageEnabled) {
       setSaveNote(`Saving ${what} to the website…`);
       addShared(entry)
-        .then(() => {
+        .then((stored) => {
           setSharedError("");
-          setSaveNote(`Saved ${what} — everyone with the link can open it`);
+          const siteNote =
+            stored === "no-rows"
+              ? " The keyword and listing files were too big for the website; the context and ISQ ranking were kept."
+              : stored === "results-only"
+                ? " The inputs were too big for the website; only the results were kept."
+                : "";
+          setSaveNote(`Saved ${what} — everyone with the link can open it.${siteNote}${localNote}`);
         })
         .catch((err: Error) => {
           setSharedError(err.message);
-          setSaveNote(`Saved on this device only — the website couldn't store it (${err.message})`);
+          setSaveNote(
+            `Saved on this device only — the website couldn't store it (${err.message}).${localNote}`,
+          );
         })
-        .finally(() => setTimeout(() => setSaveNote(""), 6000));
+        .finally(() => setTimeout(() => setSaveNote(""), 12000));
     } else {
-      setSaveNote(`Saved ${what} on this device`);
-      setTimeout(() => setSaveNote(""), 3500);
+      setSaveNote(`Saved ${what} on this device.${localNote}`);
+      setTimeout(() => setSaveNote(""), localNote ? 12000 : 3500);
     }
-    downloadMarkdown(entry);
-    downloadExcel(entry);
   }
 
   function openSaved(entry: SavedRun) {
@@ -726,7 +813,9 @@ function Index() {
             onClick={() => setShowSaved((v) => !v)}
             className="ml-auto rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
           >
-            {showSaved ? "Hide saved results" : `View saved results (${saved.length})`}
+            {showSaved
+              ? "Hide saved results"
+              : `View saved results (${saved.length + PUBLISHED.length})`}
           </button>
         </div>
         <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
@@ -739,6 +828,51 @@ function Index() {
 
       {showSaved ? (
         <section className="panel mb-5 p-4">
+          {PUBLISHED.length ? (
+            <div className="mb-4">
+              <h2 className="font-display mb-1 text-sm font-semibold">Published results</h2>
+              <p className="mb-2 text-[11px] text-muted-foreground">
+                Published with the site: everyone sees these, and they can't be deleted.
+              </p>
+              <ul className="divide-y divide-border">
+                {PUBLISHED.map((s) => (
+                  <li key={s.id} className="flex flex-wrap items-center gap-2 py-2">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold">{s.name}</div>
+                      <div className="font-mono text-[11px] text-muted-foreground">
+                        {new Date(s.savedAt).toLocaleDateString()} · {s.result.filters.length}{" "}
+                        filters
+                        {s.withoutResult ? " · with + without context" : ""}
+                      </div>
+                    </div>
+                    <div className="ml-auto flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => openSaved(s)}
+                        className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-accent"
+                      >
+                        Open
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadMarkdown(s)}
+                        className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                      >
+                        Download .md
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadExcel(s)}
+                        className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                      >
+                        Download .xlsx
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           <h2 className="font-display mb-1 text-sm font-semibold">Saved results</h2>
           <p
             className={`mb-2 text-[11px] ${sharedError === "" ? "text-success" : sharedError ? "text-warning" : "text-muted-foreground"}`}
@@ -751,8 +885,8 @@ function Index() {
           </p>
           {saved.length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              Nothing saved yet. Generate filters, then use “Save results + download .md” (or “Save
-              everything” when a context was given).
+              Nothing saved yet. Generate filters, then use “Save results”. Saved results are kept
+              in this browser, newest first.
             </p>
           ) : (
             <ul className="divide-y divide-border">
@@ -787,6 +921,13 @@ function Index() {
                       className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
                     >
                       Download .xlsx
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadJson(s)}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                    >
+                      Download .json
                     </button>
                     <button
                       type="button"
@@ -1143,9 +1284,9 @@ function Index() {
           onChange={(e) => setUiDesign(e.target.checked)}
         />
         <span>
-          <strong className="text-foreground">Include UI design</strong> — UI pattern, filter
-          options and interaction rules for each filter. Untick to get only the filter list, tiers,
-          confidence and rationale (shorter answer, cheaper run).
+          <strong className="text-foreground">Include UI design</strong> — a UI pattern for each
+          filter and the interaction rules. Untick for a shorter, cheaper answer. The ISQ values
+          (with their confidence) are always included.
         </span>
       </label>
 
@@ -1365,7 +1506,7 @@ function Index() {
               onClick={saveResult}
               className=" rounded-lg border border-border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-secondary"
             >
-              Save everything + download .md
+              Save results
             </button>
           </div>
           {variant === "similar" ? <Similarity cmp={baseRun.comparison} /> : null}
@@ -1490,7 +1631,7 @@ function Index() {
                 onClick={saveResult}
                 className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
               >
-                Save results + download .md
+                Save results
               </button>
             </div>
           </div>

@@ -8,7 +8,8 @@
  *   VITE_FIREBASE_DATABASE_ID optional: the Firestore database id when it isn't "(default)"
  *
  * Firestore documents are limited to 1 MiB, so each entry is stored as one gzip+base64 string. If an
- * entry is still too large the inputs (keyword files etc.) are dropped and only the results are kept.
+ * entry is still too large the keyword and listing files are dropped (the context and ISQ ranking are
+ * kept); only if that is not enough are all inputs dropped and just the results kept.
  */
 const API_KEY: string = import.meta.env["VITE_FIREBASE_API_KEY"] ?? "";
 const PROJECT: string = import.meta.env["VITE_FIREBASE_PROJECT_ID"] ?? "";
@@ -107,9 +108,31 @@ export async function listShared<T extends Saveable>(): Promise<T[]> {
   return out;
 }
 
-export async function addShared(entry: Saveable): Promise<void> {
+/** The big inputs: keyword and listing exports. The small text inputs (context, ISQ ranking) stay. */
+const ROW_INPUTS = ["serp", "internal", "products"];
+
+/** A copy of the entry without the keyword/listing rows, keeping the context and the ISQ ranking. */
+export function withoutRows<T extends Saveable>(entry: T): T {
+  if (!entry.inputs || typeof entry.inputs !== "object") return entry;
+  const inputs = { ...(entry.inputs as Record<string, unknown>) };
+  for (const key of ROW_INPUTS) if (key in inputs) inputs[key] = "";
+  return { ...entry, inputs };
+}
+
+/** What was stored: everything, everything but the keyword/listing rows, or only the results. */
+export type Stored = "full" | "no-rows" | "results-only";
+
+export async function addShared(entry: Saveable): Promise<Stored> {
+  let stored: Stored = "full";
   let payload = await pack(entry);
-  if (payload.length > MAX_PAYLOAD_CHARS) payload = await pack({ ...entry, inputs: undefined });
+  if (payload.length > MAX_PAYLOAD_CHARS) {
+    stored = "no-rows";
+    payload = await pack(withoutRows(entry));
+  }
+  if (payload.length > MAX_PAYLOAD_CHARS) {
+    stored = "results-only";
+    payload = await pack({ ...entry, inputs: undefined });
+  }
   if (payload.length > MAX_PAYLOAD_CHARS)
     throw new Error("this result is too large for shared storage even without its inputs");
   const resp = await fetch(
@@ -129,6 +152,7 @@ export async function addShared(entry: Saveable): Promise<void> {
     },
   );
   await check(resp, "save");
+  return stored;
 }
 
 export async function removeShared(id: string): Promise<void> {

@@ -43,7 +43,8 @@ import {
   buildFieldMapUser,
   buildTermLabelUser,
 } from "./prompts";
-import { compareContext, parseReferenceIsq, type ContextComparison } from "./compare";
+import type { ContextComparison } from "./compare";
+import { valueConfidence, type ValueConfidence } from "./value-confidence";
 import type { StageId } from "@/skills";
 
 export * from "./llm";
@@ -69,6 +70,11 @@ export interface FilterRow {
    *  raw string) — lets the UI show the exact dimension/spec rows this filter's numbers came from. */
   linked_dimension?: string | null;
   linked_listing_spec?: string | null;
+  /**
+   * High / Medium / Low per option, from the share of keyword demand or listings it holds (set in the
+   * check step, so a saved result keeps it). Absent when the filter has no linked evidence.
+   */
+  value_confidence?: ValueConfidence[];
 }
 
 export interface FilterResult {
@@ -93,7 +99,7 @@ export interface PipelineInputs {
 
 export type { StageId };
 
-export type StepId = "prepare" | "label" | "fields" | "design" | "check" | "compare";
+export type StepId = "prepare" | "label" | "fields" | "design" | "check";
 export type StepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
 export interface StepStat {
@@ -106,24 +112,83 @@ export interface StepSplit {
   unit: string;
   code: number;
   model: number;
-  /** Not labelled by either (the model left it out, or it fell below the model's term cap). */
+  /** Not labelled by either: in scope, but the model left it out. */
   none: number;
+  /** Lower-demand terms beyond the scope, not part of the bar (not sent to the model). */
+  outside: number;
 }
 
-/** Labelling work by owner, counted per term and per unit of search demand. */
+/** How many of the highest-demand terms the labelling step works on (matches the model's term cap). */
+const LABEL_SCOPE = 150;
+
+/**
+ * Labelling work by owner over the top LABEL_SCOPE terms by demand (the ones the step actually works
+ * on), counted per term and per unit of search demand. Lower-demand terms beyond that are not part
+ * of the split; they're reported separately as `outside`.
+ */
 function labelSplit(mining: TermMining | null, modelLabels: TermLabel[]): StepSplit[] {
   if (!mining) return [];
   const byModel = new Set(modelLabels.map((l) => l.term));
-  const terms: StepSplit = { title: "Terms", unit: "terms", code: 0, model: 0, none: 0 };
-  const demand: StepSplit = { title: "Search demand", unit: "demand", code: 0, model: 0, none: 0 };
-  for (const t of mining.terms) {
-    if (t.auto === "skip") continue;
-    const d = Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0);
+  const terms: StepSplit = {
+    title: `Terms (top ${LABEL_SCOPE} by demand)`,
+    unit: "terms",
+    code: 0,
+    model: 0,
+    none: 0,
+    outside: 0,
+  };
+  const demand: StepSplit = {
+    title: `Search demand (top ${LABEL_SCOPE} terms)`,
+    unit: "demand",
+    code: 0,
+    model: 0,
+    none: 0,
+    outside: 0,
+  };
+  const demandOf = (t: TermStat) =>
+    Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0);
+  // mining.terms is already ranked by demand share, highest first.
+  const eligible = mining.terms.filter((t) => t.auto !== "skip");
+  eligible.forEach((t, i) => {
+    if (i >= LABEL_SCOPE) {
+      terms.outside++;
+      demand.outside += demandOf(t);
+      return;
+    }
     const who = t.auto ? "code" : byModel.has(t.term) ? "model" : "none";
     terms[who]++;
-    demand[who] += d;
-  }
+    demand[who] += demandOf(t);
+  });
   return [terms, demand];
+}
+
+/**
+ * The terms nobody labelled, highest search demand first, with why: never sent to the model (past its
+ * term cap), or sent but the model gave no label. Shown in the label step's "See the working".
+ */
+function unlabelledReport(
+  mining: TermMining | null,
+  sent: TermStat[],
+  modelLabels: TermLabel[],
+): string {
+  if (!mining) return "";
+  const sentSet = new Set(sent.map((t) => t.term));
+  const labelled = new Set(modelLabels.map((l) => l.term));
+  const rows = mining.terms
+    .filter((t) => !t.auto && !labelled.has(t.term))
+    .map((t) => ({
+      term: t.term,
+      demand: Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0),
+      why: sentSet.has(t.term) ? "sent, model gave no label" : "not sent (over the term cap)",
+    }))
+    .sort((a, b) => b.demand - a.demand);
+  if (!rows.length) return "";
+  const notSent = rows.filter((r) => r.why.startsWith("not sent")).length;
+  return [
+    `Left unlabelled (${rows.length}): ${notSent} not sent to the model, ${rows.length - notSent} sent but not labelled`,
+    "term | search demand | why",
+    ...rows.map((r) => `${r.term} | ${r.demand.toLocaleString()} | ${r.why}`),
+  ].join("\n");
 }
 
 export interface Step {
@@ -173,9 +238,9 @@ export interface PipelineRun {
   usage: Usage;
   calls: number;
   prompts: PromptRecord[];
-  /** The same run made without the category context (only when a context was given). */
+  /** Only on results saved before the without-context run was dropped: the same run without the context. */
   withoutContext?: PipelineRun;
-  /** How alike the with- and without-context filters are, and how each matches your ISQs. */
+  /** Only on those older results: how alike the with- and without-context filters are. */
   comparison?: ContextComparison;
 }
 
@@ -213,13 +278,6 @@ export const INITIAL_STEPS: Step[] = [
     label: "Check & fix the output",
     description:
       "Code fills in coverage, share and fill rates from the evidence links, then enforces the tier rules and cleans options. No repair call.",
-    status: "pending",
-  },
-  {
-    id: "compare",
-    label: "Compare with vs without context",
-    description:
-      "Repeats the filter design with the category context removed, then compares the two sets of filters (ISQs) and checks each against the ISQs you gave. Skipped when no context was given.",
     status: "pending",
   },
 ];
@@ -615,10 +673,11 @@ export function attachEvidence(
     // "values"/"ui_pattern" are no longer asked of the model (fewer output tokens, faster runs):
     // code derives them from the same evidence the model linked to. A model that still sends its
     // own non-empty values is respected as an override (e.g. a merged/renamed option list).
-    if (uiDesign && f.values.length === 0) {
+    // The values are always filled in; only the UI pattern belongs to "Include UI design".
+    if (f.values.length === 0) {
       const derived = deriveOptions(f, dim, spec, listing?.price ?? null, isPrice, isPlace);
       f.values = derived.values;
-      f.ui_pattern = derived.ui_pattern;
+      if (uiDesign) f.ui_pattern = derived.ui_pattern;
     }
 
     const sources: string[] = [];
@@ -683,18 +742,9 @@ export function fixResult(
     return true;
   });
 
+  // The options (ISQ values) are checked whether or not "Include UI design" is on; only the UI
+  // pattern and interaction rules are tied to it.
   for (const f of r.filters) {
-    if (!uiDesign) {
-      // Filters + tiers only: no options or UI patterns to check.
-      f.values = [];
-      f.ui_pattern = f.tier === "Tier 3" ? "display only" : "";
-      if (
-        !/\d/.test(f.rationale) &&
-        !/context|interview|ranking|ranked|\bCM\b|listing/i.test(f.rationale)
-      )
-        warnings.push(`The rationale for "${f.name}" cites no evidence.`);
-      continue;
-    }
     const junk = f.values.filter((v) => v.length < 2 || /^\d+(\.\d+)?$/.test(v));
     if (junk.length) {
       f.values = f.values.filter((v) => !junk.includes(v));
@@ -714,7 +764,8 @@ export function fixResult(
       f.ui_pattern = "display only";
       fixes.push(`"${f.name}" had fewer than 2 options, so it moved to Tier 3 (display only).`);
     }
-    if (f.tier === "Tier 3" && !/display/i.test(f.ui_pattern)) f.ui_pattern = "display only";
+    if (!uiDesign) f.ui_pattern = f.tier === "Tier 3" ? "display only" : "";
+    else if (f.tier === "Tier 3" && !/display/i.test(f.ui_pattern)) f.ui_pattern = "display only";
     if (
       !/\d/.test(f.rationale) &&
       !/context|interview|ranking|ranked|\bCM\b|listing/i.test(f.rationale)
@@ -784,8 +835,7 @@ export async function runPipeline(
   hooks: RunHooks,
 ): Promise<PipelineRun> {
   const { onStep, signal } = hooks;
-  // "compare" re-runs only the comparison; this run just reuses its cached answers, as for "check".
-  const from = hooks.from === "compare" ? "check" : hooks.from;
+  const from = hooks.from;
   // Re-running from a step asks the model afresh for that step (from "prepare": for every step).
   // Labelling and spec merging don't depend on each other; the design step is always asked afresh
   // unless the re-run starts at the check step.
@@ -974,7 +1024,12 @@ export async function runPipeline(
             : []),
         ],
         split: labelSplit(prep.mining, labels),
-        output: JSON.stringify(data, null, 2),
+        output: [
+          JSON.stringify(data, null, 2),
+          unlabelledReport(prep.mining, prep.modelTerms, labels),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
       });
       return {
         labels: [...auto, ...labels],
@@ -988,7 +1043,9 @@ export async function runPipeline(
       step("label", "error", {
         detail: "used code labels only",
         split: labelSplit(prep.mining, []),
-        output: (err as Error).message,
+        output: [(err as Error).message, unlabelledReport(prep.mining, prep.modelTerms, [])]
+          .filter(Boolean)
+          .join("\n\n"),
       });
       return { labels: auto, category: null };
     }
@@ -1156,6 +1213,12 @@ export async function runPipeline(
   );
   const { fixes, warnings: left } = fixResult(result, inputs.uiDesign !== false);
   if (inputs.uiDesign === false) result.interaction_rules = [];
+  // After the fixes, so the confidence matches the options that are actually shown. Stored on the
+  // filter, so a saved result keeps it without the evidence.
+  for (const f of result.filters) {
+    const vc = valueConfidence(f, evidence);
+    if (vc?.length) f.value_confidence = vc;
+  }
   warnings.push(...fixes.map((f) => `Auto-fixed: ${f}`), ...linkNotes, ...left);
   step("check", "done", {
     calls: 0,
@@ -1228,94 +1291,4 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;
   return { calls: prompts.length, inputTokens, outputTokens };
-}
-
-// ───────────────────────────── with vs without context ─────────────────────────────
-
-/**
- * The normal run (with the category context), then the same run without it and a comparison of the
- * two. The second run reuses cached answers where its prompts match, so only the design step (and
- * the labelling prompt, which also quotes the context) cost new model calls.
- */
-export async function runAll(
-  settings: LlmSettings,
-  inputs: PipelineInputs,
-  hooks: RunHooks,
-): Promise<PipelineRun> {
-  const main = await runPipeline(settings, inputs, hooks);
-  const { onStep, signal } = hooks;
-  const t0 = performance.now();
-  const done = (patch: Partial<Step>) =>
-    onStep("compare", { ...patch, ms: Math.round(performance.now() - t0) });
-
-  if (!inputs.context.trim()) {
-    onStep("compare", {
-      status: "skipped",
-      calls: 0,
-      detail: "no category context given — paste one to compare with vs without",
-    });
-    return main;
-  }
-  onStep("compare", { status: "running" });
-  try {
-    // A re-run from the compare step asks the design model afresh, like any re-run from a step.
-    const from: StepId | undefined = hooks.from === "compare" ? "design" : hooks.from;
-    const without = await runPipeline(
-      settings,
-      { ...inputs, context: "" },
-      { onStep: () => {}, ...(signal ? { signal } : {}), ...(from ? { from } : {}) },
-    );
-    const given = parseReferenceIsq(inputs.specs);
-    const fromListing =
-      main.evidence.listing?.fields.slice(0, 15).map((f) => f.key.replace(/^isq\./, "")) ?? [];
-    const comparison = compareContext(
-      without.result,
-      main.result,
-      given.length ? given : fromListing,
-    );
-    const ref = comparison.refWith && comparison.refWithout;
-    done({
-      status: "done",
-      calls: without.calls,
-      usage: without.usage,
-      detail: `${comparison.overlapPct}% of filters are the same with and without context`,
-      stats: [
-        { label: "filters with context", value: main.result.filters.length },
-        { label: "filters without context", value: without.result.filters.length },
-        { label: "in both", value: comparison.shared.length },
-        { label: "overlap", value: `${comparison.overlapPct}%` },
-        { label: "found without context", value: `${comparison.recallPct}%` },
-        {
-          label: "same tier",
-          value: comparison.shared.length ? `${comparison.sameTierPct}%` : "–",
-        },
-        ...(ref
-          ? [
-              {
-                label: "of your ISQs found (with)",
-                value: `${comparison.refWith!.covered.length}/${comparison.refWith!.reference}`,
-              },
-              {
-                label: "of your ISQs found (without)",
-                value: `${comparison.refWithout!.covered.length}/${comparison.refWithout!.reference}`,
-              },
-            ]
-          : []),
-      ],
-      input: `Category context: ${inputs.context.length.toLocaleString()} characters (removed for the second run). Everything else identical.`,
-      output: [
-        `Only with context: ${comparison.onlyWith.join(", ") || "none"}`,
-        `Only without context: ${comparison.onlyWithout.join(", ") || "none"}`,
-        ...comparison.shared.map(
-          (x) => `  ${x.without} (${x.tierWithout}) ~ ${x.withCtx} (${x.tierWith})`,
-        ),
-      ].join("\n"),
-    });
-    return { ...main, withoutContext: without, comparison };
-  } catch (err) {
-    if ((err as Error).name === "AbortError") throw err;
-    main.warnings.push(`Could not compare with vs without context: ${(err as Error).message}`);
-    done({ status: "error", detail: "comparison failed", output: (err as Error).message });
-    return main;
-  }
 }

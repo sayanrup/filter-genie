@@ -1,6 +1,7 @@
 import * as XLSX from "xlsx";
 import type { ContextComparison } from "./compare";
 import type { FilterResult } from "./filter-gen";
+import { valuesWithConfidence } from "./value-confidence";
 
 const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
 
@@ -13,7 +14,7 @@ function filterRows(result: FilterResult) {
       Tier: f.tier,
       Filter: f.name,
       "UI pattern": f.ui_pattern,
-      Values: (f.values ?? []).join(", "),
+      Values: valuesWithConfidence(f).join(", "),
       Confidence: f.confidence,
       Why: f.rationale,
       "Coverage %": f.coverage_pct ?? "",

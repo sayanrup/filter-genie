@@ -87,6 +87,12 @@ function WorkSplit({ split }: { split: NonNullable<Step["split"]> }) {
                 </span>
               ) : null}
             </div>
+            {row.outside ? (
+              <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                + {row.outside.toLocaleString()} lower-demand {row.unit} not included (not sent to
+                the model)
+              </div>
+            ) : null}
           </div>
         );
       })}

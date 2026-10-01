@@ -1,10 +1,40 @@
 import { useState } from "react";
 import { FilterDetailRow } from "@/components/FilterDetail";
 import { resultHasDesign } from "@/lib/compare";
+import { VALUE_CONFIDENCE_RULE, confidenceOf } from "@/lib/value-confidence";
 import type { Evidence, FilterResult } from "@/lib/filter-gen";
+
+const LEVEL_CLS = {
+  High: "bg-success-soft text-success",
+  Medium: "bg-warning-soft text-warning",
+  Low: "bg-danger-soft text-destructive",
+} as const;
 
 const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
 
+/** Left-edge accent of a value chip, by its confidence. */
+const CHIP_ACCENT = {
+  High: "border-l-success",
+  Medium: "border-l-warning",
+  Low: "border-l-destructive",
+} as const;
+const LEVEL_RANK = { High: 0, Medium: 1, Low: 2 } as const;
+const isOther = (v: string) => /^other/i.test(v.trim());
+
+/**
+ * A filter's values for display, most confident first (High, Medium, Low), "Other" last, and the
+ * options without a confidence after the measured ones. Ties keep the order they came in (demand).
+ */
+function orderedValues(
+  values: string[],
+  level: (v: string) => keyof typeof LEVEL_RANK | undefined,
+) {
+  const rank = (v: string) => (isOther(v) ? 4 : level(v) !== undefined ? LEVEL_RANK[level(v)!] : 3);
+  return values
+    .map((v, i) => ({ v, i }))
+    .sort((a, b) => rank(a.v) - rank(b.v) || a.i - b.i)
+    .map((x) => x.v);
+}
 /** The ranked filter table (click a row for its full reasoning), plus interaction rules and blockers. */
 export function FilterTable({
   result,
@@ -25,7 +55,8 @@ export function FilterTable({
               "#",
               "Tier",
               "Filter",
-              ...(hasDesign ? ["UI pattern", "Values"] : []),
+              ...(hasDesign ? ["UI pattern"] : []),
+              "Values",
               "Confidence",
               "Why",
             ].map((h) => (
@@ -46,6 +77,8 @@ export function FilterTable({
             .flatMap((f, i) => {
               const key = `${f.name}-${i}`;
               const open = expandedFilter === key;
+              const vc = confidenceOf(f, evidence);
+              const levelOf = new Map((vc ?? []).map((v) => [v.value, v]));
               const row = (
                 <tr
                   key={key}
@@ -86,28 +119,39 @@ export function FilterTable({
                       </div>
                     ) : null}
                   </td>
-                  {hasDesign ? (
-                    <>
-                      <td className="px-3 py-3 text-xs">{f.ui_pattern}</td>
-                      <td className="px-3 py-3">
-                        <div className="flex flex-wrap gap-1">
-                          {f.values.slice(0, 15).map((v, vi) => (
+                  {hasDesign ? <td className="px-3 py-3 text-xs">{f.ui_pattern}</td> : null}
+                  <td className="min-w-56 max-w-80 px-3 py-3">
+                    <div className="flex flex-wrap gap-1.5">
+                      {orderedValues(f.values, (v) => levelOf.get(v)?.level)
+                        .slice(0, 15)
+                        .map((v, vi) => {
+                          const c = levelOf.get(v);
+                          return (
                             <span
                               key={`${v}-${vi}`}
-                              className="rounded border border-border bg-secondary px-1.5 py-px text-[11px]"
+                              title={c?.why}
+                              className={`inline-flex items-stretch overflow-hidden rounded-md border border-border bg-card text-[11px] leading-none shadow-sm ${
+                                c ? `border-l-[3px] ${CHIP_ACCENT[c.level]}` : ""
+                              }`}
                             >
-                              {v}
+                              <span className="px-2 py-1.5 font-medium">{v}</span>
+                              {c ? (
+                                <span
+                                  className={`flex items-center border-l border-border px-1.5 text-[9px] font-bold uppercase tracking-wider ${LEVEL_CLS[c.level]}`}
+                                >
+                                  {c.level}
+                                </span>
+                              ) : null}
                             </span>
-                          ))}
-                          {f.values.length > 15 ? (
-                            <span className="rounded border border-border px-1.5 py-px text-[11px] text-muted-foreground">
-                              +{f.values.length - 15}
-                            </span>
-                          ) : null}
-                        </div>
-                      </td>
-                    </>
-                  ) : null}
+                          );
+                        })}
+                      {f.values.length > 15 ? (
+                        <span className="rounded-md border border-dashed border-border px-2 py-1.5 text-[11px] leading-none text-muted-foreground">
+                          +{f.values.length - 15} more
+                        </span>
+                      ) : null}
+                    </div>
+                  </td>
                   <td className="px-3 py-3">
                     <span
                       className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
@@ -152,13 +196,18 @@ export function FilterTable({
                       key={`${key}-detail`}
                       filter={f}
                       evidence={evidence}
-                      colSpan={hasDesign ? 7 : 5}
+                      colSpan={hasDesign ? 7 : 6}
                     />,
                   ]
                 : [row];
             })}
         </tbody>
       </table>
+      {result.filters.some((f) => confidenceOf(f, evidence)?.length) ? (
+        <p className="border-t border-border px-4 py-2 text-[11px] text-muted-foreground">
+          {VALUE_CONFIDENCE_RULE}
+        </p>
+      ) : null}
 
       {result.interaction_rules?.length || result.blockers?.length ? (
         <div className="grid gap-4 border-t border-border p-4 sm:grid-cols-2">

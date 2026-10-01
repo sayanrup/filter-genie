@@ -9,7 +9,25 @@ and why (skill 08) — it just no longer authors their option lists.
 
 - **Layer:** code (deterministic) — no prompt section; left out of the master prompt entirely
 - **Used by:** the check step, after the master prompt answers
-- **Code:** `src/lib/filter-gen.ts` → `deriveOptions()`, called from `attachEvidence()`
+- **Code:** `src/lib/filter-gen.ts` → `deriveOptions()`, called from `attachEvidence()`; confidence per
+  value in `src/lib/value-confidence.ts`
+
+## Values are always produced
+
+The options (ISQ values) of every filter are built and shown whether or not "Include UI design" is
+ticked. That toggle only controls the **UI pattern** and the **interaction rules**: unticked, `ui_pattern`
+is `""` (`"display only"` for Tier 3), `interaction_rules` is `[]`, and the table drops the UI pattern
+column and the page preview. The values, their checks (junk, duplicates, 12 max, fewer than 2 → Tier 3)
+and their confidence are unchanged.
+
+## Confidence per value
+
+Each value carries High / Medium / Low, shown on the value itself in the Values column and exported as
+`House (High)`. It is computed in code (`valueConfidence()`) from the largest share of the linked
+dimension's keyword demand or of the linked listing spec's filled listings that the value holds:
+High ≥ 20%, Medium ≥ 5%, Low below that or not seen in the data. "Other" gets none. It is stored on the
+filter as `value_confidence`, so a saved result keeps it without its evidence. The filter-level
+`confidence` (the model's judgement of the whole filter) is separate and stays in its own column.
 
 ## What the code does
 

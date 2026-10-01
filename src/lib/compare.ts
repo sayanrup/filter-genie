@@ -147,13 +147,12 @@ export function parseReferenceIsq(specs: string): string[] {
   return out;
 }
 
-/** Runs made with "Include UI design" off have no options or UI patterns to show. */
+/**
+ * Whether the result carries UI patterns. Runs made with "Include UI design" off don't; their
+ * options (ISQ values) are still there and still shown.
+ */
 export function resultHasDesign(result: FilterResult | null | undefined) {
-  return Boolean(
-    result?.filters.some(
-      (f) => f.values.length > 0 || (f.ui_pattern && f.ui_pattern !== "display only"),
-    ),
-  );
+  return Boolean(result?.filters.some((f) => f.ui_pattern && f.ui_pattern !== "display only"));
 }
 
 const cell = (v: string) => v.replace(/\|/g, "\\|");

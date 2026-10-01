@@ -13,7 +13,8 @@ All in code — **no second model call** (a repair turn would resend the whole p
 
 | Check | Automatic fix |
 |-------|---------------|
-| Options and UI pattern | built from the linked evidence (top keyword values, listing values, price quartiles) — see skill 09; the model doesn't send these unless it chooses to override |
+| Options and UI pattern | built from the linked evidence (top keyword values, listing values, price quartiles) — see skill 09; the model doesn't send these unless it chooses to override. Options are always built; the UI pattern only with "Include UI design" |
+| Confidence per option | High / Medium / Low from the option's share of demand or listings, stored as `value_confidence` after the fixes above, so it matches the options shown |
 | Tier 1 has more than 5 filters | lowest-ranked extras move to Tier 2 |
 | Tier 1 has fewer than 3 (and ≥ 3 filterable exist) | best Tier 2 filters (by confidence, then rank) are promoted |
 | A Tier 1/2 filter has fewer than 2 options | moved to Tier 3 (display only) |
