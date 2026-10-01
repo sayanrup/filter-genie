@@ -9,6 +9,8 @@ to those goes to a fuller rationale and sharper interaction rules instead. The m
 is judgement only: does it exist, at what tier, why — argued well enough that a reviewer trusts it.
 
 - **Layer:** prompt only (the UI in `src/routes/index.tsx` renders these fields)
+- **Code adds after the model answers:** `values`, `ui_pattern` (only with "Include UI design"), and
+  `value_confidence` — a High / Medium / Low per value (skill 09). None of these are in the model's JSON.
 - **Used by:** master prompt (last section)
 
 ## Prompt

@@ -63,9 +63,17 @@ needs ISQ push") instead of demoting them.
 **Include UI design.** Ticked by default. Filter options and UI pattern are always built by code from
 the same evidence the model already links to (top keyword values, common listing values, price
 quartiles) — the model never retypes an option list, so it spends its output budget on judgement and a
-thorough rationale instead, regardless of this toggle. Untick it to also drop interaction rules and get
-just the filter list — tiers, order, confidence and rationale; the table hides the UI columns and the
-page preview.
+thorough rationale instead, regardless of this toggle. The **values (ISQ options) are always produced and
+shown, each with a High / Medium / Low confidence** (the share of keyword demand or listings it holds, see
+skill 09). Untick the toggle to drop only the UI pattern and the interaction rules; the table then hides the
+UI pattern column and the page preview.
+
+**One run, with context.** Generate runs once, with the category context. The earlier second run without the
+context (and its comparison) was removed; results saved before that still open and show it.
+
+**Saving.** "Save results" stores the run (this browser, plus the website when shared storage is set up) and
+downloads `.md`, `.xlsx` and `.json`. To file a download in a folder on your machine, rebuilt from the full
+data: `npx tsx scripts/save-local.ts <file.json|file.xlsx>` → `saved-results/<category>-<date>/`.
 
 ## Cost
 

@@ -1,5 +1,6 @@
 import { comparisonMarkdown, type ContextComparison } from "./compare";
 import type { FilterResult } from "./filter-gen";
+import { VALUE_CONFIDENCE_RULE, valuesWithConfidence } from "./value-confidence";
 
 /** Inputs as stored with a saved run: keyword/listing rows are JSON strings, docs are plain text. */
 export interface InputBundle {
@@ -14,9 +15,16 @@ function mdCell(value: string) {
   return value.replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
 }
 
+const FENCE_MAX = 20000;
+
 function fence(label: string, body: string, lang = "text") {
   if (!body.trim()) return "";
-  return `### ${label}\n\n\`\`\`${lang}\n${body.slice(0, 20000)}\n\`\`\`\n\n`;
+  // Say so when an input is cut, instead of leaving what looks like a complete (but broken) block.
+  const cut =
+    body.length > FENCE_MAX
+      ? `\n[… cut here: ${(body.length - FENCE_MAX).toLocaleString()} more characters not included in this file]`
+      : "";
+  return `### ${label}\n\n\`\`\`${lang}\n${body.slice(0, FENCE_MAX)}${cut}\n\`\`\`\n\n`;
 }
 
 export function buildMarkdown(opts: {
@@ -47,8 +55,10 @@ export function buildMarkdown(opts: {
   md += `\n## Recommended filters\n\n`;
   md += `| # | Tier | Filter | UI pattern | Values | Confidence | Why |\n|---|---|---|---|---|---|---|\n`;
   filters.forEach((f, i) => {
-    md += `| ${i + 1} | ${f.tier} | ${mdCell(f.name)}${f.needs_new_isq ? " ⚠️" : ""} | ${mdCell(f.ui_pattern)} | ${mdCell((f.values ?? []).join(", "))} | ${f.confidence} | ${mdCell(f.rationale)} |\n`;
+    md += `| ${i + 1} | ${f.tier} | ${mdCell(f.name)}${f.needs_new_isq ? " ⚠️" : ""} | ${mdCell(f.ui_pattern)} | ${mdCell(valuesWithConfidence(f).join(", "))} | ${f.confidence} | ${mdCell(f.rationale)} |\n`;
   });
+
+  if (filters.some((f) => f.value_confidence?.length)) md += `\n_${VALUE_CONFIDENCE_RULE}_\n`;
 
   const isq = filters.filter((f) => f.needs_new_isq);
   if (isq.length) {
