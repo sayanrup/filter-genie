@@ -8,6 +8,7 @@ import {
   heuristicFieldMap,
   mineTerms,
   profileListings,
+  SOURCE_LABEL,
   specSummary,
   termsForModel,
   toKeywordTable,
@@ -33,9 +34,10 @@ import {
 } from "./llm";
 import {
   FIELD_MAP_SYSTEM,
-  FILTER_DESIGN_SYSTEM,
-  FILTER_DESIGN_SYSTEM_NO_UI,
+  LABEL_RETRY_NOTE,
   TERM_LABEL_SYSTEM,
+  TERM_LABEL_SYSTEM_MCAT,
+  designSystemFor,
   BUDGETS,
   buildDesignUser,
   formatLakh,
@@ -44,8 +46,17 @@ import {
   buildTermLabelUser,
 } from "./prompts";
 import type { ContextComparison } from "./compare";
+import {
+  MIN_MCAT_KEYWORDS,
+  describeKeywordSelection,
+  selectMcatKeywords,
+  splitByMcat,
+  type McatScope,
+} from "./mcats";
 import { valueConfidence, type ValueConfidence } from "./value-confidence";
-import type { StageId } from "@/skills";
+import { MCAT_SKILLS, type SkillId, type StageId } from "@/skills";
+
+export type { McatScope };
 
 export * from "./llm";
 
@@ -79,6 +90,12 @@ export interface FilterRow {
 
 export interface FilterResult {
   category_name?: string;
+  /** Multi-MCAT runs: the MCAT's id and primary PMCAT from the product file. */
+  mcat_id?: string;
+  /** Multi-MCAT runs: the subcategory the MCAT belongs to, when the product file names it. */
+  subcat_id?: string;
+  subcat_name?: string;
+  pmcat?: { id?: string; name: string };
   total_keywords_analyzed?: number;
   filters: FilterRow[];
   interaction_rules?: string[];
@@ -95,6 +112,13 @@ export interface PipelineInputs {
   demoListings?: boolean;
   /** Ask for UI patterns, option values and interaction rules (default on). Off = filters + tiers only. */
   uiDesign?: boolean;
+  /**
+   * When the listings hold several MCATs (a group each), run them one by one (default on). Off = the
+   * groups are read together as one category.
+   */
+  separateMcats?: boolean;
+  /** Set on the inputs of one MCAT's run (by splitByMcat): which MCAT it is and what its evidence is. */
+  mcat?: McatScope;
 }
 
 export type { StageId };
@@ -219,6 +243,8 @@ export interface PromptRecord {
   title: string;
   /** Skill-doc stage whose composed system prompt this call uses. */
   stage?: StageId;
+  /** Extra skills in that prompt (the MCAT-scope skills, in multi-MCAT runs). */
+  include?: SkillId[];
   messages: ChatMessage[];
 }
 
@@ -301,13 +327,19 @@ export interface Prepared {
   /** The category's own dimension names (ranking + listing specs) for keyword labelling. */
   dims: DimensionCandidates;
   context: string;
+  /** Set when this run covers one MCAT of a subcategory (the keyword files are common to all MCATs). */
+  mcat: McatScope | null;
 }
 
 export function prepare(inputs: PipelineInputs): Prepared {
-  const tables = [
+  const allTables = [
     toKeywordTable(inputs.internalRows, "internal"),
     toKeywordTable(inputs.serpRows, "serp"),
   ].filter((t): t is KeywordTable => t !== null && t.rows.length > 0);
+  // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, picked
+  // here in code, so the terms, labels, coverage and shares below are all that MCAT's own.
+  const picked = inputs.mcat ? selectMcatKeywords(allTables, inputs.mcat) : null;
+  const tables = picked ? picked.tables : allTables;
   const mining = tables.length ? mineTerms(tables) : null;
   const flatListings = inputs.listingRows.slice(0, 500).map((r) => flattenListing(r));
   const fieldMap = heuristicFieldMap(flatListings);
@@ -323,18 +355,33 @@ export function prepare(inputs: PipelineInputs): Prepared {
       flatListings.length ? profileListings(flatListings, fieldMap) : null,
     ),
     context: inputs.context,
+    mcat: inputs.mcat && picked ? { ...inputs.mcat, keywordSelection: picked.selection } : null,
   };
 }
 
 /** The field-mapping call only helps when there are at least two specs that might be synonyms. */
 const needsFieldCall = (prep: Prepared) => prep.specs.length >= 2;
 
-function labelMessages(prep: Prepared, budget: PromptBudget = BUDGETS.normal): ChatMessage[] {
+/** Fewer terms than this and an empty answer can be a genuine "nothing to label". */
+const EMPTY_LABEL_MIN_TERMS = 10;
+
+function labelMessages(
+  prep: Prepared,
+  budget: PromptBudget = BUDGETS.normal,
+  note = "",
+): ChatMessage[] {
   return [
-    { role: "system", content: TERM_LABEL_SYSTEM },
+    { role: "system", content: prep.mcat ? TERM_LABEL_SYSTEM_MCAT : TERM_LABEL_SYSTEM },
     {
       role: "user",
-      content: buildTermLabelUser(prep.modelTerms, prep.mining!, prep.dims, prep.context, budget),
+      content: buildTermLabelUser(
+        prep.modelTerms,
+        prep.mining!,
+        prep.dims,
+        prep.context,
+        budget,
+        prep.mcat,
+      ).concat(note ? "\n\n" + note : ""),
     },
   ];
 }
@@ -381,12 +428,21 @@ const COMPACT_NOTE = (step: string) =>
 
 /** Prompts as they'd be sent, before any model call (for the "View prompts" panel). */
 export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
+  // Several MCATs in the listings: every MCAT gets its own set of calls, so preview (and cost) all of them.
+  const slices = splitByMcat(inputs);
+  if (slices.length > 1)
+    return slices.flatMap((s) =>
+      previewPrompts(s.inputs).map((p) => ({ ...p, title: `${s.name} · ${p.title}` })),
+    );
+
   const prep = prepare(inputs);
+  const include = prep.mcat ? MCAT_SKILLS : null;
   const out: PromptRecord[] = [];
   if (prep.modelTerms.length) {
     out.push({
       id: "label",
       stage: "label",
+      ...(include?.label ? { include: include.label } : {}),
       title: "1 · Label keyword terms",
       messages: labelMessages(prep),
     });
@@ -403,11 +459,12 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
   out.push({
     id: "design",
     stage: "design",
+    ...(include?.design ? { include: include.design } : {}),
     title: "3 · Master prompt — design the filter panel",
     messages: [
       {
         role: "system",
-        content: inputs.uiDesign === false ? FILTER_DESIGN_SYSTEM_NO_UI : FILTER_DESIGN_SYSTEM,
+        content: designSystemFor(inputs.uiDesign !== false, Boolean(prep.mcat)),
       },
       {
         role: "user",
@@ -424,6 +481,7 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
             : null,
           demoListings: Boolean(inputs.demoListings),
           uiDesign: inputs.uiDesign !== false,
+          mcat: prep.mcat,
         }).concat(
           prep.modelTerms.length
             ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
@@ -449,7 +507,8 @@ function cacheKey(settings: LlmSettings, messages: ChatMessage[]) {
 
 function remember(key: string, value: unknown) {
   stageCache.set(key, value);
-  if (stageCache.size > 24) stageCache.delete(stageCache.keys().next().value as string);
+  // Room for a few MCATs' worth of answers (up to three calls each) at once.
+  if (stageCache.size > 120) stageCache.delete(stageCache.keys().next().value as string);
 }
 
 // ───────────────────────────── parsing model answers ─────────────────────────────
@@ -865,6 +924,18 @@ export async function runPipeline(
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
   const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
+  if (prep.mcat) {
+    warnings.push(...prep.mcat.notes);
+    const sel = prep.mcat.keywordSelection ?? [];
+    for (const k of sel.filter((x) => !x.used && x.total > 0))
+      warnings.push(
+        `Keywords: only ${k.selected} of the ${k.total.toLocaleString()} ${SOURCE_LABEL[k.source]} keywords are about ${prep.mcat.name} (fewer than ${MIN_MCAT_KEYWORDS}), so that file was left out for it.`,
+      );
+    if (sel.length && !prep.tables.length)
+      warnings.push(
+        `No keywords are about ${prep.mcat.name}, so this panel rests on its listings, context and ranking alone; the keyword evidence (A) is absent.`,
+      );
+  }
   {
     const bySource = (src: string) => prep.tables.find((t) => t.source === src)?.rows.length ?? 0;
     const stats: StepStat[] = [];
@@ -888,6 +959,12 @@ export async function runPipeline(
       { label: "context chars", value: inputs.context.length },
     );
     const inputLines = [
+      ...(prep.mcat
+        ? [
+            `MCAT: ${prep.mcat.name} (siblings: ${prep.mcat.siblings.join(", ")}) · ${prep.mcat.listings} listings of its own`,
+            `keywords picked for this MCAT from the common files: ${prep.mcat.keywordSelection?.length ? describeKeywordSelection(prep.mcat.keywordSelection) : "no keyword files"}`,
+          ]
+        : []),
       ...prep.tables.map(
         (t) =>
           `${t.source} keywords: ${t.rows.length} rows · query column "${t.queryColumn ?? "?"}" · demand "${t.demandMetric ?? "none"}" · action "${t.actionMetric ?? "none"}"${t.rateMetrics.length ? ` · rates ${t.rateMetrics.join(", ")}` : ""}`,
@@ -953,6 +1030,7 @@ export async function runPipeline(
     maxTokens: number,
     reasoning: "off" | "low" | "medium",
     reuse: boolean,
+    include: SkillId[] = [],
   ) => {
     let compact = false;
     const out = await withBudget(
@@ -973,7 +1051,13 @@ export async function runPipeline(
         warnings.push(COMPACT_NOTE(STEP_NAME[id]));
       },
     );
-    prompts.push({ id, stage: id, title, messages: out.messages });
+    prompts.push({
+      id,
+      stage: id,
+      ...(include.length ? { include } : {}),
+      title,
+      messages: out.messages,
+    });
     return { ...out, compact };
   };
   const compactTag = (c: boolean) => (c ? " · compact prompt" : "");
@@ -991,27 +1075,56 @@ export async function runPipeline(
     const known = new Set(prep.modelTerms.map((t) => t.term));
     step("label", "running");
     try {
-      const {
-        data,
-        cached,
-        usage: stepUsage,
-        compact,
-      } = await ask(
+      const include = MCAT_SKILLS.label && prep.mcat ? MCAT_SKILLS.label : [];
+      const maxTokens = Math.min(2500, 400 + prep.modelTerms.length * 10);
+      let attempt = await ask(
         "label",
         "1 · Label keyword terms",
         (b) => labelMessages(prep, b),
-        Math.min(2500, 400 + prep.modelTerms.length * 10),
+        maxTokens,
         "off",
         !fresh("label"),
+        include,
       );
-      const labels = parseLabels(data, known);
+      let labels = parseLabels(attempt.data, known);
+      let stepUsage = attempt.usage;
+      let calls = attempt.cached ? 0 : 1;
+      let retried = false;
+      // An empty answer for a list this long is a failure, not a verdict: never keep it for reuse,
+      // and ask once more with a firmer instruction.
+      if (!labels.length && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS) {
+        stageCache.delete(cacheKey(settings, attempt.messages));
+        retried = true;
+        attempt = await ask(
+          "label",
+          "1 · Label keyword terms (second try)",
+          (b) => labelMessages(prep, b, LABEL_RETRY_NOTE),
+          maxTokens,
+          "off",
+          false,
+          include,
+        );
+        stepUsage = addUsage(stepUsage, attempt.usage);
+        calls += 1;
+        labels = parseLabels(attempt.data, known);
+        if (!labels.length) stageCache.delete(cacheKey(settings, attempt.messages));
+      }
+      const { data, compact } = attempt;
+      const cached = attempt.cached && !retried;
+      const none = labels.length === 0 && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS;
+      if (none)
+        warnings.push(
+          `Term labelling: the model labelled none of the ${prep.modelTerms.length} keyword terms${retried ? ", even when asked a second time" : ""}, so only code-labelled terms (price, place, size) were grouped and the keyword evidence is thin. Open "See the working" on that step to read its reply.`,
+        );
+      else if (retried)
+        warnings.push("Term labelling: the first answer labelled nothing; the second try worked.");
       const dims = new Set(labels.map((l) => l.dimension));
       const category = (data as any)?.category_name;
-      step("label", "done", {
-        calls: cached ? 0 : 1,
+      step("label", none ? "error" : "done", {
+        calls,
         cached,
         usage: stepUsage,
-        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${none ? " · the model labelled none, used code labels only" : ""}${retried && !none ? " · second try" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
         stats: [
           { label: "terms sent", value: prep.modelTerms.length },
           { label: "labelled", value: labels.length },
@@ -1140,7 +1253,7 @@ export async function runPipeline(
   // 4 · design
   const uiDesign = inputs.uiDesign !== false;
   const designMessages = (budget: PromptBudget): ChatMessage[] => [
-    { role: "system", content: uiDesign ? FILTER_DESIGN_SYSTEM : FILTER_DESIGN_SYSTEM_NO_UI },
+    { role: "system", content: designSystemFor(uiDesign, Boolean(prep.mcat)) },
     {
       role: "user",
       content: buildDesignUser({
@@ -1154,6 +1267,7 @@ export async function runPipeline(
         demoListings: Boolean(inputs.demoListings),
         uiDesign,
         budget,
+        mcat: prep.mcat,
       }),
     },
   ];
@@ -1174,6 +1288,7 @@ export async function runPipeline(
     uiDesign ? 3200 : 2200,
     "medium",
     from === "check",
+    MCAT_SKILLS.design && prep.mcat ? MCAT_SKILLS.design : [],
   );
   const { result, links } = normalizeResult(designData);
   if (result.filters.length === 0) {
@@ -1256,7 +1371,14 @@ export async function runPipeline(
         .join("\n")}`,
   });
 
-  if (!result.category_name && category) result.category_name = category;
+  // A multi-MCAT run is named after its MCAT, not after whatever the model made of the shared keywords.
+  if (prep.mcat) {
+    result.category_name = prep.mcat.name;
+    if (prep.mcat.id) result.mcat_id = prep.mcat.id;
+    if (prep.mcat.pmcat) result.pmcat = prep.mcat.pmcat;
+    if (prep.mcat.subcat?.id) result.subcat_id = prep.mcat.subcat.id;
+    if (prep.mcat.subcat?.name) result.subcat_name = prep.mcat.subcat.name;
+  } else if (!result.category_name && category) result.category_name = category;
   result.total_keywords_analyzed = kwCount;
   return { result, evidence, warnings, usage, calls, prompts };
 }

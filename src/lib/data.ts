@@ -72,9 +72,87 @@ function findRecordArray(obj: unknown, depth = 0): unknown[] | null {
   return null;
 }
 
+/**
+ * Keeps at most `limit` rows. A file holding several MCATs (rows tagged `_group`) is capped per group,
+ * so a big first group can't push the later ones out of the file.
+ */
+export function capRows(rows: Row[], limit = MAX_ROWS): Row[] {
+  if (!rows.some((r) => typeof r["_group"] === "string")) return rows.slice(0, limit);
+  const kept = new Map<string, number>();
+  return rows.filter((r) => {
+    const g = String(r["_group"] ?? "");
+    const n = kept.get(g) ?? 0;
+    kept.set(g, n + 1);
+    return n < limit;
+  });
+}
+
+/** `{id, name}` as an object or a one-item array of them (a product's own `mcat` is `[{id, name}]`). */
+function idName(v: unknown): { id: string; name: string } | null {
+  const o = Array.isArray(v) ? v[0] : v;
+  if (!o || typeof o !== "object") return null;
+  const rec = o as Record<string, unknown>;
+  const id = rec["id"] == null ? "" : String(rec["id"]).trim();
+  const name = rec["name"] == null ? "" : String(rec["name"]).trim();
+  return id || name ? { id, name } : null;
+}
+
+/** `{prefix}_id` and `{prefix}_name` as two flat fields ("mcat_id": "161287", "mcat_name": "Candy Making Machine"). */
+function flatIdName(rec: Record<string, unknown>, prefix: string) {
+  return idName({ id: rec[`${prefix}_id`], name: rec[`${prefix}_name`] });
+}
+
+const WRAPPER_LIST_KEYS = ["products", "items", "listings", "records", "data", "results", "rows"];
+const WRAPPER_MCAT_KEYS = ["input_mcat", "mcat", "primary_mcat"];
+const WRAPPER_PMCAT_KEYS = ["primary_pmcat", "pmcat", "input_pmcat"];
+
+/**
+ * One wrapper per MCAT: `[{"input_mcat": {"id", "name"}, "primary_pmcat": {...}, "products": [...]}, ...]`.
+ * Every product becomes a row tagged with its MCAT (`_group` = name, `_mcat_id`) and its primary PMCAT
+ * (`_pmcat`, `_pmcat_id`), so the MCATs can be run one by one. Returns null for any other shape.
+ */
+function unwrapMcatList(list: unknown[], root: Record<string, unknown> | null): Row[] | null {
+  if (!list.length) return null;
+  // The subcategory the MCATs belong to, when the file says: {"subcat_id": "729", "subcat_name": "…", "mcat_groups": [...]}.
+  const subcat = root ? flatIdName(root, "subcat") : null;
+  const out: Row[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const w = list[i];
+    if (!w || typeof w !== "object" || Array.isArray(w)) return null;
+    const rec = w as Record<string, unknown>;
+    const listKey = WRAPPER_LIST_KEYS.find(
+      (k) => Array.isArray(rec[k]) && (rec[k] as unknown[]).some((x) => x && typeof x === "object"),
+    );
+    const mcat =
+      WRAPPER_MCAT_KEYS.map((k) => idName(rec[k])).find(Boolean) ?? flatIdName(rec, "mcat");
+    // Only a record that names its MCAT counts as a wrapper; a listing that merely has a `products` field doesn't.
+    if (!listKey || !mcat) return null;
+    const pmcat =
+      WRAPPER_PMCAT_KEYS.map((k) => idName(rec[k])).find(Boolean) ?? flatIdName(rec, "pmcat");
+    const tag: Row = { _group: mcat.name || mcat.id || `Group ${i + 1}` };
+    if (mcat.id) tag["_mcat_id"] = mcat.id;
+    if (pmcat?.name) tag["_pmcat"] = pmcat.name;
+    if (pmcat?.id) tag["_pmcat_id"] = pmcat.id;
+    if (subcat?.id) tag["_subcat_id"] = subcat.id;
+    if (subcat?.name) tag["_subcat"] = subcat.name;
+    for (const p of rec[listKey] as unknown[]) {
+      if (!p || typeof p !== "object" || Array.isArray(p)) continue;
+      const row: Row = { ...tag, ...(p as Row) };
+      delete row["_isq_map"]; // the same ISQ again as a name -> value map; the "name==value" list is the complete one
+      out.push(row);
+    }
+  }
+  return out.length ? out : null;
+}
+
 function jsonToRows(text: string): Row[] {
   const parsed = JSON.parse(text);
-  const items = findRecordArray(parsed) ?? [parsed];
+  const found = findRecordArray(parsed);
+  const root =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  const items = (found ? unwrapMcatList(found, root) : null) ?? found ?? [parsed];
   return items.map((it) => (it && typeof it === "object" ? (it as Row) : { query: String(it) }));
 }
 
@@ -134,7 +212,7 @@ export function textToRows(text: string): Row[] {
   if (!t) return [];
   if (t.startsWith("[") || t.startsWith("{")) {
     try {
-      return jsonToRows(t).slice(0, MAX_ROWS);
+      return capRows(jsonToRows(t));
     } catch {
       /* fall through to delimited parsing */
     }
@@ -169,7 +247,7 @@ export function textToRows(text: string): Row[] {
 
 export async function fileToRows(file: File, limit = MAX_ROWS): Promise<Row[]> {
   const ext = file.name.split(".").pop()?.toLowerCase();
-  if (ext === "json") return jsonToRows(await file.text()).slice(0, limit);
+  if (ext === "json") return capRows(jsonToRows(await file.text()), limit);
   if (ext === "txt" || ext === "tsv" || ext === "md")
     return textToRows(await file.text()).slice(0, limit);
   const buf = await file.arrayBuffer();
@@ -288,7 +366,18 @@ export function normalizeQuery(q: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+// The same rows are turned into a table many times (the page, the preview of every MCAT, every run), and a
+// table is never changed after it is made, so one table per rows array and source is kept.
+const keywordTables = new WeakMap<Row[], Map<KeywordSource, KeywordTable | null>>();
+
 export function toKeywordTable(rows: Row[], source: KeywordSource): KeywordTable | null {
+  let bySource = keywordTables.get(rows);
+  if (!bySource) keywordTables.set(rows, (bySource = new Map()));
+  if (!bySource.has(source)) bySource.set(source, buildKeywordTable(rows, source));
+  return bySource.get(source) ?? null;
+}
+
+function buildKeywordTable(rows: Row[], source: KeywordSource): KeywordTable | null {
   if (rows.length === 0) return null;
   const cols = describeColumns(rows);
   const queryCol =
@@ -827,6 +916,19 @@ export function flattenListing(
     return out;
   }
   if (Array.isArray(obj)) {
+    // ISQ as a list of "name==value" strings (several entries with one name are that spec's options).
+    const pairs = obj.filter((x): x is string => typeof x === "string" && x.includes("=="));
+    if (pairs.length > 0 && pairs.length >= obj.length * 0.6) {
+      for (const pair of pairs) {
+        const at = pair.indexOf("==");
+        const name = pair.slice(0, at).trim();
+        const value = pair.slice(at + 2).trim();
+        if (!name || isEmpty(value)) continue;
+        const key = `${SPEC_PREFIX}${name}`;
+        out[key] = out[key] ? `${out[key]}, ${value}` : value;
+      }
+      return out;
+    }
     if (obj.every((x) => x === null || typeof x !== "object")) {
       const joined = obj.filter((x) => !isEmpty(x)).join(", ");
       if (joined && prefix) out[prefix] = joined;
@@ -953,7 +1055,8 @@ export function heuristicFieldMap(flat: Record<string, string>[]): Map<string, s
     else if (CATEGORY_KEY.test(key)) role = "@category";
     else if (UNIT_KEY.test(key)) role = "@unit";
     else if (PRICE_KEY.test(key)) role = "@price";
-    else if (specMode || key === "_group") role = "@ignore";
+    else if (specMode || key.startsWith("_"))
+      role = "@ignore"; // "_group", "_mcat_id", …: tags the reader added, not product attributes
     else if (avgLen > 80)
       role = "@ignore"; // free text, not an attribute
     else role = canonicalSpecName(key);

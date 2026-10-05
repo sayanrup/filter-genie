@@ -9,9 +9,13 @@ source field names onto canonical spec names so that fill rates can be measured 
 
 ## What the code does
 
+0. **MCAT wrappers first:** an array of `{"input_mcat": {"id", "name"}, "primary_pmcat": {...}, "products": [...]}`
+   is unwrapped into one row per product, tagged with the MCAT (`_group`, `_mcat_id`) and its primary PMCAT
+   (`_pmcat`, `_pmcat_id`). Without this the wrappers themselves would be read as "listings".
 1. Finds the list of records wherever it lives (`products`, `items`, `data`, `listings`, … or the first array).
    An object holding **several arrays of records** (e.g. one per category: `{"portable-cabins": [...],
-   "office-cabins": [...]}`) is read in full — every group, each record tagged with `_group`.
+   "office-cabins": [...]}`) is read in full — every group, each record tagged with `_group` (up to 5,000 rows per group). With two or
+   more groups the app treats them as the MCATs of a subcategory and runs each on its own (skills 12–13).
 2. Flattens nested objects to dotted paths (`specs.material`). Arrays of whole records inside a record
    (e.g. `more_prod` — other products of the same seller) are skipped so they don't skew fill rates.
 3. Turns **name/value spec arrays** into real spec keys — `[{"name": "Material", "value": "MS"}]` and

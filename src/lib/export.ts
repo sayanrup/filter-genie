@@ -48,6 +48,11 @@ export function buildMarkdown(opts: {
   let md = `# Search filters — ${name}\n\n`;
   md += `- **Saved:** ${new Date(savedAt).toLocaleString()}\n`;
   md += `- **Model:** ${model}\n`;
+  if (result.subcat_name || result.subcat_id)
+    md += `- **Subcategory:** ${result.subcat_name ?? ""}${result.subcat_id ? ` (${result.subcat_id})` : ""}\n`;
+  if (result.mcat_id) md += `- **MCAT ID:** ${result.mcat_id}\n`;
+  if (result.pmcat)
+    md += `- **Primary PMCAT:** ${result.pmcat.name}${result.pmcat.id ? ` (${result.pmcat.id})` : ""}\n`;
   if (result.total_keywords_analyzed)
     md += `- **Keywords analysed:** ${result.total_keywords_analyzed}\n`;
   md += `- **Filters:** ${filters.length} (Tier 1: ${filters.filter((f) => f.tier === "Tier 1").length}, Tier 2: ${filters.filter((f) => f.tier === "Tier 2").length}, Tier 3: ${filters.filter((f) => f.tier === "Tier 3").length})\n`;

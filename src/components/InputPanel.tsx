@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 
 interface InputPanelProps {
   step: number;
@@ -14,6 +14,8 @@ interface InputPanelProps {
   detail?: string;
   tall?: boolean;
   className?: string;
+  /** Another way to fill this input (e.g. load from an API), shown under the hint. */
+  source?: ReactNode;
 }
 
 export function InputPanel({
@@ -29,6 +31,7 @@ export function InputPanel({
   detail,
   tall,
   className,
+  source,
 }: InputPanelProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -45,6 +48,7 @@ export function InputPanel({
         </span>
       </div>
       <p className="mb-3 text-xs leading-relaxed text-muted-foreground">{hint}</p>
+      {source}
 
       <button
         type="button"

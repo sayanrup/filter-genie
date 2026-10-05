@@ -8,7 +8,8 @@ import {
   type DimensionCandidates,
   type specSummary,
 } from "./data";
-import { composeSystemPrompt } from "@/skills";
+import { composeSystemPrompt, MCAT_SKILLS } from "@/skills";
+import { describeKeywordSelection, type McatScope } from "./mcats";
 
 /*
  * System prompts are assembled from the skill docs in src/skills (base.md + one .md per layer).
@@ -149,6 +150,8 @@ export function excerpt(text: string, max: number, keywords: string[]) {
 // ───────────────────────────── 1 · term labelling ─────────────────────────────
 
 export const TERM_LABEL_SYSTEM = composeSystemPrompt("label");
+/** Multi-MCAT runs: the keywords are common to all MCATs, so the labeller is told whose qualifiers to label. */
+export const TERM_LABEL_SYSTEM_MCAT = composeSystemPrompt("label", [], MCAT_SKILLS.label);
 
 export function buildTermLabelUser(
   terms: TermStat[],
@@ -156,6 +159,7 @@ export function buildTermLabelUser(
   dims: DimensionCandidates,
   context: string,
   budget: PromptBudget = BUDGETS.normal,
+  mcat: McatScope | null = null,
 ) {
   // No numbers: labelling doesn't need them. Skip the example when it's just the term itself.
   const lines = terms
@@ -171,9 +175,20 @@ export function buildTermLabelUser(
         .slice(0, budget.maxSpecs)
         .map((d) => `${d.name} — ${d.values.slice(0, budget.specValues + 1).join(", ")}`),
     );
-  const parts = [
+  const parts: string[] = [];
+  if (mcat)
+    parts.push(
+      block(
+        "MCAT",
+        [
+          `MCAT: ${mcat.name}`,
+          `Sibling MCATs (the other MCATs in this run, each labelled in its own call): ${mcat.siblings.join(", ")}`,
+        ].join("\n"),
+      ),
+    );
+  parts.push(
     `Category words (not qualifiers): ${mining.coreTerms.join(", ") || "(none detected)"}`,
-  ];
+  );
   if (dimLines.length) parts.push(block("CATEGORY_DIMENSIONS", dimLines.join("\n")));
   else parts.push("No category dimensions were provided — use the fallback dimensions.");
   const ctx = excerpt(context, budget.labelContextChars, [
@@ -215,6 +230,23 @@ export const FILTER_DESIGN_SYSTEM = composeSystemPrompt("design");
  */
 export const FILTER_DESIGN_SYSTEM_NO_UI = composeSystemPrompt("design", ["options"]);
 
+/** Added to the labelling message when the first answer labelled nothing at all. */
+export const LABEL_RETRY_NOTE =
+  "NOTE: a first answer to this list labelled NOTHING. A list like this nearly always holds filterable qualifiers (type, material, capacity, feature, application, brand, condition). Go through the TERMS again and label every term that is one, following the rules; skip only the ones that really are not.";
+
+/** The same two prompts with skill 12 (MCAT scope) added, for runs that cover one MCAT of a subcategory. */
+export const FILTER_DESIGN_SYSTEM_MCAT = composeSystemPrompt("design", [], MCAT_SKILLS.design);
+export const FILTER_DESIGN_SYSTEM_NO_UI_MCAT = composeSystemPrompt(
+  "design",
+  ["options"],
+  MCAT_SKILLS.design,
+);
+
+export function designSystemFor(uiDesign: boolean, mcat: boolean): string {
+  if (mcat) return uiDesign ? FILTER_DESIGN_SYSTEM_MCAT : FILTER_DESIGN_SYSTEM_NO_UI_MCAT;
+  return uiDesign ? FILTER_DESIGN_SYSTEM : FILTER_DESIGN_SYSTEM_NO_UI;
+}
+
 export const NO_UI_NOTE =
   'UI DESIGN IS SWITCHED OFF for this run: decide only which filters exist, their tier, rank, confidence and rationale. Return "interaction_rules": [] and do not spend any output reasoning about options or UI patterns — those are not part of your output.';
 
@@ -231,6 +263,31 @@ export interface DesignEvidence {
   demoListings?: boolean;
   uiDesign?: boolean;
   budget?: PromptBudget;
+  /** Set when this run covers one MCAT of several; its keywords were picked from the common files. */
+  mcat?: McatScope | null;
+}
+
+/** The MCAT_SCOPE block: which MCAT this is, what the keyword numbers really describe, how thin the evidence is. */
+function formatMcatScope(m: McatScope, hasKeywords: boolean) {
+  const lines = [
+    `MCAT: ${m.name}`,
+    ...(m.subcat?.name ? [`Subcategory: ${m.subcat.name}`] : []),
+    ...(m.pmcat ? [`Primary PMCAT (its parent product category): ${m.pmcat.name}`] : []),
+    `Sibling MCATs (the other MCATs in this run, each designed in its own call): ${m.siblings.join(", ")}`,
+    `This MCAT's own listings: ${fmt(m.listings)}`,
+  ];
+  const sel = m.keywordSelection ?? [];
+  if (sel.length) {
+    lines.push(
+      "Keyword files: common to all MCATs. Code picked the keywords that are about THIS MCAT (its name, its PMCAT, or words only its own listings use) before this call, so every keyword number in A is a share of those keywords, not of the whole file.",
+      `Keywords picked: ${describeKeywordSelection(sel)}`,
+    );
+  } else if (hasKeywords) {
+    lines.push("Keywords: none were about this MCAT, so there is no keyword evidence (A).");
+  }
+  if (m.notes.length)
+    lines.push("Thin or missing evidence for this MCAT:", ...m.notes.map((n) => `- ${n}`));
+  return lines.join("\n");
 }
 
 function metricName(t: KeywordTable | undefined) {
@@ -399,7 +456,7 @@ function formatListing(p: ListingProfile, demo: boolean, budget: PromptBudget) {
 export function buildDesignUser(ev: DesignEvidence) {
   const budget = ev.budget ?? BUDGETS.normal;
   const parts: string[] = [];
-  parts.push(`CATEGORY: ${ev.category ?? "(infer it from the evidence)"}`);
+  parts.push(`CATEGORY: ${ev.mcat?.name ?? ev.category ?? "(infer it from the evidence)"}`);
   const present = [
     ev.tables.length ? "A" : null,
     ev.context.trim() ? "B" : null,
@@ -407,6 +464,12 @@ export function buildDesignUser(ev: DesignEvidence) {
     ev.listing ? "D" : null,
   ].filter(Boolean);
   parts.push(`Evidence present: ${present.join(", ") || "none"}.`);
+  if (ev.mcat)
+    parts.push(
+      "",
+      "## MCAT SCOPE",
+      block("MCAT_SCOPE", formatMcatScope(ev.mcat, ev.tables.length > 0)),
+    );
 
   if (ev.tables.length) {
     const body = [
