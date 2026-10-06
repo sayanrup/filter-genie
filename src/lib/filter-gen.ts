@@ -8,6 +8,7 @@ import {
   heuristicFieldMap,
   mineTerms,
   profileListings,
+  SOURCE_LABEL,
   specSummary,
   termsForModel,
   toKeywordTable,
@@ -33,19 +34,38 @@ import {
 } from "./llm";
 import {
   FIELD_MAP_SYSTEM,
-  FILTER_DESIGN_SYSTEM,
-  FILTER_DESIGN_SYSTEM_NO_UI,
+  LABEL_RETRY_NOTE,
+  RANGES_SYSTEM,
   TERM_LABEL_SYSTEM,
+  TERM_LABEL_SYSTEM_MCAT,
+  designSystemFor,
   BUDGETS,
   buildDesignUser,
   formatLakh,
   type PromptBudget,
   buildFieldMapUser,
+  buildRangesUser,
   buildTermLabelUser,
 } from "./prompts";
+import {
+  applyRanges,
+  filterRangeText,
+  rangeLines,
+  type DimensionSpec,
+  type ValueRange,
+} from "./ranges";
 import type { ContextComparison } from "./compare";
+import {
+  MIN_MCAT_KEYWORDS,
+  describeKeywordSelection,
+  selectMcatKeywords,
+  splitByMcat,
+  type McatScope,
+} from "./mcats";
 import { valueConfidence, type ValueConfidence } from "./value-confidence";
-import type { StageId } from "@/skills";
+import { MCAT_SKILLS, type SkillId, type StageId } from "@/skills";
+
+export type { McatScope };
 
 export * from "./llm";
 
@@ -66,6 +86,12 @@ export interface FilterRow {
   listing_fill_pct?: number | null;
   needs_new_isq?: boolean;
   isq_note?: string | null;
+  /**
+   * Option values the model suggests adding to the seller form when this filter needs a new ISQ ("PEB",
+   * "Modular", "LGSF"): the values of the red note, shown as "AI suggested" beside the real ones. Not in
+   * `values`, so they carry no confidence, range or fill rate.
+   */
+  ai_values?: string[];
   /** The resolved evidence keys this filter is linked to (set by attachEvidence, never the model's
    *  raw string) — lets the UI show the exact dimension/spec rows this filter's numbers came from. */
   linked_dimension?: string | null;
@@ -75,10 +101,31 @@ export interface FilterRow {
    * check step, so a saved result keeps it). Absent when the filter has no linked evidence.
    */
   value_confidence?: ValueConfidence[];
+  /**
+   * Lower and upper bound of each numeric option ("5,001 - 10,000 sq ft" → 5001 … 10000), from the ranges
+   * step (skill 14). Absent on filters that aren't numeric and on results saved before that step existed.
+   */
+  ranges?: ValueRange[];
+  /**
+   * For a filter whose values are sizes with several numbers ("10x12 ft"): one slider per axis, each with a
+   * lower and upper limit in one unit (skill 14). Set instead of `ranges`.
+   */
+  dimensions?: DimensionSpec;
+  /**
+   * When the exact values of a numeric filter ("2.5 m", "4 Meter", "5 m") were folded into ranges or turned
+   * into buckets ("Less than 2.5 m", "2.5 to 4 m", …), the exact values that were replaced.
+   */
+  exact_values?: string[];
 }
 
 export interface FilterResult {
   category_name?: string;
+  /** Multi-MCAT runs: the MCAT's id and primary PMCAT from the product file. */
+  mcat_id?: string;
+  /** Multi-MCAT runs: the subcategory the MCAT belongs to, when the product file names it. */
+  subcat_id?: string;
+  subcat_name?: string;
+  pmcat?: { id?: string; name: string };
   total_keywords_analyzed?: number;
   filters: FilterRow[];
   interaction_rules?: string[];
@@ -95,11 +142,18 @@ export interface PipelineInputs {
   demoListings?: boolean;
   /** Ask for UI patterns, option values and interaction rules (default on). Off = filters + tiers only. */
   uiDesign?: boolean;
+  /**
+   * When the listings hold several MCATs (a group each), run them one by one (default on). Off = the
+   * groups are read together as one category.
+   */
+  separateMcats?: boolean;
+  /** Set on the inputs of one MCAT's run (by splitByMcat): which MCAT it is and what its evidence is. */
+  mcat?: McatScope;
 }
 
 export type { StageId };
 
-export type StepId = "prepare" | "label" | "fields" | "design" | "check";
+export type StepId = "prepare" | "label" | "fields" | "design" | "check" | "ranges";
 export type StepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
 export interface StepStat {
@@ -219,6 +273,8 @@ export interface PromptRecord {
   title: string;
   /** Skill-doc stage whose composed system prompt this call uses. */
   stage?: StageId;
+  /** Extra skills in that prompt (the MCAT-scope skills, in multi-MCAT runs). */
+  include?: SkillId[];
   messages: ChatMessage[];
 }
 
@@ -280,6 +336,13 @@ export const INITIAL_STEPS: Step[] = [
       "Code fills in coverage, share and fill rates from the evidence links, then enforces the tier rules and cleans options. No repair call.",
     status: "pending",
   },
+  {
+    id: "ranges",
+    label: "Lower & upper bounds",
+    description:
+      "Sends the final ISQ values to the model, which gives each numeric one (price, size, capacity…) a lower and an upper bound. Code keeps a bound only when the number is in the value's own text.",
+    status: "pending",
+  },
 ];
 
 /** Prompt messages as readable text for the "See the working" panel. */
@@ -301,13 +364,19 @@ export interface Prepared {
   /** The category's own dimension names (ranking + listing specs) for keyword labelling. */
   dims: DimensionCandidates;
   context: string;
+  /** Set when this run covers one MCAT of a subcategory (the keyword files are common to all MCATs). */
+  mcat: McatScope | null;
 }
 
 export function prepare(inputs: PipelineInputs): Prepared {
-  const tables = [
+  const allTables = [
     toKeywordTable(inputs.internalRows, "internal"),
     toKeywordTable(inputs.serpRows, "serp"),
   ].filter((t): t is KeywordTable => t !== null && t.rows.length > 0);
+  // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, picked
+  // here in code, so the terms, labels, coverage and shares below are all that MCAT's own.
+  const picked = inputs.mcat ? selectMcatKeywords(allTables, inputs.mcat) : null;
+  const tables = picked ? picked.tables : allTables;
   const mining = tables.length ? mineTerms(tables) : null;
   const flatListings = inputs.listingRows.slice(0, 500).map((r) => flattenListing(r));
   const fieldMap = heuristicFieldMap(flatListings);
@@ -323,18 +392,33 @@ export function prepare(inputs: PipelineInputs): Prepared {
       flatListings.length ? profileListings(flatListings, fieldMap) : null,
     ),
     context: inputs.context,
+    mcat: inputs.mcat && picked ? { ...inputs.mcat, keywordSelection: picked.selection } : null,
   };
 }
 
 /** The field-mapping call only helps when there are at least two specs that might be synonyms. */
 const needsFieldCall = (prep: Prepared) => prep.specs.length >= 2;
 
-function labelMessages(prep: Prepared, budget: PromptBudget = BUDGETS.normal): ChatMessage[] {
+/** Fewer terms than this and an empty answer can be a genuine "nothing to label". */
+const EMPTY_LABEL_MIN_TERMS = 10;
+
+function labelMessages(
+  prep: Prepared,
+  budget: PromptBudget = BUDGETS.normal,
+  note = "",
+): ChatMessage[] {
   return [
-    { role: "system", content: TERM_LABEL_SYSTEM },
+    { role: "system", content: prep.mcat ? TERM_LABEL_SYSTEM_MCAT : TERM_LABEL_SYSTEM },
     {
       role: "user",
-      content: buildTermLabelUser(prep.modelTerms, prep.mining!, prep.dims, prep.context, budget),
+      content: buildTermLabelUser(
+        prep.modelTerms,
+        prep.mining!,
+        prep.dims,
+        prep.context,
+        budget,
+        prep.mcat,
+      ).concat(note ? "\n\n" + note : ""),
     },
   ];
 }
@@ -374,6 +458,7 @@ const STEP_NAME = {
   label: "keyword-labelling",
   fields: "spec-merging",
   design: "master (filter design)",
+  ranges: "numeric-ranges",
 } as const;
 
 const COMPACT_NOTE = (step: string) =>
@@ -381,12 +466,21 @@ const COMPACT_NOTE = (step: string) =>
 
 /** Prompts as they'd be sent, before any model call (for the "View prompts" panel). */
 export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
+  // Several MCATs in the listings: every MCAT gets its own set of calls, so preview (and cost) all of them.
+  const slices = splitByMcat(inputs);
+  if (slices.length > 1)
+    return slices.flatMap((s) =>
+      previewPrompts(s.inputs).map((p) => ({ ...p, title: `${s.name} · ${p.title}` })),
+    );
+
   const prep = prepare(inputs);
+  const include = prep.mcat ? MCAT_SKILLS : null;
   const out: PromptRecord[] = [];
   if (prep.modelTerms.length) {
     out.push({
       id: "label",
       stage: "label",
+      ...(include?.label ? { include: include.label } : {}),
       title: "1 · Label keyword terms",
       messages: labelMessages(prep),
     });
@@ -403,11 +497,12 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
   out.push({
     id: "design",
     stage: "design",
+    ...(include?.design ? { include: include.design } : {}),
     title: "3 · Master prompt — design the filter panel",
     messages: [
       {
         role: "system",
-        content: inputs.uiDesign === false ? FILTER_DESIGN_SYSTEM_NO_UI : FILTER_DESIGN_SYSTEM,
+        content: designSystemFor(inputs.uiDesign !== false, Boolean(prep.mcat)),
       },
       {
         role: "user",
@@ -424,11 +519,27 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
             : null,
           demoListings: Boolean(inputs.demoListings),
           uiDesign: inputs.uiDesign !== false,
+          mcat: prep.mcat,
         }).concat(
           prep.modelTerms.length
             ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
             : "",
         ),
+      },
+    ],
+  });
+  out.push({
+    id: "ranges",
+    stage: "ranges",
+    title: "4 · Numeric ranges — lower and upper bounds",
+    messages: [
+      { role: "system", content: RANGES_SYSTEM },
+      {
+        role: "user",
+        content:
+          "[Preview: at run time this lists the final filters (at most " +
+          MAX_FILTERS +
+          ") that have numbers in their ISQ values, with every value and the listing stats behind it.]",
       },
     ],
   });
@@ -449,7 +560,8 @@ function cacheKey(settings: LlmSettings, messages: ChatMessage[]) {
 
 function remember(key: string, value: unknown) {
   stageCache.set(key, value);
-  if (stageCache.size > 24) stageCache.delete(stageCache.keys().next().value as string);
+  // Room for a few MCATs' worth of answers (up to three calls each) at once.
+  if (stageCache.size > 120) stageCache.delete(stageCache.keys().next().value as string);
 }
 
 // ───────────────────────────── parsing model answers ─────────────────────────────
@@ -541,6 +653,17 @@ function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } 
       rationale: String(f?.rationale ?? "").trim(),
       needs_new_isq: Boolean(f?.needs_new_isq),
       isq_note: f?.isq_note ? String(f.isq_note) : null,
+      ...(Array.isArray(f?.suggested_values)
+        ? {
+            ai_values: [
+              ...new Set(
+                f.suggested_values
+                  .map((v: unknown) => String(v).trim().slice(0, 40))
+                  .filter(Boolean),
+              ),
+            ] as string[],
+          }
+        : {}),
     };
   });
   const result: FilterResult = {
@@ -712,6 +835,10 @@ export function attachEvidence(
 }
 
 const MAX_OPTIONS = 12;
+/** Filters shown in a panel, across all tiers: more than this is noise for a buyer (and for a reviewer). */
+export const MAX_FILTERS = 6;
+/** AI-suggested ISQ values shown beside a filter's real values (see `FilterRow.ai_values`). */
+const MAX_AI_VALUES = 6;
 
 /**
  * Deterministic fixes instead of a second (full-price) model call. Returns a note per change so
@@ -795,11 +922,38 @@ export function fixResult(
       );
   }
 
+  // At most MAX_FILTERS in all: the best tier first, then the model's own rank within a tier.
+  if (r.filters.length > MAX_FILTERS) {
+    const order: Record<Tier, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
+    const ranked = [...r.filters].sort((a, b) => order[a.tier] - order[b.tier] || a.rank - b.rank);
+    const dropped = ranked.slice(MAX_FILTERS);
+    const keep = new Set(ranked.slice(0, MAX_FILTERS));
+    r.filters = r.filters.filter((f) => keep.has(f));
+    fixes.push(
+      `Kept the top ${MAX_FILTERS} of ${ranked.length} filters; left out ${dropped
+        .map((f) => `"${f.name}" (${f.tier})`)
+        .join(", ")}.`,
+    );
+  }
+
   // Renumber ranks 1…n per tier, keeping the model's order (promoted filters go last in Tier 1).
   for (const t of ["Tier 1", "Tier 2", "Tier 3"] as Tier[]) {
     const inTier = r.filters.filter((f) => f.tier === t);
     const original = new Map(inTier.map((f) => [f, f.rank]));
     inTier.sort((a, b) => original.get(a)! - original.get(b)!).forEach((f, i) => (f.rank = i + 1));
+  }
+
+  // Values the model suggests adding to the seller form (the red "needs a new ISQ" note): shown as AI
+  // suggestions beside the real values, never mixed into them. Only for a filter that needs a new ISQ,
+  // without duplicates of an existing value, at most MAX_AI_VALUES.
+  for (const f of r.filters) {
+    if (!f.ai_values?.length) continue;
+    const have = new Set(f.values.map(norm));
+    const fresh = f.needs_new_isq
+      ? f.ai_values.filter((v) => !have.has(norm(v)) && have.add(norm(v)))
+      : [];
+    if (fresh.length) f.ai_values = fresh.slice(0, MAX_AI_VALUES);
+    else delete f.ai_values;
   }
 
   // Every ISQ gap gets a blocker.
@@ -865,6 +1019,18 @@ export async function runPipeline(
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
   const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
+  if (prep.mcat) {
+    warnings.push(...prep.mcat.notes);
+    const sel = prep.mcat.keywordSelection ?? [];
+    for (const k of sel.filter((x) => !x.used && x.total > 0))
+      warnings.push(
+        `Keywords: only ${k.selected} of the ${k.total.toLocaleString()} ${SOURCE_LABEL[k.source]} keywords are about ${prep.mcat.name} (fewer than ${MIN_MCAT_KEYWORDS}), so that file was left out for it.`,
+      );
+    if (sel.length && !prep.tables.length)
+      warnings.push(
+        `No keywords are about ${prep.mcat.name}, so this panel rests on its listings, context and ranking alone; the keyword evidence (A) is absent.`,
+      );
+  }
   {
     const bySource = (src: string) => prep.tables.find((t) => t.source === src)?.rows.length ?? 0;
     const stats: StepStat[] = [];
@@ -888,6 +1054,12 @@ export async function runPipeline(
       { label: "context chars", value: inputs.context.length },
     );
     const inputLines = [
+      ...(prep.mcat
+        ? [
+            `MCAT: ${prep.mcat.name} (siblings: ${prep.mcat.siblings.join(", ")}) · ${prep.mcat.listings} listings of its own`,
+            `keywords picked for this MCAT from the common files: ${prep.mcat.keywordSelection?.length ? describeKeywordSelection(prep.mcat.keywordSelection) : "no keyword files"}`,
+          ]
+        : []),
       ...prep.tables.map(
         (t) =>
           `${t.source} keywords: ${t.rows.length} rows · query column "${t.queryColumn ?? "?"}" · demand "${t.demandMetric ?? "none"}" · action "${t.actionMetric ?? "none"}"${t.rateMetrics.length ? ` · rates ${t.rateMetrics.join(", ")}` : ""}`,
@@ -947,12 +1119,13 @@ export async function runPipeline(
    * compact form if the provider says it's too long for the model.
    */
   const ask = async (
-    id: "label" | "fields" | "design",
+    id: "label" | "fields" | "design" | "ranges",
     title: string,
     build: (budget: PromptBudget) => ChatMessage[],
     maxTokens: number,
     reasoning: "off" | "low" | "medium",
     reuse: boolean,
+    include: SkillId[] = [],
   ) => {
     let compact = false;
     const out = await withBudget(
@@ -973,7 +1146,13 @@ export async function runPipeline(
         warnings.push(COMPACT_NOTE(STEP_NAME[id]));
       },
     );
-    prompts.push({ id, stage: id, title, messages: out.messages });
+    prompts.push({
+      id,
+      stage: id,
+      ...(include.length ? { include } : {}),
+      title,
+      messages: out.messages,
+    });
     return { ...out, compact };
   };
   const compactTag = (c: boolean) => (c ? " · compact prompt" : "");
@@ -991,27 +1170,56 @@ export async function runPipeline(
     const known = new Set(prep.modelTerms.map((t) => t.term));
     step("label", "running");
     try {
-      const {
-        data,
-        cached,
-        usage: stepUsage,
-        compact,
-      } = await ask(
+      const include = MCAT_SKILLS.label && prep.mcat ? MCAT_SKILLS.label : [];
+      const maxTokens = Math.min(2500, 400 + prep.modelTerms.length * 10);
+      let attempt = await ask(
         "label",
         "1 · Label keyword terms",
         (b) => labelMessages(prep, b),
-        Math.min(2500, 400 + prep.modelTerms.length * 10),
+        maxTokens,
         "off",
         !fresh("label"),
+        include,
       );
-      const labels = parseLabels(data, known);
+      let labels = parseLabels(attempt.data, known);
+      let stepUsage = attempt.usage;
+      let calls = attempt.cached ? 0 : 1;
+      let retried = false;
+      // An empty answer for a list this long is a failure, not a verdict: never keep it for reuse,
+      // and ask once more with a firmer instruction.
+      if (!labels.length && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS) {
+        stageCache.delete(cacheKey(settings, attempt.messages));
+        retried = true;
+        attempt = await ask(
+          "label",
+          "1 · Label keyword terms (second try)",
+          (b) => labelMessages(prep, b, LABEL_RETRY_NOTE),
+          maxTokens,
+          "off",
+          false,
+          include,
+        );
+        stepUsage = addUsage(stepUsage, attempt.usage);
+        calls += 1;
+        labels = parseLabels(attempt.data, known);
+        if (!labels.length) stageCache.delete(cacheKey(settings, attempt.messages));
+      }
+      const { data, compact } = attempt;
+      const cached = attempt.cached && !retried;
+      const none = labels.length === 0 && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS;
+      if (none)
+        warnings.push(
+          `Term labelling: the model labelled none of the ${prep.modelTerms.length} keyword terms${retried ? ", even when asked a second time" : ""}, so only code-labelled terms (price, place, size) were grouped and the keyword evidence is thin. Open "See the working" on that step to read its reply.`,
+        );
+      else if (retried)
+        warnings.push("Term labelling: the first answer labelled nothing; the second try worked.");
       const dims = new Set(labels.map((l) => l.dimension));
       const category = (data as any)?.category_name;
-      step("label", "done", {
-        calls: cached ? 0 : 1,
+      step("label", none ? "error" : "done", {
+        calls,
         cached,
         usage: stepUsage,
-        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${none ? " · the model labelled none, used code labels only" : ""}${retried && !none ? " · second try" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
         stats: [
           { label: "terms sent", value: prep.modelTerms.length },
           { label: "labelled", value: labels.length },
@@ -1140,7 +1348,7 @@ export async function runPipeline(
   // 4 · design
   const uiDesign = inputs.uiDesign !== false;
   const designMessages = (budget: PromptBudget): ChatMessage[] => [
-    { role: "system", content: uiDesign ? FILTER_DESIGN_SYSTEM : FILTER_DESIGN_SYSTEM_NO_UI },
+    { role: "system", content: designSystemFor(uiDesign, Boolean(prep.mcat)) },
     {
       role: "user",
       content: buildDesignUser({
@@ -1154,6 +1362,7 @@ export async function runPipeline(
         demoListings: Boolean(inputs.demoListings),
         uiDesign,
         budget,
+        mcat: prep.mcat,
       }),
     },
   ];
@@ -1174,6 +1383,7 @@ export async function runPipeline(
     uiDesign ? 3200 : 2200,
     "medium",
     from === "check",
+    MCAT_SKILLS.design && prep.mcat ? MCAT_SKILLS.design : [],
   );
   const { result, links } = normalizeResult(designData);
   if (result.filters.length === 0) {
@@ -1256,7 +1466,85 @@ export async function runPipeline(
         .join("\n")}`,
   });
 
-  if (!result.category_name && category) result.category_name = category;
+  // 6 · lower and upper bounds for the numeric ISQ values: one small call on the final filters. Code keeps
+  // a bound only when its number is in the option's own text, so a failure here only leaves plain labels.
+  if (!result.filters.some((f) => f.values.some((v) => /\d/.test(v)))) {
+    step("ranges", "skipped", { calls: 0, detail: "no ISQ value has a number" });
+  } else {
+    step("ranges", "running");
+    try {
+      const {
+        data,
+        cached,
+        usage: rangesUsage,
+        compact,
+      } = await ask(
+        "ranges",
+        "4 · Numeric ranges — lower and upper bounds",
+        () => [
+          { role: "system", content: RANGES_SYSTEM },
+          { role: "user", content: buildRangesUser(result.filters, listing) },
+        ],
+        2500,
+        "off",
+        from !== "ranges" && from !== "prepare",
+      );
+      const applied = applyRanges(result.filters, data, listing);
+      if (applied.skipped.length)
+        warnings.push(
+          `Ranges: ${applied.skipped.length} option(s) stay plain labels because the bounds the model gave aren't in the option's own text (${applied.skipped.slice(0, 5).join("; ")}${applied.skipped.length > 5 ? "; …" : ""}).`,
+        );
+      step("ranges", "done", {
+        calls: cached ? 0 : 1,
+        cached,
+        usage: rangesUsage,
+        detail: `${applied.options} option(s) in ${applied.filters} filter(s) have bounds${applied.inferred ? ` · ${applied.inferred} read by code` : ""}${applied.regrouped ? ` · ${applied.regrouped} regrouped` : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+        stats: [
+          { label: "filters with bounds", value: applied.filters },
+          { label: "options with bounds", value: applied.options },
+          { label: "filters read by code", value: applied.inferred },
+          { label: "filters regrouped into ranges", value: applied.regrouped },
+          { label: "options left as labels", value: applied.skipped.length },
+        ],
+        output: [
+          ...result.filters
+            .filter((f) => f.ranges?.length || f.dimensions)
+            .map(
+              (f) =>
+                `${f.name}  (${filterRangeText(f)}):\n${rangeLines(f)
+                  .map((l) => `  ${l}`)
+                  .join("\n")}`,
+            ),
+          JSON.stringify(data, null, 2),
+        ].join("\n\n"),
+      });
+    } catch (err) {
+      if ((err as Error).name === "AbortError") throw err;
+      // The model call failed: code still reads the numeric filters, so none is left unprocessed.
+      let applied = { inferred: 0 };
+      try {
+        applied = applyRanges(result.filters, null, listing);
+      } catch {
+        // the filters stay as plain labels
+      }
+      warnings.push(
+        `Numeric ranges: the model call failed (${(err as Error).message}); ${applied.inferred ? `${applied.inferred} filter(s) were read by code instead` : "no filter could be read by code, so the ISQ values stay as plain labels"}.`,
+      );
+      step("ranges", "error", {
+        detail: `model call failed · ${applied.inferred} filter(s) read by code`,
+        output: (err as Error).message,
+      });
+    }
+  }
+
+  // A multi-MCAT run is named after its MCAT, not after whatever the model made of the shared keywords.
+  if (prep.mcat) {
+    result.category_name = prep.mcat.name;
+    if (prep.mcat.id) result.mcat_id = prep.mcat.id;
+    if (prep.mcat.pmcat) result.pmcat = prep.mcat.pmcat;
+    if (prep.mcat.subcat?.id) result.subcat_id = prep.mcat.subcat.id;
+    if (prep.mcat.subcat?.name) result.subcat_name = prep.mcat.subcat.name;
+  } else if (!result.category_name && category) result.category_name = category;
   result.total_keywords_analyzed = kwCount;
   return { result, evidence, warnings, usage, calls, prompts };
 }
@@ -1287,6 +1575,12 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
       // three required parts, interaction_rules are more detailed, and the model has room for a
       // brief reasoning pass per candidate (skill 08) — sized for that, not for minimum output.
       outputTokens += p.messages[1]?.content.includes("UI DESIGN IS SWITCHED OFF") ? 1400 : 2200;
+  }
+  // The ranges prompt is only a placeholder before the run: its real message lists up to MAX_FILTERS filters
+  // with all their values, and the answer is one entry per numeric option.
+  if (prompts.some((p) => p.id === "ranges")) {
+    inputTokens += 700;
+    outputTokens += 500;
   }
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;

@@ -46,13 +46,18 @@ STEP 5 — CONFIDENCE, from steps 1–2 only:
 - Low: no keyword evidence at all — the filter rests on listings or general category knowledge alone.
 
 STEP 6 — ASSIGN TIERS, using the outcome of steps 1, 2 and 3 (never step 4 — supply doesn't affect tier):
-- Tier 1 (always visible; how buyers shortlist): the 3–5 candidates with the strongest combination of
+- HARD LIMIT: the panel has AT MOST 6 filters in total, across all tiers. Scoring many candidates is fine;
+  returning more than 6 is not. Rank every candidate, then return only the best 6 — a candidate that
+  does not make the top 6 is left out of the answer, however real it is.
+- Tier 1 (always visible; how buyers shortlist): the 3–4 candidates with the strongest combination of
   demand (step 1), discrimination (step 1) and confirmation (step 2). A step-3 add reaches Tier 1 only
   if both B and C insisted on it.
-- Tier 2 (under "More filters"): everything real but secondary — moderate demand, Medium confidence,
-  context/ranking-only specs from step 3, niche segments. Usually 2–6 filters.
+- Tier 2 (under "More filters"): the real but secondary ones that still make the top 6 — moderate demand,
+  Medium confidence, context/ranking-only specs from step 3. Usually 1–3 filters.
 - Tier 3 (not a filter — shown on the listing card instead): contradicted in step 2, or weak
-  discrimination with no confirmation, or bottom tier in C.
+  discrimination with no confirmation, or bottom tier in C. Only if the top 6 has room left over.
+- A spec that appears only in the context or ranking (a long list of "seller specs" or "missing specs"
+  is not a list of filters) must be backed by D or A to make the top 6.
 - Price: include (in whichever tier its evidence earns) if price-intent coverage in A ≥ 3%, or D has
   enough priced listings. Location: include if coverage in A ≥ 3%.
 

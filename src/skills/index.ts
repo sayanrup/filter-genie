@@ -15,6 +15,9 @@ import s08 from "./08-scoring-and-tiering.md?raw";
 import s09 from "./09-filter-options-and-ui.md?raw";
 import s10 from "./10-rationale-and-output.md?raw";
 import s11 from "./11-output-validation.md?raw";
+import s12 from "./12-mcat-scope.md?raw";
+import s13 from "./13-mcat-labelling.md?raw";
+import s14 from "./14-numeric-ranges.md?raw";
 
 export interface SkillDoc {
   id: string;
@@ -52,11 +55,14 @@ export const SKILLS = {
   options: doc("options", "09-filter-options-and-ui.md", s09),
   output: doc("output", "10-rationale-and-output.md", s10),
   validation: doc("validation", "11-output-validation.md", s11),
+  mcatScope: doc("mcatScope", "12-mcat-scope.md", s12),
+  mcatLabelling: doc("mcatLabelling", "13-mcat-labelling.md", s13),
+  numericRanges: doc("numericRanges", "14-numeric-ranges.md", s14),
 } satisfies Record<string, SkillDoc>;
 
 export type SkillId = keyof typeof SKILLS;
 
-export type StageId = "label" | "fields" | "design";
+export type StageId = "label" | "fields" | "design" | "ranges";
 
 /** Which skill docs make up each stage's system prompt, in order (base.md is always first). */
 export const STAGES: Record<StageId, { title: string; skills: SkillId[] }> = {
@@ -75,19 +81,36 @@ export const STAGES: Record<StageId, { title: string; skills: SkillId[] }> = {
       "output",
     ],
   },
+  ranges: { title: "Numeric ranges — lower and upper bounds", skills: ["numericRanges"] },
 };
 
 const DIVIDER = "\n\n---\n\n";
 
-export function stageSkills(stage: StageId, exclude: SkillId[] = []): SkillDoc[] {
-  return [
-    SKILLS.base,
-    ...STAGES[stage].skills.filter((id) => !exclude.includes(id)).map((id) => SKILLS[id]),
-  ];
+/**
+ * Skills added to a stage only when a subcategory is run MCAT by MCAT (see skill 12). They are placed
+ * right after the stage's opening skill, so the rest of the method is read with the scope in mind.
+ */
+export const MCAT_SKILLS: Partial<Record<StageId, SkillId[]>> = {
+  label: ["mcatLabelling"],
+  design: ["mcatScope"],
+};
+
+export function stageSkills(
+  stage: StageId,
+  exclude: SkillId[] = [],
+  include: SkillId[] = [],
+): SkillDoc[] {
+  const [first, ...rest] = STAGES[stage].skills.filter((id) => !exclude.includes(id));
+  const ids = first ? [first, ...include, ...rest] : include;
+  return [SKILLS.base, ...ids.map((id) => SKILLS[id])];
 }
 
-export function composeSystemPrompt(stage: StageId, exclude: SkillId[] = []): string {
-  return stageSkills(stage, exclude)
+export function composeSystemPrompt(
+  stage: StageId,
+  exclude: SkillId[] = [],
+  include: SkillId[] = [],
+): string {
+  return stageSkills(stage, exclude, include)
     .map((s) => s.prompt)
     .filter(Boolean)
     .join(DIVIDER);

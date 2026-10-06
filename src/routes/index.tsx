@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { InputPanel } from "@/components/InputPanel";
+import { McatContextLoader } from "@/components/McatContextLoader";
 import {
   SOURCE_LABEL,
   describeKeywordTable,
@@ -35,10 +36,20 @@ import {
   type PipelineRun,
   type PromptRecord,
   type Provider,
+  type Step,
   type StepId,
 } from "@/lib/filter-gen";
 import { SKILLS, stageSkills } from "@/skills";
 import { StepCards, type StepView } from "@/components/StepCards";
+import { McatNav, McatPanel, McatPlan, type McatState } from "@/components/McatPanel";
+import {
+  describeKeywordSelection,
+  selectMcatKeywords,
+  splitByMcat,
+  type McatSlice,
+} from "@/lib/mcats";
+import { runMcats } from "@/lib/run-mcats";
+import { useMcatPlan } from "@/lib/use-mcat-plan";
 import { SearchPreview } from "@/components/SearchPreview";
 import { FilterTable } from "@/components/FilterTable";
 import { Similarity } from "@/components/ContextCompare";
@@ -49,9 +60,10 @@ import {
   removeShared,
   sharedStorageEnabled,
   withoutRows,
+  type Stored,
 } from "@/lib/saved-store";
 import publishedResults from "@/data/published-results.json";
-import { downloadWorkbook } from "@/lib/export-xlsx";
+import { downloadMcatWorkbook, downloadWorkbook } from "@/lib/export-xlsx";
 import { buildFullMarkdown, buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
 // Read from the gitignored .env.local so the key never lands in the repo (which syncs to Lovable).
@@ -81,6 +93,9 @@ export const Route = createFileRoute("/")({
 
 type Status = { kind: "ok" | "error" | "busy"; message: string } | null;
 
+/** MCATs generated at once in a multi-MCAT run (each already runs its labelling and spec merge in parallel). */
+const MCAT_CONCURRENCY = 2;
+
 const STORAGE_KEY = "filter-gen-settings";
 
 const SAVED_KEY = "filter-gen-saved";
@@ -100,6 +115,47 @@ interface SavedRun {
   /** Set when a category context was given: the same run without it, and how alike they are. */
   withoutResult?: PipelineRun["result"];
   comparison?: ContextComparison;
+  /** What else the run produced, so a reopened result shows the same warnings, cost and step results. */
+  warnings?: string[];
+  usage?: PipelineRun["usage"];
+  calls?: number;
+  steps?: Step[];
+  /**
+   * A subcategory saved as one entry: every MCAT's result, in the order they were run. `result` above is
+   * then the first MCAT's, and `inputs` is the whole run's inputs, kept once.
+   */
+  subcat_id?: string;
+  subcat_name?: string;
+  mcats?: SavedMcat[];
+}
+
+/** One MCAT inside a saved subcategory: what its run produced. */
+interface SavedMcat {
+  name: string;
+  result: PipelineRun["result"];
+  warnings?: string[];
+  usage?: PipelineRun["usage"];
+  calls?: number;
+  steps?: Step[];
+}
+
+/** Longest step output kept in a saved run (the design step's reply is already in `result`). */
+const SAVED_STEP_OUTPUT_CHARS = 4000;
+const SAVED_MCAT_STEP_OUTPUT_CHARS = 1000;
+
+/** A finished step for saving: no prompt text (it's rebuilt from the inputs) and a capped output. */
+function stepsForSave(steps: StepView[], maxOutput = SAVED_STEP_OUTPUT_CHARS): Step[] {
+  return steps.map(({ startedAt: _startedAt, input: _input, output, ...rest }) => ({
+    ...rest,
+    ...(output
+      ? {
+          output:
+            output.length > maxOutput
+              ? `${output.slice(0, maxOutput)}\n[… cut to keep the saved run small]`
+              : output,
+        }
+      : {}),
+  }));
 }
 
 const EMPTY_BUNDLE: InputBundle = { serp: "", internal: "", context: "", specs: "", products: "" };
@@ -118,7 +174,9 @@ function rowsFromBundle(json: string): Row[] | null {
 }
 
 /** A saved run only keeps the result and inputs; evidence is recomputed on the next Generate. */
-function runFromSaved(entry: SavedRun): PipelineRun {
+function runFromSaved(
+  entry: Pick<SavedRun, "result" | "warnings" | "usage" | "calls" | "withoutResult" | "comparison">,
+): PipelineRun {
   const plain = (result: PipelineRun["result"]): PipelineRun => ({
     result,
     evidence: {
@@ -136,6 +194,9 @@ function runFromSaved(entry: SavedRun): PipelineRun {
   });
   return {
     ...plain(entry.result),
+    warnings: entry.warnings ?? [],
+    usage: entry.usage ?? {},
+    calls: entry.calls ?? 0,
     ...(entry.withoutResult && entry.comparison
       ? { withoutContext: plain(entry.withoutResult), comparison: entry.comparison }
       : {}),
@@ -264,8 +325,20 @@ function Index() {
   const [showSkills, setShowSkills] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [steps, setSteps] = useState<StepView[]>([]);
-  const [baseRun, setRun] = useState<PipelineRun | null>(null);
+  const [singleSteps, setSteps] = useState<StepView[]>([]);
+  const [singleRun, setRun] = useState<PipelineRun | null>(null);
+  // A product file with several MCATs: one run each. `mcats` is empty for an ordinary single-category run.
+  const [mcats, setMcats] = useState<McatState[]>([]);
+  const [activeMcat, setActiveMcat] = useState(0);
+  const [separateMcats, setSeparateMcats] = useState(true);
+  const activeState = mcats[activeMcat];
+  const selectMcat = (i: number) => {
+    setActiveMcat(i);
+    setVariant("with");
+  };
+  // Everything below reads the MCAT on screen, so one code path shows either kind of run.
+  const steps = mcats.length ? (activeState?.steps ?? []) : singleSteps;
+  const baseRun = mcats.length ? (activeState?.run ?? null) : singleRun;
   // Which result is on screen: the normal run, the same run without context, or their comparison.
   const [variant, setVariant] = useState<"with" | "without" | "similar">("with");
   const [tab, setTab] = useState<Tab>("table");
@@ -277,6 +350,7 @@ function Index() {
   const [sharedError, setSharedError] = useState<string | null>(null);
   const [savedLine, setSavedLine] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+  const resultRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     try {
@@ -343,6 +417,7 @@ function Index() {
       listingRows: productsFile ?? safeRows(productsText),
       demoListings,
       uiDesign,
+      separateMcats,
     }),
     [
       serpFile,
@@ -355,6 +430,7 @@ function Index() {
       productsText,
       demoListings,
       uiDesign,
+      separateMcats,
     ],
   );
 
@@ -390,9 +466,38 @@ function Index() {
 
   // Deferred so typing stays smooth while the preview/estimate recomputes.
   const deferredInputs = useDeferredValue(inputs);
+  // The MCATs in the product file, whether or not they are run separately (the switch must stay visible).
+  const mcatSlices = useMemo(
+    () => splitByMcat({ ...deferredInputs, separateMcats: true }),
+    [deferredInputs],
+  );
+  const splitting = separateMcats && mcatSlices.length > 1;
+  // Per MCAT, the keywords picked for it from the common files, and the cost of the whole run. Worked out
+  // one MCAT at a time in the background so a big product file doesn't freeze the page.
+  const mcatPlan = useMcatPlan(
+    mcatSlices,
+    deferredInputs.serpRows,
+    deferredInputs.internalRows,
+    splitting,
+  );
+  const mcatKeywordLines = mcatPlan.keywords;
+  // Many MCATs: only the MCAT on screen is previewed (the prompts of all of them are the estimate's job).
+  const previewMcat = splitting
+    ? (mcatSlices[Math.min(activeMcat, mcatSlices.length - 1)] ?? null)
+    : null;
   const previewRecords = useMemo(
-    () => (hasInput ? previewPrompts(deferredInputs) : []),
-    [deferredInputs, hasInput],
+    () =>
+      !hasInput
+        ? []
+        : splitting
+          ? previewMcat && showPrompt
+            ? previewPrompts(previewMcat.inputs).map((p) => ({
+                ...p,
+                title: `${previewMcat.name} · ${p.title}`,
+              }))
+            : []
+          : previewPrompts(deferredInputs),
+    [deferredInputs, hasInput, splitting, previewMcat, showPrompt],
   );
   const promptRecords: PromptRecord[] = !showPrompt
     ? []
@@ -401,13 +506,23 @@ function Index() {
       : previewRecords;
   // With a category context the run is repeated without it (labelling + design; the rest is cached).
   const estimate = useMemo(() => {
+    if (splitting) {
+      // Until every MCAT is worked through, the rest count as an average run each.
+      const left = mcatSlices.length - mcatPlan.progress;
+      const e = mcatPlan.estimate;
+      return {
+        calls: e.calls + left * 3,
+        inputTokens: e.inputTokens + left * EST_RUN_TOKENS.input,
+        outputTokens: e.outputTokens + left * EST_RUN_TOKENS.output,
+      };
+    }
     if (!previewRecords.length)
       return { calls: 3, inputTokens: EST_RUN_TOKENS.input, outputTokens: EST_RUN_TOKENS.output };
     const withoutCtx = deferredInputs.context.trim()
       ? previewPrompts({ ...deferredInputs, context: "" }).filter((r) => r.id !== "fields")
       : [];
     return estimateRun([...previewRecords, ...withoutCtx]);
-  }, [previewRecords, deferredInputs]);
+  }, [previewRecords, deferredInputs, splitting, mcatSlices.length, mcatPlan]);
 
   const [balance, setBalance] = useState<KeyBalance | null>(null);
   const [balanceError, setBalanceError] = useState("");
@@ -543,9 +658,16 @@ function Index() {
       setError("Enter your API key first.");
       return;
     }
+    // Several MCATs in the product file: one run each.
+    const slices = splitByMcat(inputs);
+    if (slices.length > 1) {
+      await generateMcats(slices, from);
+      return;
+    }
     const controller = new AbortController();
     abortRef.current = controller;
     setLoading(true);
+    setMcats([]);
     setRun(null);
     setSteps(INITIAL_STEPS.map((s) => ({ ...s })));
     try {
@@ -578,34 +700,110 @@ function Index() {
     }
   }
 
+  /**
+   * One run per MCAT, two at a time. Generate redoes every MCAT; re-running from a step redoes only
+   * the MCAT on screen and keeps the others. A failed MCAT doesn't stop the rest.
+   */
+  async function generateMcats(slices: McatSlice[], from?: StepId) {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setLoading(true);
+    const only =
+      from && mcats.length > 1 ? slices.findIndex((s) => s.name === activeState?.name) : -1;
+    const blank = (s: McatSlice): McatState => ({
+      name: s.name,
+      inputs: s.inputs,
+      status: "waiting",
+      steps: INITIAL_STEPS.map((x) => ({ ...x })),
+      run: null,
+      error: "",
+    });
+    const before = new Map(mcats.map((m) => [m.name, m]));
+    setMcats(
+      slices.map((s, i) => (only < 0 || i === only ? blank(s) : (before.get(s.name) ?? blank(s)))),
+    );
+    setActiveMcat(only >= 0 ? only : 0);
+    setRun(null);
+    setSteps([]);
+    setSavedLine("");
+    const toRun = only >= 0 ? [slices[only]!] : slices;
+    // Index in the run -> index in the list on screen.
+    const at = (i: number) => (only >= 0 ? only : i);
+    const update = (i: number, fn: (m: McatState) => McatState) =>
+      setMcats((cur) => cur.map((m, j) => (j === at(i) ? fn(m) : m)));
+    try {
+      await runMcats(settings, toRun, {
+        signal: controller.signal,
+        concurrency: MCAT_CONCURRENCY,
+        ...(from ? { from } : {}),
+        onStart: (i) => update(i, (m) => ({ ...m, status: "running" })),
+        onStep: (i, id, patch) =>
+          update(i, (m) => ({
+            ...m,
+            steps: m.steps.map((s) =>
+              s.id === id
+                ? {
+                    ...s,
+                    ...patch,
+                    ...(patch.status === "running" ? { startedAt: Date.now() } : {}),
+                  }
+                : s,
+            ),
+          })),
+        onDone: (i, run) => update(i, (m) => ({ ...m, status: "done", run })),
+        onError: (i, err) =>
+          update(i, (m) => ({
+            ...m,
+            status: "error",
+            error: err.name === "AbortError" ? "Stopped." : err.message,
+            steps: m.steps.map((s) => (s.status === "running" ? { ...s, status: "error" } : s)),
+          })),
+      });
+      // Stop leaves the MCATs that hadn't started: say so rather than leaving them "Waiting".
+      setMcats((cur) =>
+        cur.map((m) =>
+          m.status === "waiting" || m.status === "running"
+            ? { ...m, status: "error", error: "Stopped before it finished." }
+            : m,
+        ),
+      );
+      setVariant("with");
+      setTab("table");
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  }
+
   /** Inputs in the saved-run format: rows as JSON strings, docs as text. */
-  function currentBundle(): InputBundle {
+  function bundleOf(i: PipelineInputs): InputBundle {
     const rows = (r: Row[]) => (r.length ? JSON.stringify(r) : "");
     return {
-      serp: rows(inputs.serpRows),
-      internal: rows(inputs.internalRows),
-      context: inputs.context,
-      specs: inputs.specs,
-      products: rows(inputs.listingRows),
+      serp: rows(i.serpRows),
+      internal: rows(i.internalRows),
+      context: i.context,
+      specs: i.specs,
+      products: rows(i.listingRows),
     };
   }
+  const currentBundle = () => bundleOf(inputs);
 
   /**
    * Keeps the list in this browser. When the browser's quota is hit, the newest run is stored without
    * its keyword/listing files (context and ISQ ranking stay). Says what was kept for the newest run.
    */
-  function persistSaved(next: SavedRun[]): "full" | "no-rows" | "failed" {
+  function persistSaved(next: SavedRun[], fresh = 1): "full" | "no-rows" | "failed" {
     setSaved(next);
     try {
       localStorage.setItem(SAVED_KEY, JSON.stringify(next));
       return "full";
     } catch {
-      /* over the quota: retry without the newest run's big files */
+      /* over the quota: retry without the newest runs' big files */
     }
     try {
       localStorage.setItem(
         SAVED_KEY,
-        JSON.stringify(next.map((s, i) => (i === 0 ? withoutRows(s) : s))),
+        JSON.stringify(next.map((s, i) => (i < fresh ? withoutRows(s) : s))),
       );
       return "no-rows";
     } catch {
@@ -614,6 +812,23 @@ function Index() {
   }
 
   function downloadMarkdown(entry: SavedRun) {
+    if (entry.mcats?.length) {
+      // One section per MCAT; the inputs are in the .json download.
+      const md = entry.mcats
+        .map((m) =>
+          buildMarkdown({
+            name: m.name,
+            savedAt: entry.savedAt,
+            model: entry.model,
+            inputs: EMPTY_BUNDLE,
+            device: entry.device ?? "desktop",
+            result: m.result,
+          }),
+        )
+        .join("\n\n---\n\n");
+      download(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.md`, "text/markdown", md);
+      return;
+    }
     const common = {
       name: entry.name,
       savedAt: entry.savedAt,
@@ -635,6 +850,13 @@ function Index() {
 
   /** The same content as an Excel workbook: filters with / without context, rules, and similarity. */
   function downloadExcel(entry: SavedRun) {
+    if (entry.mcats?.length) {
+      downloadMcatWorkbook(
+        `${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.xlsx`,
+        entry.mcats.map((m) => ({ name: m.name, result: m.result })),
+      );
+      return;
+    }
     downloadWorkbook(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.xlsx`, {
       result: entry.result,
       ...(entry.withoutResult ? { withoutResult: entry.withoutResult } : {}),
@@ -651,26 +873,75 @@ function Index() {
     );
   }
 
-  /** Saves what Generate produced in this browser (and the website). Nothing is downloaded: the saved list has the download buttons. */
+  /**
+   * Saves what Generate produced in this browser (and the website). A multi-MCAT run is saved as ONE entry for
+   * its subcategory (named by the subcat id): open it to get the MCAT cards back, and click an MCAT to see its
+   * filters and values. Every save is kept as its own entry (save a subcategory twice and you get two); delete
+   * the ones you don't want from the saved list. Nothing is downloaded: the saved list has the download buttons.
+   */
   function saveResult() {
-    if (!baseRun) return;
-    const entry: SavedRun = {
-      id: `${Date.now()}`,
-      name: baseRun.result.category_name || "Untitled category",
-      savedAt: new Date().toISOString(),
-      model: settings.model,
-      result: baseRun.result,
-      inputs: currentBundle(),
-      tab,
-      device,
-      ...(baseRun.withoutContext && baseRun.comparison
-        ? { withoutResult: baseRun.withoutContext.result, comparison: baseRun.comparison }
-        : {}),
-    };
-    const local = persistSaved([entry, ...saved]);
-    const what = entry.withoutResult
-      ? `"${entry.name}": with and without context, plus how similar`
-      : `"${entry.name}"`;
+    const stamp = Date.now();
+    // MCATs with no result (failed, stopped, or never started) have nothing to save: say so.
+    const finished = mcats.length > 1 ? mcats.filter((m) => m.run) : [];
+    const unsaved = mcats.length > 1 ? mcats.filter((m) => !m.run).map((m) => m.name) : [];
+    const unsavedNote = unsaved.length ? ` Not saved, no result: ${unsaved.join(", ")}.` : "";
+    let entry: SavedRun;
+    if (mcats.length > 1) {
+      if (!finished.length) return;
+      const first = finished[0]!.run!.result;
+      const subcatId = first.subcat_id ?? "";
+      const subcatName = first.subcat_name ?? "";
+      entry = {
+        id: `${stamp}`,
+        name:
+          subcatId || subcatName
+            ? `${subcatName || "Subcategory"}${subcatId ? ` (subcat ${subcatId})` : ""}`
+            : `${finished.length} MCATs`,
+        savedAt: new Date(stamp).toISOString(),
+        model: settings.model,
+        result: first,
+        inputs: currentBundle(),
+        tab,
+        device,
+        ...(subcatId ? { subcat_id: subcatId } : {}),
+        ...(subcatName ? { subcat_name: subcatName } : {}),
+        mcats: finished.map((m) => ({
+          name: m.name,
+          result: m.run!.result,
+          warnings: m.run!.warnings,
+          usage: m.run!.usage,
+          calls: m.run!.calls,
+          // Smaller outputs than a single run's: a subcategory holds many MCATs in one saved entry.
+          ...(m.steps.length ? { steps: stepsForSave(m.steps, SAVED_MCAT_STEP_OUTPUT_CHARS) } : {}),
+        })),
+      };
+    } else {
+      if (!baseRun) return;
+      entry = {
+        id: `${stamp}`,
+        name: baseRun.result.category_name || "Untitled category",
+        savedAt: new Date(stamp).toISOString(),
+        model: settings.model,
+        result: baseRun.result,
+        inputs: currentBundle(),
+        tab,
+        device,
+        warnings: baseRun.warnings,
+        usage: baseRun.usage,
+        calls: baseRun.calls,
+        ...(steps.length ? { steps: stepsForSave(steps) } : {}),
+        ...(baseRun.withoutContext && baseRun.comparison
+          ? { withoutResult: baseRun.withoutContext.result, comparison: baseRun.comparison }
+          : {}),
+      };
+    }
+    const entries: SavedRun[] = [entry];
+    const local = persistSaved([entry, ...saved], 1);
+    const what = entry.mcats
+      ? `"${entry.name}" with ${entry.mcats.length} MCATs (${entry.mcats.map((m) => m.name).join(", ")})`
+      : entry.withoutResult
+        ? `"${entry.name}": with and without context, plus how similar`
+        : `"${entry.name}"`;
     // Say what didn't fit, so a saved run that comes back without its files isn't a surprise.
     const localNote =
       local === "no-rows"
@@ -678,29 +949,39 @@ function Index() {
         : local === "failed"
           ? " This browser's storage is full, so it isn't kept here — download it from the saved list to keep it."
           : "";
+    const notes = localNote + unsavedNote;
     if (sharedStorageEnabled) {
       setSaveNote(`Saving ${what} to the website…`);
-      addShared(entry)
-        .then((stored) => {
-          setSharedError("");
-          const siteNote =
-            stored === "no-rows"
-              ? " The keyword and listing files were too big for the website; the context and ISQ ranking were kept."
-              : stored === "results-only"
-                ? " The inputs were too big for the website; only the results were kept."
-                : "";
-          setSaveNote(`Saved ${what} — everyone with the link can open it.${siteNote}${localNote}`);
-        })
-        .catch((err: Error) => {
-          setSharedError(err.message);
-          setSaveNote(
-            `Saved on this device only — the website couldn't store it (${err.message}).${localNote}`,
+      Promise.allSettled(entries.map((e) => addShared(e)))
+        .then((settled) => {
+          const failed = settled.filter((s): s is PromiseRejectedResult => s.status === "rejected");
+          const stored: Stored[] = settled.flatMap((s) =>
+            s.status === "fulfilled" ? [s.value] : [],
           );
+          const why = failed.length ? (failed[0]!.reason as Error).message : "";
+          if (failed.length) setSharedError(why);
+          else setSharedError("");
+          if (failed.length === settled.length) {
+            setSaveNote(
+              `Saved on this device only — the website couldn't store it (${why}).${notes}`,
+            );
+          } else if (failed.length) {
+            setSaveNote(
+              `Saved ${what} on this device; ${failed.length} of ${settled.length} couldn't be stored on the website (${why}).${notes}`,
+            );
+          } else {
+            const siteNote = stored.includes("results-only")
+              ? " The inputs were too big for the website; only the results were kept."
+              : stored.includes("no-rows")
+                ? " The keyword and listing files were too big for the website; the context and ISQ ranking were kept."
+                : "";
+            setSaveNote(`Saved ${what} — everyone with the link can open it.${siteNote}${notes}`);
+          }
         })
         .finally(() => setTimeout(() => setSaveNote(""), 12000));
     } else {
-      setSaveNote(`Saved ${what} on this device.${localNote}`);
-      setTimeout(() => setSaveNote(""), localNote ? 12000 : 3500);
+      setSaveNote(`Saved ${what} on this device.${notes}`);
+      setTimeout(() => setSaveNote(""), notes ? 12000 : 3500);
     }
   }
 
@@ -719,9 +1000,40 @@ function Index() {
     setProductsFile(rowsFromBundle(i.products));
     setProductsText("");
     setProductsStatus(restored(i.products));
-    setRun(runFromSaved(entry));
+    if (entry.mcats?.length) {
+      // A saved subcategory: the MCAT cards come back, each with its own result; the product file's own
+      // split gives every MCAT its inputs again (for re-runs and the next save).
+      const base: PipelineInputs = {
+        serpRows: rowsFromBundle(i.serp) ?? [],
+        internalRows: rowsFromBundle(i.internal) ?? [],
+        context: i.context,
+        specs: i.specs,
+        listingRows: rowsFromBundle(i.products) ?? [],
+        demoListings,
+        uiDesign,
+        separateMcats: true,
+      };
+      const slices = splitByMcat(base);
+      setSeparateMcats(true);
+      setMcats(
+        entry.mcats.map((m) => ({
+          name: m.name,
+          inputs: slices.find((x) => x.name === m.name)?.inputs ?? { ...base, listingRows: [] },
+          status: "done",
+          steps: m.steps ?? [],
+          run: runFromSaved(m),
+          error: "",
+        })),
+      );
+      setActiveMcat(0);
+      setRun(null);
+      setSteps([]);
+    } else {
+      setMcats([]);
+      setRun(runFromSaved(entry));
+      setSteps(entry.steps ?? []);
+    }
     setVariant("with");
-    setSteps([]);
     setError("");
     setSavedLine(`Saved ${new Date(entry.savedAt).toLocaleString()} · ${entry.model}`);
     setDevice(entry.device ?? "desktop");
@@ -737,6 +1049,23 @@ function Index() {
       );
   }
 
+  /** Empties this browser's copy of the saved list. The website's shared copies are not touched. */
+  function clearLocalSaved() {
+    if (!window.confirm(`Remove all ${saved.length} saved results from this browser?`)) return;
+    setSaved([]);
+    try {
+      localStorage.removeItem(SAVED_KEY);
+    } catch {
+      /* storage unavailable */
+    }
+    setSaveNote(
+      sharedStorageEnabled
+        ? "Cleared this browser's saved results. Results saved on the website stay there and come back on reload; use Delete to remove one."
+        : "Cleared this browser's saved results.",
+    );
+    setTimeout(() => setSaveNote(""), 8000);
+  }
+
   function clearAll() {
     setSerpText("");
     setInternalText("");
@@ -749,6 +1078,8 @@ function Index() {
     setSerpStatus(null);
     setInternalStatus(null);
     setProductsStatus(null);
+    setMcats([]);
+    setActiveMcat(0);
     setRun(null);
     setSteps([]);
     setError("");
@@ -790,6 +1121,34 @@ function Index() {
     }
     return `${settings.model} · ${run.calls} call${run.calls === 1 ? "" : "s"} · in ${pin ?? "?"} tok · out ${pout ?? "?"} tok${cost}`;
   }, [run, preset, settings.model, savedLine]);
+
+  // Calls, tokens and cost across every finished MCAT of a multi-MCAT run.
+  const mcatTotals = useMemo(() => {
+    const runs = mcats.flatMap((m) => (m.run ? [m.run] : []));
+    if (!runs.length) return "";
+    const calls = runs.reduce((n, r) => n + r.calls, 0);
+    const pin = runs.reduce((n, r) => n + (r.usage.prompt_tokens ?? 0), 0);
+    const pout = runs.reduce((n, r) => n + (r.usage.completion_tokens ?? 0), 0);
+    let cost = "";
+    if (preset?.tier === "FREE") cost = " · free";
+    else if (preset && pin && pout) {
+      const usd = (preset.inputCost * pin) / 1e6 + (preset.outputCost * pout) / 1e6;
+      cost = ` · ~$${usd.toFixed(5)} (₹${(usd * USD_TO_INR).toFixed(2)})`;
+    }
+    return `${calls} calls · in ${pin} tok · out ${pout} tok${cost}`;
+  }, [mcats, preset]);
+  const finishedMcats = mcats.flatMap((m) =>
+    m.run
+      ? [
+          {
+            name: m.name,
+            result: m.run.result,
+            listings: m.inputs.listingRows.length,
+            keywords: mcatKeywordLines?.lines[m.name] ?? "",
+          },
+        ]
+      : [],
+  );
 
   const allPromptsText = promptRecords
     .map((p) =>
@@ -873,7 +1232,18 @@ function Index() {
               </ul>
             </div>
           ) : null}
-          <h2 className="font-display mb-1 text-sm font-semibold">Saved results</h2>
+          <div className="mb-1 flex items-center gap-2">
+            <h2 className="font-display text-sm font-semibold">Saved results</h2>
+            {saved.length ? (
+              <button
+                type="button"
+                onClick={clearLocalSaved}
+                className="ml-auto rounded-md border border-border px-3 py-1 text-xs font-medium text-destructive hover:bg-danger-soft"
+              >
+                Clear all (this browser)
+              </button>
+            ) : null}
+          </div>
           <p
             className={`mb-2 text-[11px] ${sharedError === "" ? "text-success" : sharedError ? "text-warning" : "text-muted-foreground"}`}
           >
@@ -895,8 +1265,11 @@ function Index() {
                   <div className="min-w-0">
                     <div className="truncate text-sm font-semibold">{s.name}</div>
                     <div className="font-mono text-[11px] text-muted-foreground">
-                      {new Date(s.savedAt).toLocaleString()} · {s.result.filters.length} filters ·{" "}
-                      {s.model}
+                      {new Date(s.savedAt).toLocaleString()} ·{" "}
+                      {s.mcats
+                        ? `${s.mcats.length} MCATs · ${s.mcats.reduce((n, m) => n + m.result.filters.length, 0)} filters`
+                        : `${s.result.filters.length} filters`}{" "}
+                      · {s.model}
                       {s.withoutResult ? " · with + without context" : ""}
                     </div>
                   </div>
@@ -1228,6 +1601,13 @@ function Index() {
           text={contextText}
           onTextChange={setContextText}
           onFile={async (f) => setContextText(await f.text())}
+          source={
+            <McatContextLoader
+              onLoad={(md) =>
+                setContextText((t) => (t.trim() ? `${t.trimEnd()}\n\n---\n\n${md}` : md))
+              }
+            />
+          }
           tall
         />
         <InputPanel
@@ -1261,6 +1641,21 @@ function Index() {
           className="md:col-span-2"
         />
       </div>
+
+      {mcatSlices.length > 1 ? (
+        <McatPlan
+          slices={mcatSlices}
+          separate={separateMcats}
+          onSeparateChange={setSeparateMcats}
+          hasKeywords={Boolean(inputs.serpRows.length || inputs.internalRows.length)}
+          keywordLines={mcatKeywordLines?.lines ?? {}}
+          keywordCheck={
+            mcatKeywordLines && mcatPlan.done
+              ? { withKeywords: mcatKeywordLines.withKeywords, top: mcatKeywordLines.top }
+              : null
+          }
+        />
+      ) : null}
 
       <label className="mt-3 flex items-start gap-2 text-xs text-muted-foreground">
         <input
@@ -1306,7 +1701,9 @@ function Index() {
             onClick={() => void generate()}
             className="rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
           >
-            Generate filter recommendations
+            {splitting
+              ? `Generate filters for ${mcatSlices.length} MCATs`
+              : "Generate filter recommendations"}
           </button>
         )}
         <button
@@ -1341,6 +1738,46 @@ function Index() {
         >
           Export CSV
         </button>
+        {mcats.length > 1 && finishedMcats.length > 0 ? (
+          <>
+            <button
+              type="button"
+              onClick={() =>
+                downloadMcatWorkbook(
+                  `filter-recommendations-${finishedMcats.length}-mcats.xlsx`,
+                  finishedMcats,
+                )
+              }
+              className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent"
+            >
+              Export all MCATs (.xlsx)
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                download(
+                  `filter-recommendations-${finishedMcats.length}-mcats.json`,
+                  "application/json",
+                  JSON.stringify(
+                    {
+                      mcats: finishedMcats.map((m) => ({
+                        name: m.name,
+                        mcat_id: m.result.mcat_id,
+                        pmcat: m.result.pmcat,
+                        result: m.result,
+                      })),
+                    },
+                    null,
+                    2,
+                  ),
+                )
+              }
+              className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent"
+            >
+              Export all MCATs (.json)
+            </button>
+          </>
+        ) : null}
         <button
           type="button"
           onClick={clearAll}
@@ -1353,6 +1790,9 @@ function Index() {
             {preset.tier === "FREE" ? "free" : `~₹${estINR}/run`} · {estimate.calls} model call
             {estimate.calls === 1 ? "" : "s"} · ~{(estimate.inputTokens / 1000).toFixed(1)}k in /{" "}
             {(estimate.outputTokens / 1000).toFixed(1)}k out tokens
+            {splitting && !mcatPlan.done
+              ? ` · counting MCAT ${mcatPlan.progress} of ${mcatSlices.length}…`
+              : ""}
           </span>
         ) : null}
       </div>
@@ -1361,7 +1801,9 @@ function Index() {
         <section className="panel mt-4 p-4">
           <div className="mb-1 flex flex-wrap items-center gap-2">
             <h2 className="label-caps">
-              {run ? "Prompts sent in the last run" : "Prompts (preview from your current inputs)"}
+              {run
+                ? `Prompts sent in the last run${mcats.length > 1 && activeState ? ` — ${activeState.name}` : ""}`
+                : "Prompts (preview from your current inputs)"}
             </h2>
             <button
               type="button"
@@ -1412,6 +1854,7 @@ function Index() {
                       {stageSkills(
                         p.stage,
                         p.stage === "design" && !uiDesign ? ["options"] : [],
+                        p.include ?? [],
                       ).map((s) => (
                         <span
                           key={s.id}
@@ -1460,6 +1903,10 @@ function Index() {
         <div className="mt-4 rounded-lg bg-danger-soft px-4 py-3 text-sm text-destructive">
           {error}
         </div>
+      ) : null}
+
+      {mcats.length > 1 ? (
+        <McatPanel items={mcats} active={activeMcat} onSelect={selectMcat} totals={mcatTotals} />
       ) : null}
 
       {steps.length ? (
@@ -1514,7 +1961,7 @@ function Index() {
       ) : null}
 
       {run && result && variant !== "similar" ? (
-        <section className={baseRun?.comparison ? "mt-2" : "mt-6"}>
+        <section ref={resultRef} className={baseRun?.comparison ? "mt-2" : "mt-6"}>
           <div className="mb-4 flex flex-wrap gap-3">
             {[
               { label: "Total filters", value: result.filters.length, tone: "" },
@@ -1540,6 +1987,15 @@ function Index() {
           {result.category_name ? (
             <p className="mb-3 text-sm">
               Category: <strong>{result.category_name}</strong>
+              {result.mcat_id ? (
+                <span className="ml-2 font-mono text-xs text-muted-foreground">
+                  MCAT ID {result.mcat_id}
+                  {result.pmcat ? ` · PMCAT ${result.pmcat.name}` : ""}
+                  {result.subcat_name || result.subcat_id
+                    ? ` · Subcat ${result.subcat_id ?? ""} ${result.subcat_name ?? ""}`
+                    : ""}
+                </span>
+              ) : null}
             </p>
           ) : null}
 
@@ -1626,12 +2082,17 @@ function Index() {
               className={`mb-2 ml-auto flex items-center gap-2 ${baseRun?.comparison ? "hidden" : ""}`}
             >
               {saveNote ? <span className="text-xs text-success">{saveNote}</span> : null}
+              {mcats.length > 1 ? (
+                <McatNav items={mcats} active={activeMcat} onSelect={selectMcat} />
+              ) : null}
               <button
                 type="button"
                 onClick={saveResult}
                 className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
               >
-                Save results
+                {finishedMcats.length > 1
+                  ? `Save all ${finishedMcats.length} MCATs`
+                  : "Save results"}
               </button>
             </div>
           </div>
@@ -1650,6 +2111,20 @@ function Index() {
 
           {usageLine ? (
             <p className="mt-2 font-mono text-[11px] text-muted-foreground">{usageLine}</p>
+          ) : null}
+
+          {mcats.length > 1 ? (
+            <div className="mt-4 flex justify-end">
+              {/* After a long table: go on to the next MCAT and come back to the top of its result. */}
+              <McatNav
+                items={mcats}
+                active={activeMcat}
+                onSelect={(i) => {
+                  selectMcat(i);
+                  resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              />
+            </div>
           ) : null}
         </section>
       ) : null}

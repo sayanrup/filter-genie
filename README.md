@@ -37,8 +37,10 @@ listings (5) ────▶ code: flatten JSON → field rules (ignore ids/urls
 context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT → filters linked to evidence rows
                                           (judgement only — which filter, which tier, why; no options)
                    code: fill in coverage / share / fill %, options and UI pattern from the links,
-                         auto-fix (Tier 1 = 3–5, real options, Tier 3 display-only, ISQ blockers)
-                         and list every fix
+                         auto-fix (at most 6 filters, Tier 1 = 3–5, real options, Tier 3 display-only,
+                         ISQ blockers) and list every fix
+                   model · step 4: NUMERIC RANGES (skill 14) → lower / upper bound for each numeric ISQ value
+                   code: keep a bound only when its number is in the option's own text
 ```
 
 Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.
@@ -119,6 +121,27 @@ Sep 2026, not permanent):
 
 If a provider rejects an optional parameter (JSON mode, reasoning, routing), the call is retried once without them.
 
+## A subcategory: several MCATs in one Generate
+
+If the product file holds more than one MCAT — a JSON array of wrappers, one per MCAT
+(`[{"input_mcat": {"id": "13467", "name": "Diesel Generator"}, "primary_pmcat": {...}, "products": [...]}, ...]`),
+a JSON with one array per MCAT (`{"portable-cabins": [...], "office-cabins": [...]}`), or an `mcat` column —
+the MCAT's **id** (`input_mcat.id`, or an `mcat_id` column) and primary PMCAT are read along with its name, shown on
+screen and put in the result, the Excel/Markdown/JSON exports and the saved run. Generate designs each MCAT's
+filters and ISQ values in its own run (one at a time, so the page stays responsive; one failing doesn't stop the rest). The page lists the
+MCATs before you start, with a switch to read them together as one category instead.
+
+| Input | What each MCAT gets |
+|-------|--------------------|
+| Product listings | **Its own listings** — fill rates, common values and price come from these alone (up to 5,000 rows per MCAT) |
+| SERP + internal keywords | **The files are common to all MCATs, but each MCAT works only on the keywords about it**, picked in code before any model call: each keyword is broken into words (run-together words are cut by a word-break DP; typos and other endings are clustered with the MCAT word they vary), looked up in a word index of every MCAT's name, primary PMCAT and own-listing words, and given to the MCAT whose name it covers best. Terms, labels, coverage and share are then that MCAT's own. An MCAT with fewer than 10 such keywords in a file runs without that file (a warning says so) |
+| Context doc, ISQ ranking | Shared, unless a line in them is just an MCAT's name (`## Portable Cabins`, `MCAT: Portable Cabins`): that starts the MCAT's own section, and text above the first one is shared |
+
+The page shows, before you run, how many keywords each MCAT got. Skills 12–13 tell the model to keep
+keyword-only dimensions out of the top tier, to skip keywords that name another MCAT, and never to make a
+filter whose options are the other MCATs. Results show one card per MCAT; **Save** stores each MCAT as its own saved result, and **Export all
+MCATs (.xlsx)** gives a summary, one flat sheet of every filter with an MCAT column, and a sheet per MCAT.
+
 ## Skill docs — the prompts live in `src/skills/`
 
 Every prompt is assembled from small markdown files, one per layer of the task, so you can improve one
@@ -142,6 +165,8 @@ system prompt for a stage = base.md + the "## Prompt" section of each skill doc 
 | `09-filter-options-and-ui.md` | Option lists & UI pattern — code only now, no prompt (see the file) | after step 3 |
 | `10-rationale-and-output.md` | Rationale, rules, blockers, JSON schema, worked example | master prompt |
 | `11-output-validation.md` | Code checks and automatic fixes (no prompt) | after step 3 |
+| `12-mcat-scope.md` | One MCAT of a subcategory; keywords are common to all MCATs | master prompt, multi-MCAT runs only |
+| `13-mcat-labelling.md` | Whose qualifiers to label when the keywords cover several MCATs | step 1, multi-MCAT runs only |
 
 Each skill doc has:
 
@@ -174,6 +199,7 @@ The **Skill docs** toggle in that panel shows each markdown file in full.
 |------|------|
 | `src/lib/data.ts` | Parsing, column detection, term mining, aggregation, listing flattening & profiling (no model) |
 | `src/lib/prompts.ts` | Builds each stage's user message (the data blocks) |
+| `src/lib/mcats.ts`, `src/lib/run-mcats.ts` | Splitting a product file into MCATs (listings, context sections), the keyword-share measure, and running the MCATs |
 | `src/lib/llm.ts` | OpenRouter/LiteLLM client: JSON mode, reasoning budget, price routing (with fallback), retry on 429/5xx |
 | `src/lib/filter-gen.ts` | The pipeline: prepare → label ∥ merge specs → design → link evidence & auto-fix; cache; cost estimate |
 | `src/lib/export.ts` | Markdown export for saved runs |

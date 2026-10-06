@@ -54,6 +54,10 @@ function readFilters(sheet: XLSX.WorkSheet): FilterRow[] {
       needs_new_isq: text(r["Needs new ISQ"]).toLowerCase() === "yes",
       isq_note: text(r["ISQ note"]) || null,
     };
+    const aiValues = text(r["AI suggested values"])
+      .split(/\s*,\s*/)
+      .filter(Boolean);
+    if (aiValues.length) row.ai_values = aiValues;
     if (sources.length) row.sources = sources;
     if (valueConfidence.length) row.value_confidence = valueConfidence;
     out.push(row);

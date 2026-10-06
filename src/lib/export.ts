@@ -1,5 +1,6 @@
 import { comparisonMarkdown, type ContextComparison } from "./compare";
 import type { FilterResult } from "./filter-gen";
+import { filterRangeText, rangeLines } from "./ranges";
 import { VALUE_CONFIDENCE_RULE, valuesWithConfidence } from "./value-confidence";
 
 /** Inputs as stored with a saved run: keyword/listing rows are JSON strings, docs are plain text. */
@@ -48,6 +49,11 @@ export function buildMarkdown(opts: {
   let md = `# Search filters — ${name}\n\n`;
   md += `- **Saved:** ${new Date(savedAt).toLocaleString()}\n`;
   md += `- **Model:** ${model}\n`;
+  if (result.subcat_name || result.subcat_id)
+    md += `- **Subcategory:** ${result.subcat_name ?? ""}${result.subcat_id ? ` (${result.subcat_id})` : ""}\n`;
+  if (result.mcat_id) md += `- **MCAT ID:** ${result.mcat_id}\n`;
+  if (result.pmcat)
+    md += `- **Primary PMCAT:** ${result.pmcat.name}${result.pmcat.id ? ` (${result.pmcat.id})` : ""}\n`;
   if (result.total_keywords_analyzed)
     md += `- **Keywords analysed:** ${result.total_keywords_analyzed}\n`;
   md += `- **Filters:** ${filters.length} (Tier 1: ${filters.filter((f) => f.tier === "Tier 1").length}, Tier 2: ${filters.filter((f) => f.tier === "Tier 2").length}, Tier 3: ${filters.filter((f) => f.tier === "Tier 3").length})\n`;
@@ -60,11 +66,23 @@ export function buildMarkdown(opts: {
 
   if (filters.some((f) => f.value_confidence?.length)) md += `\n_${VALUE_CONFIDENCE_RULE}_\n`;
 
+  const numeric = filters.filter((f) => f.ranges?.length || f.dimensions);
+  if (numeric.length) {
+    md += `\n## Numeric ranges (lower – upper)\n\n`;
+    for (const f of numeric) {
+      const options = rangeLines(f)
+        .map((l) => l.replace("  →  ", ": "))
+        .join("; ");
+      const note = f.dimensions?.note ? ` _(${f.dimensions.note})_` : "";
+      md += `- **${f.name}** — ${filterRangeText(f)} · ${options}${note}\n`;
+    }
+  }
+
   const isq = filters.filter((f) => f.needs_new_isq);
   if (isq.length) {
     md += `\n## Needs a new listing field\n\n`;
     isq.forEach((f) => {
-      md += `- **${f.name}** — ${f.isq_note || "Spec is not captured on listings today."}\n`;
+      md += `- **${f.name}** — ${f.isq_note || "Spec is not captured on listings today."}${f.ai_values?.length ? ` AI-suggested values: ${f.ai_values.join(", ")}.` : ""}\n`;
     });
   }
   if (result.interaction_rules?.length) {
