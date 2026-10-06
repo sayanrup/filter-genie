@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { StepView } from "@/components/StepCards";
 import type { McatSlice } from "@/lib/mcats";
 import type { PipelineInputs, PipelineRun } from "@/lib/filter-gen";
@@ -42,15 +43,36 @@ export function McatPlan({
   /** What the keyword file is about, and how many MCATs found keywords in it (null: no keyword file). */
   keywordCheck: { withKeywords: number; top: string[] } | null;
 }) {
+  // Closed until clicked: the list of MCATs and the notes under it are long. The switch stays in view.
+  const [shown, setShown] = useState(false);
+  const fewKeywords = Boolean(
+    separate && keywordCheck && keywordCheck.withKeywords * 2 < slices.length,
+  );
   return (
     <section className="panel mt-4 p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <h2 className="font-display text-sm font-semibold">
-          {slices.length} MCATs found in the product file
-          {slices[0]?.inputs.mcat?.subcat
-            ? ` · subcategory ${slices[0].inputs.mcat.subcat.id ?? ""} ${slices[0].inputs.mcat.subcat.name ?? ""}`
-            : ""}
-        </h2>
+        <button
+          type="button"
+          onClick={() => setShown((v) => !v)}
+          aria-expanded={shown}
+          title={shown ? "Click to hide the MCATs" : "Click to see the MCATs"}
+          className="min-w-0 rounded-md px-1 py-0.5 text-left hover:bg-accent/50"
+        >
+          <h2 className="font-display text-sm font-semibold">
+            <span className="mr-1.5 inline-block w-3 text-[11px] text-muted-foreground">
+              {shown ? "▼" : "▶"}
+            </span>
+            {slices.length} MCATs found in the product file
+            {slices[0]?.inputs.mcat?.subcat
+              ? ` · subcategory ${slices[0].inputs.mcat.subcat.id ?? ""} ${slices[0].inputs.mcat.subcat.name ?? ""}`
+              : ""}
+            {!shown && fewKeywords ? (
+              <span className="ml-2 rounded-full bg-warning-soft px-2 py-0.5 align-middle text-[10px] font-semibold text-warning-foreground">
+                ⚠ few keywords found
+              </span>
+            ) : null}
+          </h2>
+        </button>
         <label className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
           <input
             type="checkbox"
@@ -63,7 +85,7 @@ export function McatPlan({
           </span>
         </label>
       </div>
-      {separate ? (
+      {separate && shown ? (
         <>
           <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
             Each MCAT gets its own filters and ISQ values, from its own listings.{" "}
@@ -187,5 +209,64 @@ export function McatPanel({
         })}
       </div>
     </section>
+  );
+}
+
+/**
+ * Previous / next MCAT with a result, and a list to jump to any of them. Sits beside the filter table so
+ * the MCATs can be read one after another without going back up to the cards.
+ */
+export function McatNav({
+  items,
+  active,
+  onSelect,
+}: {
+  items: McatState[];
+  active: number;
+  onSelect: (index: number) => void;
+}) {
+  // Only MCATs that have a result: one still waiting or running has nothing to show yet.
+  const ready = items.flatMap((m, i) => (m.run ? [i] : []));
+  const pos = ready.indexOf(active);
+  const prev = pos > 0 ? ready[pos - 1] : undefined;
+  const next = pos >= 0 && pos < ready.length - 1 ? ready[pos + 1] : undefined;
+  const btn =
+    "rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-semibold transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40";
+  return (
+    <div className="flex flex-wrap items-center gap-1.5" aria-label="Move between MCATs">
+      <button
+        type="button"
+        disabled={prev === undefined}
+        onClick={() => prev !== undefined && onSelect(prev)}
+        className={btn}
+        title="Previous MCAT"
+      >
+        ◀ Prev
+      </button>
+      <select
+        value={active}
+        onChange={(e) => onSelect(Number(e.target.value))}
+        aria-label="Jump to an MCAT"
+        className="max-w-52 truncate rounded-md border border-border bg-card px-2 py-1.5 text-xs"
+      >
+        {ready.map((i) => (
+          <option key={items[i]!.name} value={i}>
+            {i + 1}. {items[i]!.name}
+          </option>
+        ))}
+      </select>
+      <span className="font-mono text-[11px] text-muted-foreground">
+        {pos >= 0 ? pos + 1 : "–"}/{ready.length}
+      </span>
+      <button
+        type="button"
+        disabled={next === undefined}
+        onClick={() => next !== undefined && onSelect(next)}
+        className={btn}
+        title="Next MCAT"
+      >
+        Next ▶
+      </button>
+    </div>
   );
 }

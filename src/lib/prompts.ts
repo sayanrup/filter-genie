@@ -10,6 +10,7 @@ import {
 } from "./data";
 import { composeSystemPrompt, MCAT_SKILLS } from "@/skills";
 import { describeKeywordSelection, type McatScope } from "./mcats";
+import type { FilterRow } from "./filter-gen";
 
 /*
  * System prompts are assembled from the skill docs in src/skills (base.md + one .md per layer).
@@ -17,6 +18,7 @@ import { describeKeywordSelection, type McatScope } from "./mcats";
  *   1. term labelling    — mined keyword terms (the ones code couldn't label itself)
  *   2. field mapping     — canonical spec names to merge or drop
  *   3. filter design     — the computed evidence (dimension tables, context, ranking, listing profile)
+ *   4. numeric ranges    — the final filters with their ISQ values (lower / upper bounds, skill 14)
  * All numbers the model sees in step 3 are computed by code, so it never has to add anything up.
  * Every block is kept as small as it can be: input tokens are the bulk of a run's cost.
  */
@@ -215,6 +217,46 @@ export function buildFieldMapUser(
   return [
     `${listingCount} listings.`,
     block("SPECS", `spec name | filled | samples\n${lines.join("\n")}`),
+  ].join("\n");
+}
+
+// ───────────────────────────── 4 · numeric ranges ─────────────────────────────
+
+export const RANGES_SYSTEM = composeSystemPrompt("ranges");
+
+/**
+ * The final filters with all their ISQ values, for the ranges step (skill 14). Only filters with a digit in
+ * some value are sent: a filter without one can't hold a quantity. The listing stats say what kind of
+ * quantity it is and in what unit; the bounds themselves come from the value text.
+ */
+export function buildRangesUser(filters: FilterRow[], listing: ListingProfile | null) {
+  const key = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const sendable = filters.filter((f) => f.values.some((v) => /\d/.test(v)));
+  const lines = sendable.map((f, i) => {
+    const spec = f.linked_listing_spec
+      ? listing?.fields.find((x) => key(x.key) === key(f.linked_listing_spec!))
+      : undefined;
+    const out = [`${i + 1}. ${f.name} · ${f.tier}`, `   values: ${f.values.join(" | ")}`];
+    if (spec)
+      out.push(
+        `   listings: spec "${spec.key}" filled ${spec.fillPct}% (${spec.filled} of ${listing?.count ?? "?"} listings) · ${spec.distinct} distinct values · values with listing counts: ${(
+          spec.all ?? spec.top
+        )
+          .slice(0, 30)
+          .map(([v, n]) => `${v.slice(0, 30)} (${n})`)
+          .join(", ")}`,
+      );
+    if (/price|budget|cost/i.test(f.name) && listing?.price) {
+      const p = listing.price;
+      out.push(
+        `   priced listings: ${p.n}${p.unit ? ` per ${p.unit}` : ""} · min ₹${fmt(p.min)} · 25th pct ₹${fmt(p.p25)} · median ₹${fmt(p.median)} · 75th pct ₹${fmt(p.p75)} · max ₹${fmt(p.max)}`,
+      );
+    }
+    return out.join("\n");
+  });
+  return [
+    `${sendable.length} filter(s) with numbers in their values.`,
+    block("FILTERS", lines.join("\n")),
   ].join("\n");
 }
 

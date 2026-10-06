@@ -1,6 +1,7 @@
 import * as XLSX from "xlsx";
 import type { ContextComparison } from "./compare";
 import type { FilterResult } from "./filter-gen";
+import { filterRangeText, sizeText } from "./ranges";
 import { valuesWithConfidence } from "./value-confidence";
 
 const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
@@ -15,6 +16,10 @@ function filterRows(result: FilterResult) {
       Filter: f.name,
       "UI pattern": f.ui_pattern,
       Values: valuesWithConfidence(f).join(", "),
+      // The whole filter as one range, e.g. "₹750 – ₹2,10,000"; empty for a non-numeric filter.
+      Range: filterRangeText(f) ?? "",
+      // Values the AI suggests adding to the seller form (not on listings yet).
+      "AI suggested values": (f.ai_values ?? []).join(", "),
       Confidence: f.confidence,
       Why: f.rationale,
       "Coverage %": f.coverage_pct ?? "",
@@ -32,6 +37,8 @@ function valueRows(result: FilterResult) {
     .sort((a, b) => (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank)
     .flatMap((f) => {
       const byValue = new Map((f.value_confidence ?? []).map((v) => [v.value, v]));
+      const rangeOf = new Map((f.ranges ?? []).map((r) => [r.value, r]));
+      const sizeOf = new Map((f.dimensions?.options ?? []).map((o) => [o.value, o]));
       return (f.values ?? []).map((value) => ({
         Tier: f.tier,
         Filter: f.name,
@@ -39,11 +46,21 @@ function valueRows(result: FilterResult) {
         "ISQ value": value,
         "Value confidence": byValue.get(value)?.level ?? "",
         Evidence: byValue.get(value)?.why ?? "",
+        // Lower and upper bound of a numeric value; empty for a non-numeric one, and for an open end.
+        Lower: rangeOf.get(value)?.min ?? "",
+        Upper: rangeOf.get(value)?.max ?? "",
+        Unit:
+          rangeOf.get(value)?.unit ?? (f.dimensions && sizeOf.has(value) ? f.dimensions.unit : ""),
+        // A size value ("10x12 ft"): its number on each axis, in the filter's unit.
+        Size: f.dimensions && sizeOf.has(value) ? sizeText(f.dimensions, sizeOf.get(value)!) : "",
+        // Share of all the listings whose value falls in this range, and how many listings that is.
+        "Listing fill %": rangeOf.get(value)?.fill_pct ?? "",
+        Listings: rangeOf.get(value)?.listings ?? "",
       }));
     });
 }
 
-const VALUE_WIDTHS = [8, 24, 16, 30, 16, 70];
+const VALUE_WIDTHS = [8, 24, 16, 30, 16, 70, 12, 12, 12, 34, 14, 10];
 
 function rulesRows(result: FilterResult) {
   return [
@@ -88,7 +105,7 @@ function addSheet(wb: XLSX.WorkBook, name: string, sheet: XLSX.WorkSheet, widths
   XLSX.utils.book_append_sheet(wb, sheet, name);
 }
 
-const FILTER_WIDTHS = [4, 8, 24, 16, 40, 11, 60, 11, 15, 13, 13, 30, 20];
+const FILTER_WIDTHS = [4, 8, 24, 16, 40, 24, 30, 11, 60, 11, 15, 13, 13, 30, 20];
 
 /** One workbook with everything a Generate produced: filters (with / without context), rules, similarity. */
 export function buildWorkbook(opts: {

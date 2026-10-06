@@ -37,8 +37,10 @@ listings (5) ────▶ code: flatten JSON → field rules (ignore ids/urls
 context (3) + ranking (4) + evidence ──▶ model · step 3: MASTER PROMPT → filters linked to evidence rows
                                           (judgement only — which filter, which tier, why; no options)
                    code: fill in coverage / share / fill %, options and UI pattern from the links,
-                         auto-fix (Tier 1 = 3–5, real options, Tier 3 display-only, ISQ blockers)
-                         and list every fix
+                         auto-fix (at most 6 filters, Tier 1 = 3–5, real options, Tier 3 display-only,
+                         ISQ blockers) and list every fix
+                   model · step 4: NUMERIC RANGES (skill 14) → lower / upper bound for each numeric ISQ value
+                   code: keep a bound only when its number is in the option's own text
 ```
 
 Steps 1 and 2 run in parallel and are skipped when there's nothing for them to do.

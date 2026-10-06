@@ -131,6 +131,8 @@ export function StepCards({
   onRerun: (from: StepId) => void;
 }) {
   const [open, setOpen] = useState<Partial<Record<StepId, boolean>>>({});
+  // The whole section starts closed; the header still says how far the run is.
+  const [shown, setShown] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const running = steps.some((s) => s.status === "running");
 
@@ -153,8 +155,29 @@ export function StepCards({
 
   return (
     <section className="mt-4">
-      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="font-display text-base font-semibold">Watch it work</h2>
+      <button
+        type="button"
+        onClick={() => setShown((v) => !v)}
+        aria-expanded={shown}
+        title={shown ? "Click to hide the steps" : "Click to see the steps"}
+        className="mb-2 flex w-full flex-wrap items-baseline justify-between gap-2 rounded-lg px-1 py-1 text-left hover:bg-accent/50"
+      >
+        <h2 className="font-display text-base font-semibold">
+          <span className="mr-1.5 inline-block w-3 text-[11px] text-muted-foreground">
+            {shown ? "▼" : "▶"}
+          </span>
+          Watch it work
+          {!shown && running ? (
+            <span className="ml-2 rounded-full bg-primary-soft px-2 py-0.5 align-middle text-[10px] font-semibold text-primary">
+              ● Running
+            </span>
+          ) : null}
+          {!shown && !running && steps.some((s) => s.status === "error") ? (
+            <span className="ml-2 rounded-full bg-danger-soft px-2 py-0.5 align-middle text-[10px] font-semibold text-destructive">
+              ! A step failed
+            </span>
+          ) : null}
+        </h2>
         <div className="font-mono text-[11px] text-muted-foreground">
           {doneCount}/{steps.length} steps · {totals.calls} model call
           {totals.calls === 1 ? "" : "s"} · {fmtTokens(totals.inT)} in · {fmtTokens(totals.outT)}{" "}
@@ -165,9 +188,9 @@ export function StepCards({
               ? ` · ${fmtInr(runCostInr(preset, totals.inT, totals.outT))}`
               : ""}
         </div>
-      </div>
+      </button>
 
-      <ol className="grid gap-3">
+      <ol className={`grid gap-3 ${shown ? "" : "hidden"}`}>
         {steps.map((s, i) => {
           const pill = STATUS_PILL[s.status];
           const elapsed = s.status === "running" && s.startedAt ? now - s.startedAt : s.ms;

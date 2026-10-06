@@ -35,6 +35,7 @@ import {
 import {
   FIELD_MAP_SYSTEM,
   LABEL_RETRY_NOTE,
+  RANGES_SYSTEM,
   TERM_LABEL_SYSTEM,
   TERM_LABEL_SYSTEM_MCAT,
   designSystemFor,
@@ -43,8 +44,16 @@ import {
   formatLakh,
   type PromptBudget,
   buildFieldMapUser,
+  buildRangesUser,
   buildTermLabelUser,
 } from "./prompts";
+import {
+  applyRanges,
+  filterRangeText,
+  rangeLines,
+  type DimensionSpec,
+  type ValueRange,
+} from "./ranges";
 import type { ContextComparison } from "./compare";
 import {
   MIN_MCAT_KEYWORDS,
@@ -77,6 +86,12 @@ export interface FilterRow {
   listing_fill_pct?: number | null;
   needs_new_isq?: boolean;
   isq_note?: string | null;
+  /**
+   * Option values the model suggests adding to the seller form when this filter needs a new ISQ ("PEB",
+   * "Modular", "LGSF"): the values of the red note, shown as "AI suggested" beside the real ones. Not in
+   * `values`, so they carry no confidence, range or fill rate.
+   */
+  ai_values?: string[];
   /** The resolved evidence keys this filter is linked to (set by attachEvidence, never the model's
    *  raw string) — lets the UI show the exact dimension/spec rows this filter's numbers came from. */
   linked_dimension?: string | null;
@@ -86,6 +101,21 @@ export interface FilterRow {
    * check step, so a saved result keeps it). Absent when the filter has no linked evidence.
    */
   value_confidence?: ValueConfidence[];
+  /**
+   * Lower and upper bound of each numeric option ("5,001 - 10,000 sq ft" → 5001 … 10000), from the ranges
+   * step (skill 14). Absent on filters that aren't numeric and on results saved before that step existed.
+   */
+  ranges?: ValueRange[];
+  /**
+   * For a filter whose values are sizes with several numbers ("10x12 ft"): one slider per axis, each with a
+   * lower and upper limit in one unit (skill 14). Set instead of `ranges`.
+   */
+  dimensions?: DimensionSpec;
+  /**
+   * When the exact values of a numeric filter ("2.5 m", "4 Meter", "5 m") were folded into ranges or turned
+   * into buckets ("Less than 2.5 m", "2.5 to 4 m", …), the exact values that were replaced.
+   */
+  exact_values?: string[];
 }
 
 export interface FilterResult {
@@ -123,7 +153,7 @@ export interface PipelineInputs {
 
 export type { StageId };
 
-export type StepId = "prepare" | "label" | "fields" | "design" | "check";
+export type StepId = "prepare" | "label" | "fields" | "design" | "check" | "ranges";
 export type StepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
 export interface StepStat {
@@ -306,6 +336,13 @@ export const INITIAL_STEPS: Step[] = [
       "Code fills in coverage, share and fill rates from the evidence links, then enforces the tier rules and cleans options. No repair call.",
     status: "pending",
   },
+  {
+    id: "ranges",
+    label: "Lower & upper bounds",
+    description:
+      "Sends the final ISQ values to the model, which gives each numeric one (price, size, capacity…) a lower and an upper bound. Code keeps a bound only when the number is in the value's own text.",
+    status: "pending",
+  },
 ];
 
 /** Prompt messages as readable text for the "See the working" panel. */
@@ -421,6 +458,7 @@ const STEP_NAME = {
   label: "keyword-labelling",
   fields: "spec-merging",
   design: "master (filter design)",
+  ranges: "numeric-ranges",
 } as const;
 
 const COMPACT_NOTE = (step: string) =>
@@ -487,6 +525,21 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
             ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
             : "",
         ),
+      },
+    ],
+  });
+  out.push({
+    id: "ranges",
+    stage: "ranges",
+    title: "4 · Numeric ranges — lower and upper bounds",
+    messages: [
+      { role: "system", content: RANGES_SYSTEM },
+      {
+        role: "user",
+        content:
+          "[Preview: at run time this lists the final filters (at most " +
+          MAX_FILTERS +
+          ") that have numbers in their ISQ values, with every value and the listing stats behind it.]",
       },
     ],
   });
@@ -600,6 +653,17 @@ function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } 
       rationale: String(f?.rationale ?? "").trim(),
       needs_new_isq: Boolean(f?.needs_new_isq),
       isq_note: f?.isq_note ? String(f.isq_note) : null,
+      ...(Array.isArray(f?.suggested_values)
+        ? {
+            ai_values: [
+              ...new Set(
+                f.suggested_values
+                  .map((v: unknown) => String(v).trim().slice(0, 40))
+                  .filter(Boolean),
+              ),
+            ] as string[],
+          }
+        : {}),
     };
   });
   const result: FilterResult = {
@@ -771,6 +835,10 @@ export function attachEvidence(
 }
 
 const MAX_OPTIONS = 12;
+/** Filters shown in a panel, across all tiers: more than this is noise for a buyer (and for a reviewer). */
+export const MAX_FILTERS = 6;
+/** AI-suggested ISQ values shown beside a filter's real values (see `FilterRow.ai_values`). */
+const MAX_AI_VALUES = 6;
 
 /**
  * Deterministic fixes instead of a second (full-price) model call. Returns a note per change so
@@ -854,11 +922,38 @@ export function fixResult(
       );
   }
 
+  // At most MAX_FILTERS in all: the best tier first, then the model's own rank within a tier.
+  if (r.filters.length > MAX_FILTERS) {
+    const order: Record<Tier, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
+    const ranked = [...r.filters].sort((a, b) => order[a.tier] - order[b.tier] || a.rank - b.rank);
+    const dropped = ranked.slice(MAX_FILTERS);
+    const keep = new Set(ranked.slice(0, MAX_FILTERS));
+    r.filters = r.filters.filter((f) => keep.has(f));
+    fixes.push(
+      `Kept the top ${MAX_FILTERS} of ${ranked.length} filters; left out ${dropped
+        .map((f) => `"${f.name}" (${f.tier})`)
+        .join(", ")}.`,
+    );
+  }
+
   // Renumber ranks 1…n per tier, keeping the model's order (promoted filters go last in Tier 1).
   for (const t of ["Tier 1", "Tier 2", "Tier 3"] as Tier[]) {
     const inTier = r.filters.filter((f) => f.tier === t);
     const original = new Map(inTier.map((f) => [f, f.rank]));
     inTier.sort((a, b) => original.get(a)! - original.get(b)!).forEach((f, i) => (f.rank = i + 1));
+  }
+
+  // Values the model suggests adding to the seller form (the red "needs a new ISQ" note): shown as AI
+  // suggestions beside the real values, never mixed into them. Only for a filter that needs a new ISQ,
+  // without duplicates of an existing value, at most MAX_AI_VALUES.
+  for (const f of r.filters) {
+    if (!f.ai_values?.length) continue;
+    const have = new Set(f.values.map(norm));
+    const fresh = f.needs_new_isq
+      ? f.ai_values.filter((v) => !have.has(norm(v)) && have.add(norm(v)))
+      : [];
+    if (fresh.length) f.ai_values = fresh.slice(0, MAX_AI_VALUES);
+    else delete f.ai_values;
   }
 
   // Every ISQ gap gets a blocker.
@@ -1024,7 +1119,7 @@ export async function runPipeline(
    * compact form if the provider says it's too long for the model.
    */
   const ask = async (
-    id: "label" | "fields" | "design",
+    id: "label" | "fields" | "design" | "ranges",
     title: string,
     build: (budget: PromptBudget) => ChatMessage[],
     maxTokens: number,
@@ -1371,6 +1466,77 @@ export async function runPipeline(
         .join("\n")}`,
   });
 
+  // 6 · lower and upper bounds for the numeric ISQ values: one small call on the final filters. Code keeps
+  // a bound only when its number is in the option's own text, so a failure here only leaves plain labels.
+  if (!result.filters.some((f) => f.values.some((v) => /\d/.test(v)))) {
+    step("ranges", "skipped", { calls: 0, detail: "no ISQ value has a number" });
+  } else {
+    step("ranges", "running");
+    try {
+      const {
+        data,
+        cached,
+        usage: rangesUsage,
+        compact,
+      } = await ask(
+        "ranges",
+        "4 · Numeric ranges — lower and upper bounds",
+        () => [
+          { role: "system", content: RANGES_SYSTEM },
+          { role: "user", content: buildRangesUser(result.filters, listing) },
+        ],
+        2500,
+        "off",
+        from !== "ranges" && from !== "prepare",
+      );
+      const applied = applyRanges(result.filters, data, listing);
+      if (applied.skipped.length)
+        warnings.push(
+          `Ranges: ${applied.skipped.length} option(s) stay plain labels because the bounds the model gave aren't in the option's own text (${applied.skipped.slice(0, 5).join("; ")}${applied.skipped.length > 5 ? "; …" : ""}).`,
+        );
+      step("ranges", "done", {
+        calls: cached ? 0 : 1,
+        cached,
+        usage: rangesUsage,
+        detail: `${applied.options} option(s) in ${applied.filters} filter(s) have bounds${applied.inferred ? ` · ${applied.inferred} read by code` : ""}${applied.regrouped ? ` · ${applied.regrouped} regrouped` : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+        stats: [
+          { label: "filters with bounds", value: applied.filters },
+          { label: "options with bounds", value: applied.options },
+          { label: "filters read by code", value: applied.inferred },
+          { label: "filters regrouped into ranges", value: applied.regrouped },
+          { label: "options left as labels", value: applied.skipped.length },
+        ],
+        output: [
+          ...result.filters
+            .filter((f) => f.ranges?.length || f.dimensions)
+            .map(
+              (f) =>
+                `${f.name}  (${filterRangeText(f)}):\n${rangeLines(f)
+                  .map((l) => `  ${l}`)
+                  .join("\n")}`,
+            ),
+          JSON.stringify(data, null, 2),
+        ].join("\n\n"),
+      });
+    } catch (err) {
+      if ((err as Error).name === "AbortError") throw err;
+      // The model call failed: code still reads the numeric filters, so none is left unprocessed.
+      let applied = { inferred: 0 };
+      try {
+        applied = applyRanges(result.filters, null, listing);
+      } catch {
+        // the filters stay as plain labels
+      }
+      warnings.push(
+        `Numeric ranges: the model call failed (${(err as Error).message}); ${applied.inferred ? `${applied.inferred} filter(s) were read by code instead` : "no filter could be read by code, so the ISQ values stay as plain labels"}.`,
+      );
+      step("ranges", "error", {
+        detail: `model call failed · ${applied.inferred} filter(s) read by code`,
+        output: (err as Error).message,
+      });
+    }
+  }
+
   // A multi-MCAT run is named after its MCAT, not after whatever the model made of the shared keywords.
   if (prep.mcat) {
     result.category_name = prep.mcat.name;
@@ -1409,6 +1575,12 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
       // three required parts, interaction_rules are more detailed, and the model has room for a
       // brief reasoning pass per candidate (skill 08) — sized for that, not for minimum output.
       outputTokens += p.messages[1]?.content.includes("UI DESIGN IS SWITCHED OFF") ? 1400 : 2200;
+  }
+  // The ranges prompt is only a placeholder before the run: its real message lists up to MAX_FILTERS filters
+  // with all their values, and the answer is one entry per numeric option.
+  if (prompts.some((p) => p.id === "ranges")) {
+    inputTokens += 700;
+    outputTokens += 500;
   }
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;

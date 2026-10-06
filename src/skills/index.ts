@@ -17,6 +17,7 @@ import s10 from "./10-rationale-and-output.md?raw";
 import s11 from "./11-output-validation.md?raw";
 import s12 from "./12-mcat-scope.md?raw";
 import s13 from "./13-mcat-labelling.md?raw";
+import s14 from "./14-numeric-ranges.md?raw";
 
 export interface SkillDoc {
   id: string;
@@ -56,11 +57,12 @@ export const SKILLS = {
   validation: doc("validation", "11-output-validation.md", s11),
   mcatScope: doc("mcatScope", "12-mcat-scope.md", s12),
   mcatLabelling: doc("mcatLabelling", "13-mcat-labelling.md", s13),
+  numericRanges: doc("numericRanges", "14-numeric-ranges.md", s14),
 } satisfies Record<string, SkillDoc>;
 
 export type SkillId = keyof typeof SKILLS;
 
-export type StageId = "label" | "fields" | "design";
+export type StageId = "label" | "fields" | "design" | "ranges";
 
 /** Which skill docs make up each stage's system prompt, in order (base.md is always first). */
 export const STAGES: Record<StageId, { title: string; skills: SkillId[] }> = {
@@ -79,6 +81,7 @@ export const STAGES: Record<StageId, { title: string; skills: SkillId[] }> = {
       "output",
     ],
   },
+  ranges: { title: "Numeric ranges — lower and upper bounds", skills: ["numericRanges"] },
 };
 
 const DIVIDER = "\n\n---\n\n";

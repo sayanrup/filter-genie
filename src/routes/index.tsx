@@ -41,7 +41,7 @@ import {
 } from "@/lib/filter-gen";
 import { SKILLS, stageSkills } from "@/skills";
 import { StepCards, type StepView } from "@/components/StepCards";
-import { McatPanel, McatPlan, type McatState } from "@/components/McatPanel";
+import { McatNav, McatPanel, McatPlan, type McatState } from "@/components/McatPanel";
 import {
   describeKeywordSelection,
   selectMcatKeywords,
@@ -332,6 +332,10 @@ function Index() {
   const [activeMcat, setActiveMcat] = useState(0);
   const [separateMcats, setSeparateMcats] = useState(true);
   const activeState = mcats[activeMcat];
+  const selectMcat = (i: number) => {
+    setActiveMcat(i);
+    setVariant("with");
+  };
   // Everything below reads the MCAT on screen, so one code path shows either kind of run.
   const steps = mcats.length ? (activeState?.steps ?? []) : singleSteps;
   const baseRun = mcats.length ? (activeState?.run ?? null) : singleRun;
@@ -346,6 +350,7 @@ function Index() {
   const [sharedError, setSharedError] = useState<string | null>(null);
   const [savedLine, setSavedLine] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+  const resultRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     try {
@@ -871,8 +876,8 @@ function Index() {
   /**
    * Saves what Generate produced in this browser (and the website). A multi-MCAT run is saved as ONE entry for
    * its subcategory (named by the subcat id): open it to get the MCAT cards back, and click an MCAT to see its
-   * filters and values. Saving the same subcategory again replaces the earlier save. Nothing is downloaded: the
-   * saved list has the download buttons.
+   * filters and values. Every save is kept as its own entry (save a subcategory twice and you get two); delete
+   * the ones you don't want from the saved list. Nothing is downloaded: the saved list has the download buttons.
    */
   function saveResult() {
     const stamp = Date.now();
@@ -881,7 +886,6 @@ function Index() {
     const unsaved = mcats.length > 1 ? mcats.filter((m) => !m.run).map((m) => m.name) : [];
     const unsavedNote = unsaved.length ? ` Not saved, no result: ${unsaved.join(", ")}.` : "";
     let entry: SavedRun;
-    let replaced: SavedRun[] = [];
     if (mcats.length > 1) {
       if (!finished.length) return;
       const first = finished[0]!.run!.result;
@@ -911,7 +915,6 @@ function Index() {
           ...(m.steps.length ? { steps: stepsForSave(m.steps, SAVED_MCAT_STEP_OUTPUT_CHARS) } : {}),
         })),
       };
-      replaced = subcatId ? saved.filter((s) => s.mcats && s.subcat_id === subcatId) : [];
     } else {
       if (!baseRun) return;
       entry = {
@@ -933,11 +936,7 @@ function Index() {
       };
     }
     const entries: SavedRun[] = [entry];
-    const local = persistSaved([entry, ...saved.filter((s) => !replaced.includes(s))], 1);
-    if (sharedStorageEnabled) for (const r of replaced) removeShared(r.id).catch(() => undefined);
-    const replacedNote = replaced.length
-      ? " It replaced the earlier save of this subcategory."
-      : "";
+    const local = persistSaved([entry, ...saved], 1);
     const what = entry.mcats
       ? `"${entry.name}" with ${entry.mcats.length} MCATs (${entry.mcats.map((m) => m.name).join(", ")})`
       : entry.withoutResult
@@ -950,7 +949,7 @@ function Index() {
         : local === "failed"
           ? " This browser's storage is full, so it isn't kept here — download it from the saved list to keep it."
           : "";
-    const notes = localNote + unsavedNote + replacedNote;
+    const notes = localNote + unsavedNote;
     if (sharedStorageEnabled) {
       setSaveNote(`Saving ${what} to the website…`);
       Promise.allSettled(entries.map((e) => addShared(e)))
@@ -1907,15 +1906,7 @@ function Index() {
       ) : null}
 
       {mcats.length > 1 ? (
-        <McatPanel
-          items={mcats}
-          active={activeMcat}
-          onSelect={(i) => {
-            setActiveMcat(i);
-            setVariant("with");
-          }}
-          totals={mcatTotals}
-        />
+        <McatPanel items={mcats} active={activeMcat} onSelect={selectMcat} totals={mcatTotals} />
       ) : null}
 
       {steps.length ? (
@@ -1970,7 +1961,7 @@ function Index() {
       ) : null}
 
       {run && result && variant !== "similar" ? (
-        <section className={baseRun?.comparison ? "mt-2" : "mt-6"}>
+        <section ref={resultRef} className={baseRun?.comparison ? "mt-2" : "mt-6"}>
           <div className="mb-4 flex flex-wrap gap-3">
             {[
               { label: "Total filters", value: result.filters.length, tone: "" },
@@ -2091,6 +2082,9 @@ function Index() {
               className={`mb-2 ml-auto flex items-center gap-2 ${baseRun?.comparison ? "hidden" : ""}`}
             >
               {saveNote ? <span className="text-xs text-success">{saveNote}</span> : null}
+              {mcats.length > 1 ? (
+                <McatNav items={mcats} active={activeMcat} onSelect={selectMcat} />
+              ) : null}
               <button
                 type="button"
                 onClick={saveResult}
@@ -2117,6 +2111,20 @@ function Index() {
 
           {usageLine ? (
             <p className="mt-2 font-mono text-[11px] text-muted-foreground">{usageLine}</p>
+          ) : null}
+
+          {mcats.length > 1 ? (
+            <div className="mt-4 flex justify-end">
+              {/* After a long table: go on to the next MCAT and come back to the top of its result. */}
+              <McatNav
+                items={mcats}
+                active={activeMcat}
+                onSelect={(i) => {
+                  selectMcat(i);
+                  resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              />
+            </div>
           ) : null}
         </section>
       ) : null}

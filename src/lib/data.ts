@@ -967,6 +967,8 @@ export interface ListingField {
   fillPct: number;
   distinct: number;
   top: [string, number][];
+  /** Every distinct value with how many listings carry it (up to 400, most common first); `top` is its first 8. */
+  all?: [string, number][];
 }
 
 export interface PriceStats {
@@ -979,6 +981,8 @@ export interface PriceStats {
   p75: number;
   max: number;
   unit: string | null;
+  /** Every price in that unit, lowest first (up to 5,000): what a price range's listing fill rate counts. */
+  values?: number[];
 }
 
 export interface ListingProfile {
@@ -1134,17 +1138,21 @@ export function profileListings(
   }
 
   const out: ListingField[] = [...fields.entries()]
-    .map(([key, f]) => ({
-      key,
-      sources: [...f.sources],
-      filled: f.filledRows,
-      fillPct: pct(f.filledRows, count),
-      distinct: f.values.size,
-      top: [...f.values.values()]
+    .map(([key, f]) => {
+      const all = [...f.values.values()]
         .sort((a, b) => b.n - a.n)
-        .slice(0, 8)
-        .map((v) => [v.label, v.n] as [string, number]),
-    }))
+        .slice(0, 400)
+        .map((v) => [v.label, v.n] as [string, number]);
+      return {
+        key,
+        sources: [...f.sources],
+        filled: f.filledRows,
+        fillPct: pct(f.filledRows, count),
+        distinct: f.values.size,
+        top: all.slice(0, 8),
+        all,
+      };
+    })
     .sort((a, b) => b.filled - a.filled)
     .slice(0, 60);
 
@@ -1166,6 +1174,7 @@ export function profileListings(
           p75: quantile(prices, 0.75),
           max: prices[prices.length - 1]!,
           unit: topUnit,
+          values: prices.slice(0, 5000),
         }
       : null;
 
