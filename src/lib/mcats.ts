@@ -285,6 +285,121 @@ function splitUncached(inputs: PipelineInputs): McatSlice[] {
   });
 }
 
+// ───────────────────────────── which MCAT a run is about ─────────────────────────────
+
+export interface McatIdentity {
+  id?: string;
+  name?: string;
+  pmcat?: { id?: string; name: string };
+  subcat?: { id?: string; name?: string };
+}
+
+/** A cell as an MCAT id and name: plain text, or a product's own `mcat` field (`[{id, name}]`). */
+function idNameOf(v: unknown): { id: string; name: string } {
+  const o = Array.isArray(v) ? v[0] : v;
+  if (o && typeof o === "object") {
+    const rec = o as Record<string, unknown>;
+    return {
+      id: rec["id"] == null ? "" : String(rec["id"]).trim(),
+      name: rec["name"] == null ? "" : String(rec["name"]).trim(),
+    };
+  }
+  return { id: "", name: v == null ? "" : String(v).trim() };
+}
+
+/**
+ * The one MCAT a run is about: from the product file's own tags (an MCAT wrapper, an `mcat` / `mcat_id`
+ * column, a product's `mcat` field) when every listing names the same one, else from a Seller & Buyer Spec
+ * Audit in the context ("# Name — Seller & Buyer Spec Audit", then "**Mcat Id:** 123"). `name` narrows a
+ * file of several MCATs to that one's listings and audit. null when the inputs don't say, or name several.
+ */
+export function mcatIdentity(rows: Row[], context: string, name?: string): McatIdentity | null {
+  const keyOf = (s: string) => nameTokens(s).join(" ");
+  const key = mcatKeyOf(rows);
+  const idKey =
+    key === "_group"
+      ? "_mcat_id"
+      : [...new Set(rows.slice(0, 50).flatMap((r) => Object.keys(r)))].find((k) =>
+          MCAT_ID_COLUMN.test(k),
+        );
+  const cells = key
+    ? rows
+        .map((r) => {
+          const own = idNameOf(r[key]);
+          return {
+            r,
+            id: (idKey ? String(r[idKey] ?? "").trim() : "") || own.id,
+            name: mcatNameOf(own.name),
+          };
+        })
+        .filter((c) => c.id || c.name)
+        .filter((c) => !name || keyOf(c.name) === keyOf(name))
+    : [];
+  const ids = new Set(cells.map((c) => c.id).filter(Boolean));
+  const names = new Set(cells.map((c) => keyOf(c.name)).filter(Boolean));
+  if (cells.length && ids.size <= 1 && names.size <= 1) {
+    const first = cells[0]!;
+    const text = (k: string) => String(first.r[k] ?? "").trim();
+    const out: McatIdentity = {};
+    const id = [...ids][0] ?? "";
+    const own = cells.find((c) => c.name)?.name ?? "";
+    if (id) out.id = id;
+    if (own) out.name = own;
+    if (text("_pmcat"))
+      out.pmcat = { ...(text("_pmcat_id") ? { id: text("_pmcat_id") } : {}), name: text("_pmcat") };
+    if (text("_subcat_id") || text("_subcat"))
+      out.subcat = {
+        ...(text("_subcat_id") ? { id: text("_subcat_id") } : {}),
+        ...(text("_subcat") ? { name: text("_subcat") } : {}),
+      };
+    if (out.id || out.name) return out;
+  }
+
+  // No listing says: a spec audit in the context names its MCAT and id.
+  const audits: { id: string; name: string }[] = [];
+  const lines = context.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i]!.match(/^#\s+(.*?)\s*(?:[—–-]+\s*)?Seller\s*&\s*Buyer Spec Audit/i);
+    if (!head) continue;
+    const id =
+      lines
+        .slice(i + 1, i + 8)
+        .join("\n")
+        .match(/\*{0,2}\s*Mcat[ _]?Id\s*:?\s*\*{0,2}:?\s*(\d+)/i)?.[1] ?? "";
+    audits.push({ id, name: (head[1] ?? "").trim() });
+  }
+  const mine = name ? audits.filter((a) => keyOf(a.name) === keyOf(name)) : audits;
+  const auditIds = new Set(mine.map((a) => a.id).filter(Boolean));
+  if (mine.length && auditIds.size <= 1) {
+    const a = mine.find((x) => x.id) ?? mine[0]!;
+    const out: McatIdentity = {};
+    if (a.id) out.id = a.id;
+    if (a.name) out.name = a.name;
+    if (out.id || out.name) return out;
+  }
+  return null;
+}
+
+/** Writes the MCAT's id, name, PMCAT and subcategory onto a result, keeping what the result already says. */
+export function withMcatIdentity<
+  R extends {
+    mcat_id?: string;
+    mcat_name?: string;
+    pmcat?: { id?: string; name: string };
+    subcat_id?: string;
+    subcat_name?: string;
+  },
+>(result: R, who: McatIdentity | null): R {
+  if (!who) return result;
+  const out = { ...result };
+  if (!out.mcat_id && who.id) out.mcat_id = who.id;
+  if (!out.mcat_name && who.name) out.mcat_name = who.name;
+  if (!out.pmcat && who.pmcat) out.pmcat = who.pmcat;
+  if (!out.subcat_id && who.subcat?.id) out.subcat_id = who.subcat.id;
+  if (!out.subcat_name && who.subcat?.name) out.subcat_name = who.subcat.name;
+  return out;
+}
+
 // ───────────────────────────── keywords for one MCAT ─────────────────────────────
 
 /** A listing word must be filled on at least this share of the MCAT's listings to count as its vocabulary. */
