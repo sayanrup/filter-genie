@@ -58,8 +58,10 @@ import type { ContextComparison } from "./compare";
 import {
   MIN_MCAT_KEYWORDS,
   describeKeywordSelection,
+  mcatIdentity,
   selectMcatKeywords,
   splitByMcat,
+  withMcatIdentity,
   type McatScope,
 } from "./mcats";
 import { valueConfidence, type ValueConfidence } from "./value-confidence";
@@ -120,8 +122,12 @@ export interface FilterRow {
 
 export interface FilterResult {
   category_name?: string;
-  /** Multi-MCAT runs: the MCAT's id and primary PMCAT from the product file. */
+  /**
+   * The MCAT's id and name, from the product file (or a spec audit in the context), and its primary PMCAT.
+   * Set on a multi-MCAT run's results, and on a single run when the inputs name exactly one MCAT.
+   */
   mcat_id?: string;
+  mcat_name?: string;
   /** Multi-MCAT runs: the subcategory the MCAT belongs to, when the product file names it. */
   subcat_id?: string;
   subcat_name?: string;
@@ -1540,11 +1546,19 @@ export async function runPipeline(
   // A multi-MCAT run is named after its MCAT, not after whatever the model made of the shared keywords.
   if (prep.mcat) {
     result.category_name = prep.mcat.name;
+    result.mcat_name = prep.mcat.name;
     if (prep.mcat.id) result.mcat_id = prep.mcat.id;
     if (prep.mcat.pmcat) result.pmcat = prep.mcat.pmcat;
     if (prep.mcat.subcat?.id) result.subcat_id = prep.mcat.subcat.id;
     if (prep.mcat.subcat?.name) result.subcat_name = prep.mcat.subcat.name;
-  } else if (!result.category_name && category) result.category_name = category;
+  } else {
+    if (!result.category_name && category) result.category_name = category;
+    // A single-MCAT run still says which MCAT it is, when the product file or a spec audit names one.
+    Object.assign(
+      result,
+      withMcatIdentity(result, mcatIdentity(inputs.listingRows, inputs.context)),
+    );
+  }
   result.total_keywords_analyzed = kwCount;
   return { result, evidence, warnings, usage, calls, prompts };
 }

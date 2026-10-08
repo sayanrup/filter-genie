@@ -116,19 +116,28 @@ export function buildWorkbook(opts: {
   const { result, withoutResult, comparison } = opts;
   const wb = XLSX.utils.book_new();
   const both = Boolean(withoutResult);
+  // The MCAT's id and name on every row, when the run knows them.
+  const named = Boolean(result.mcat_id || result.mcat_name);
+  const tag = <T extends object>(rows: T[]) =>
+    named
+      ? rows.map((row) => ({
+          "MCAT ID": result.mcat_id ?? "",
+          MCAT: result.mcat_name ?? "",
+          ...row,
+        }))
+      : rows;
+  const lead = named ? [11, 28] : [];
   addSheet(
     wb,
     both ? "With context" : "Filters",
-    XLSX.utils.json_to_sheet(filterRows(result)),
-    FILTER_WIDTHS,
+    XLSX.utils.json_to_sheet(tag(filterRows(result))),
+    [...lead, ...FILTER_WIDTHS],
   );
   if (withoutResult)
-    addSheet(
-      wb,
-      "Without context",
-      XLSX.utils.json_to_sheet(filterRows(withoutResult)),
-      FILTER_WIDTHS,
-    );
+    addSheet(wb, "Without context", XLSX.utils.json_to_sheet(tag(filterRows(withoutResult))), [
+      ...lead,
+      ...FILTER_WIDTHS,
+    ]);
   if (comparison)
     addSheet(
       wb,
@@ -144,8 +153,9 @@ export function buildWorkbook(opts: {
   ];
   if (rules.length)
     addSheet(wb, "Rules & blockers", XLSX.utils.json_to_sheet(rules), [16, 18, 100]);
-  const values = valueRows(result);
-  if (values.length) addSheet(wb, "ISQ values", XLSX.utils.json_to_sheet(values), VALUE_WIDTHS);
+  const values = tag(valueRows(result));
+  if (values.length)
+    addSheet(wb, "ISQ values", XLSX.utils.json_to_sheet(values), [...lead, ...VALUE_WIDTHS]);
   return wb;
 }
 
@@ -248,4 +258,72 @@ export function buildMcatWorkbook(items: McatResult[]): XLSX.WorkBook {
 /** Builds the subcategory workbook and downloads it as an .xlsx file. */
 export function downloadMcatWorkbook(fileName: string, items: McatResult[]) {
   XLSX.writeFile(buildMcatWorkbook(items), fileName);
+}
+
+// ───────────────────── ISQs with their confidence, per MCAT (JSON) ─────────────────────
+
+const byTier = (r: FilterResult) =>
+  [...r.filters].sort(
+    (a, b) => (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank,
+  );
+
+/**
+ * Every MCAT with its ISQs, and every ISQ with its values, as JSON: the ISQ's confidence, and each value's
+ * confidence with its evidence, bounds and listing fill. Values the AI suggests adding to the seller form
+ * are in `values` too, with `source: "ai_suggested"` and no confidence (they aren't on any listing yet).
+ */
+export function isqJson(items: McatResult[]): string {
+  const mcats = items.map(({ name, result }) => ({
+    mcat_id: result.mcat_id ?? null,
+    mcat_name: result.mcat_name ?? (name || result.category_name || null),
+    subcat_id: result.subcat_id ?? null,
+    subcat_name: result.subcat_name ?? null,
+    pmcat: result.pmcat ?? null,
+    isqs: byTier(result).map((f) => {
+      const conf = new Map((f.value_confidence ?? []).map((v) => [v.value, v]));
+      const rangeOf = new Map((f.ranges ?? []).map((r) => [r.value, r]));
+      const sizeOf = new Map((f.dimensions?.options ?? []).map((o) => [o.value, o]));
+      return {
+        name: f.name,
+        tier: f.tier,
+        rank: f.rank,
+        confidence: f.confidence,
+        why: f.rationale,
+        range: filterRangeText(f),
+        coverage_pct: f.coverage_pct ?? null,
+        listing_fill_pct: f.listing_fill_pct ?? null,
+        needs_new_isq: Boolean(f.needs_new_isq),
+        isq_note: f.isq_note ?? null,
+        values: [
+          ...f.values.map((value) => {
+            const r = rangeOf.get(value);
+            const size = sizeOf.get(value);
+            return {
+              value,
+              source: "data",
+              confidence: conf.get(value)?.level ?? null,
+              evidence: conf.get(value)?.why ?? null,
+              ...(r
+                ? {
+                    min: r.min,
+                    max: r.max,
+                    unit: r.unit,
+                    listings: r.listings ?? null,
+                    fill_pct: r.fill_pct ?? null,
+                  }
+                : {}),
+              ...(size && f.dimensions ? { size: size.sizes, unit: f.dimensions.unit } : {}),
+            };
+          }),
+          ...(f.ai_values ?? []).map((value) => ({
+            value,
+            source: "ai_suggested",
+            confidence: null,
+            evidence: f.isq_note ?? null,
+          })),
+        ],
+      };
+    }),
+  }));
+  return JSON.stringify({ generated_at: new Date().toISOString(), mcats }, null, 2);
 }

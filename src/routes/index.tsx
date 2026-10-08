@@ -44,8 +44,10 @@ import { StepCards, type StepView } from "@/components/StepCards";
 import { McatNav, McatPanel, McatPlan, type McatState } from "@/components/McatPanel";
 import {
   describeKeywordSelection,
+  mcatIdentity,
   selectMcatKeywords,
   splitByMcat,
+  withMcatIdentity,
   type McatSlice,
 } from "@/lib/mcats";
 import { runMcats } from "@/lib/run-mcats";
@@ -63,7 +65,12 @@ import {
   type Stored,
 } from "@/lib/saved-store";
 import publishedResults from "@/data/published-results.json";
-import { downloadMcatWorkbook, downloadWorkbook } from "@/lib/export-xlsx";
+import {
+  downloadMcatWorkbook,
+  downloadWorkbook,
+  isqJson,
+  type McatResult,
+} from "@/lib/export-xlsx";
 import { buildFullMarkdown, buildMarkdown, slugify, type InputBundle } from "@/lib/export";
 
 // Read from the gitignored .env.local so the key never lands in the repo (which syncs to Lovable).
@@ -173,6 +180,44 @@ function rowsFromBundle(json: string): Row[] | null {
   }
 }
 
+/**
+ * Gives results their MCAT's id and name, read from a run's inputs (the product file's MCAT tags, or a
+ * spec audit in the context), for runs that didn't keep them: saved before the id was recorded, or
+ * single-category runs from before. The product file is parsed once, on the first result that needs it.
+ */
+function identifier(inputs: InputBundle | undefined) {
+  let rows: Row[] | null = null;
+  return (result: PipelineRun["result"], name?: string): PipelineRun["result"] => {
+    if (result.mcat_id || !inputs) return result;
+    rows ??= rowsFromBundle(inputs.products) ?? [];
+    return withMcatIdentity(result, mcatIdentity(rows, inputs.context, name));
+  };
+}
+
+/** A saved run as MCAT results (one, or one per MCAT of a saved subcategory), each with its MCAT id. */
+function savedItems(entry: SavedRun): McatResult[] {
+  const id = identifier(entry.inputs);
+  return entry.mcats?.length
+    ? entry.mcats.map((m) => ({ name: m.name, result: id(m.result, m.name) }))
+    : [{ name: entry.name, result: id(entry.result) }];
+}
+
+/** "isq-confidence-portable-cabin-135712.xlsx", or "isq-confidence-subcat-729-5-mcats.csv" for several. */
+function isqFileName(items: McatResult[], ext: string) {
+  const one = items.length === 1 ? items[0]! : null;
+  const subcat = items[0]?.result.subcat_id;
+  const base = one
+    ? `${slugify(one.result.mcat_name || one.name || one.result.category_name || "category")}${one.result.mcat_id ? `-${one.result.mcat_id}` : ""}`
+    : `${subcat ? `subcat-${subcat}-` : ""}${items.length}-mcats`;
+  return `isq-confidence-${base}.${ext}`;
+}
+
+/** Every MCAT with its ISQs and their values, each with its confidence and the MCAT id and name, as JSON. */
+function downloadIsqs(items: McatResult[]) {
+  if (!items.length) return;
+  download(isqFileName(items, "json"), "application/json", isqJson(items));
+}
+
 /** A saved run only keeps the result and inputs; evidence is recomputed on the next Generate. */
 function runFromSaved(
   entry: Pick<SavedRun, "result" | "warnings" | "usage" | "calls" | "withoutResult" | "comparison">,
@@ -255,9 +300,12 @@ function download(name: string, type: string, body: string) {
   URL.revokeObjectURL(a.href);
 }
 
-function toCsv(filters: FilterRow[]) {
+function toCsv(result: PipelineRun["result"]) {
+  const filters: FilterRow[] = result.filters;
   const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const head = [
+    "mcat_id",
+    "mcat_name",
     "tier",
     "rank",
     "name",
@@ -274,6 +322,8 @@ function toCsv(filters: FilterRow[]) {
   ];
   const rows = filters.map((f) =>
     [
+      result.mcat_id,
+      result.mcat_name ?? result.category_name,
       f.tier,
       f.rank,
       f.name,
@@ -850,15 +900,13 @@ function Index() {
 
   /** The same content as an Excel workbook: filters with / without context, rules, and similarity. */
   function downloadExcel(entry: SavedRun) {
+    const items = savedItems(entry);
     if (entry.mcats?.length) {
-      downloadMcatWorkbook(
-        `${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.xlsx`,
-        entry.mcats.map((m) => ({ name: m.name, result: m.result })),
-      );
+      downloadMcatWorkbook(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.xlsx`, items);
       return;
     }
     downloadWorkbook(`${slugify(entry.name)}-${entry.savedAt.slice(0, 10)}.xlsx`, {
-      result: entry.result,
+      result: items[0]!.result,
       ...(entry.withoutResult ? { withoutResult: entry.withoutResult } : {}),
       ...(entry.comparison ? { comparison: entry.comparison } : {}),
     });
@@ -1014,6 +1062,7 @@ function Index() {
         separateMcats: true,
       };
       const slices = splitByMcat(base);
+      const id = identifier(i);
       setSeparateMcats(true);
       setMcats(
         entry.mcats.map((m) => ({
@@ -1021,7 +1070,7 @@ function Index() {
           inputs: slices.find((x) => x.name === m.name)?.inputs ?? { ...base, listingRows: [] },
           status: "done",
           steps: m.steps ?? [],
-          run: runFromSaved(m),
+          run: runFromSaved({ ...m, result: id(m.result, m.name) }),
           error: "",
         })),
       );
@@ -1030,7 +1079,7 @@ function Index() {
       setSteps([]);
     } else {
       setMcats([]);
-      setRun(runFromSaved(entry));
+      setRun(runFromSaved({ ...entry, result: identifier(i)(entry.result) }));
       setSteps(entry.steps ?? []);
     }
     setVariant("with");
@@ -1149,6 +1198,17 @@ function Index() {
         ]
       : [],
   );
+  /** The result on screen with its MCAT id and name (read from the inputs when the run didn't set them). */
+  const currentResult = () =>
+    result && !result.mcat_id
+      ? withMcatIdentity(result, mcatIdentity(inputs.listingRows, inputs.context))
+      : result;
+  /** The run on screen for the ISQ download: every finished MCAT, or the one result. */
+  const currentItems = (): McatResult[] => {
+    if (mcats.length > 1) return finishedMcats;
+    const r = currentResult();
+    return r ? [{ name: r.category_name ?? "", result: r }] : [];
+  };
 
   const allPromptsText = promptRecords
     .map((p) =>
@@ -1226,6 +1286,14 @@ function Index() {
                       >
                         Download .xlsx
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadIsqs(savedItems(s))}
+                        title="Each MCAT with its ISQs and their values, with confidence, as JSON"
+                        className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                      >
+                        ISQs .json
+                      </button>
                     </div>
                   </li>
                 ))}
@@ -1294,6 +1362,14 @@ function Index() {
                       className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
                     >
                       Download .xlsx
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadIsqs(savedItems(s))}
+                      title="Each MCAT with its ISQs and their values, with confidence, as JSON"
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                    >
+                      ISQs .json
                     </button>
                     <button
                       type="button"
@@ -1731,12 +1807,22 @@ function Index() {
         <button
           type="button"
           onClick={() =>
-            result && download("filter-recommendations.csv", "text/csv", toCsv(result.filters))
+            result &&
+            download("filter-recommendations.csv", "text/csv", toCsv(currentResult() ?? result))
           }
           disabled={!result}
           className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
         >
           Export CSV
+        </button>
+        <button
+          type="button"
+          onClick={() => downloadIsqs(currentItems())}
+          disabled={!result && !finishedMcats.length}
+          title="Each MCAT (ID and name) with its ISQs and their values, each with its confidence, as JSON"
+          className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
+        >
+          ISQs + confidence (.json)
         </button>
         {mcats.length > 1 && finishedMcats.length > 0 ? (
           <>
