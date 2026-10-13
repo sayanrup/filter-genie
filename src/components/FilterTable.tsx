@@ -149,6 +149,13 @@ const isOther = (v: string) => /^other/i.test(v.trim());
  * A filter's values for display, most confident first (High, Medium, Low), "Other" last, and the
  * options without a confidence after the measured ones. Ties keep the order they came in (demand).
  */
+/** When the select step ran: the values it shows first, in its order, then the ones it left out. */
+function shownFirst(ordered: string[], selected: string[] | undefined) {
+  if (!selected) return ordered;
+  const shown = new Set(selected);
+  return [...selected.filter((v) => ordered.includes(v)), ...ordered.filter((v) => !shown.has(v))];
+}
+
 function orderedValues(
   values: string[],
   level: (v: string) => keyof typeof LEVEL_RANK | undefined,
@@ -186,8 +193,30 @@ export function FilterTable({
 }) {
   const [expandedFilter, setExpandedFilter] = useState<string | null>(null);
   const [rangeOpen, setRangeOpen] = useState<Record<string, boolean>>({});
+  // ISQs the select step left out (skill 15) stay hidden until asked for.
+  const [showLeftOut, setShowLeftOut] = useState(false);
+  const leftOutCount = result.filters.filter((f) => f.selected === false).length;
   return (
     <div className="panel overflow-x-auto">
+      {leftOutCount ? (
+        <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2 text-xs text-muted-foreground">
+          <span>
+            <strong className="text-foreground">
+              {result.filters.length - leftOutCount} ISQ
+              {result.filters.length - leftOutCount === 1 ? "" : "s"} shown
+            </strong>{" "}
+            · {leftOutCount} not shown (Tier 3, Tier 2 below High, too few High / Medium values, or
+            3+ strong Tier 1 ISQs)
+          </span>
+          <button
+            type="button"
+            onClick={() => setShowLeftOut((v) => !v)}
+            className="rounded-md border border-border px-2 py-1 text-[11px] font-medium text-foreground hover:bg-accent"
+          >
+            {showLeftOut ? "Hide them" : "View them"}
+          </button>
+        </div>
+      ) : null}
       <table className="w-full border-collapse text-sm">
         <thead>
           <tr>
@@ -210,7 +239,8 @@ export function FilterTable({
           </tr>
         </thead>
         <tbody>
-          {[...result.filters]
+          {result.filters
+            .filter((f) => showLeftOut || f.selected !== false)
             .sort(
               (a, b) => (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank,
             )
@@ -220,6 +250,10 @@ export function FilterTable({
               const vc = confidenceOf(f, evidence);
               const levelOf = new Map((vc ?? []).map((v) => [v.value, v]));
               const rangeOf = new Map((f.ranges ?? []).map((r) => [r.value, r]));
+              // Values the select step left out (Low, or Medium beside 4+ High) are shown muted.
+              const leftOut = new Set(
+                f.selected_values ? f.values.filter((v) => !f.selected_values!.includes(v)) : [],
+              );
               // A numeric filter shows one range in its Values cell; a click opens each option's own range.
               const whole = overallRange(f.ranges);
               const rangesShown = Boolean(rangeOpen[key]);
@@ -248,6 +282,21 @@ export function FilterTable({
                   </td>
                   <td className="px-3 py-3">
                     <strong>{f.name}</strong>
+                    {f.selected === true ? (
+                      <span
+                        title="Shown as an ISQ (skill 15)"
+                        className="ml-1.5 rounded bg-success-soft px-1.5 py-0.5 align-middle text-[9px] font-bold uppercase tracking-wider text-success"
+                      >
+                        Shown
+                      </span>
+                    ) : f.selected === false ? (
+                      <span
+                        title={f.select_note}
+                        className="ml-1.5 rounded bg-secondary px-1.5 py-0.5 align-middle text-[9px] font-bold uppercase tracking-wider text-muted-foreground"
+                      >
+                        Not shown
+                      </span>
+                    ) : null}
                     <div className="mt-1 flex flex-wrap gap-x-2 font-mono text-[10px] text-muted-foreground">
                       {f.coverage_pct != null ? <span>coverage {f.coverage_pct}%</span> : null}
                       {f.top_value_share_pct != null ? (
@@ -257,6 +306,16 @@ export function FilterTable({
                         <span>filled {f.listing_fill_pct}%</span>
                       ) : null}
                     </div>
+                    {f.selected === false && f.select_note ? (
+                      <div className="mt-1 text-[10px] leading-snug text-muted-foreground">
+                        {f.select_note}
+                      </div>
+                    ) : null}
+                    {f.doc_isq ? (
+                      <div className="mt-1 text-[10px] leading-snug text-primary">
+                        Category document: {f.doc_isq}
+                      </div>
+                    ) : null}
                     {f.needs_new_isq ? (
                       <div className="mt-1 text-[10px] text-destructive">
                         ⚠ {f.isq_note || "Needs a new listing field"}
@@ -333,7 +392,10 @@ export function FilterTable({
                       </>
                     ) : (
                       <div className="flex flex-wrap gap-1.5">
-                        {orderedValues(f.values, (v) => levelOf.get(v)?.level)
+                        {shownFirst(
+                          orderedValues(f.values, (v) => levelOf.get(v)?.level),
+                          f.selected_values,
+                        )
                           .slice(0, 15)
                           .map((v, vi) => {
                             const c = levelOf.get(v);
@@ -343,7 +405,7 @@ export function FilterTable({
                                 title={c?.why}
                                 className={`inline-flex items-stretch overflow-hidden rounded-md border border-border bg-card text-[11px] leading-none shadow-sm ${
                                   c ? `border-l-[3px] ${CHIP_ACCENT[c.level]}` : ""
-                                }`}
+                                } ${leftOut.has(v) ? "border-dashed opacity-45" : ""}`}
                               >
                                 <span className="px-2 py-1.5 font-medium">{v}</span>
                                 {rangeOf.has(v) ? (
@@ -371,24 +433,6 @@ export function FilterTable({
                         ) : null}
                       </div>
                     )}
-                    {f.ai_values?.length ? (
-                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                        <span
-                          title="Values the AI suggests adding to the seller form for this filter. They are not on listings yet, so they have no confidence or fill rate."
-                          className="text-[9px] font-bold uppercase tracking-wider text-primary"
-                        >
-                          AI suggested
-                        </span>
-                        {f.ai_values.map((v) => (
-                          <span
-                            key={v}
-                            className="rounded-md border border-dashed border-primary/50 bg-primary-soft px-2 py-1.5 text-[11px] leading-none font-medium text-primary"
-                          >
-                            {v}
-                          </span>
-                        ))}
-                      </div>
-                    ) : null}
                   </td>
                   <td className="px-3 py-3">
                     <span

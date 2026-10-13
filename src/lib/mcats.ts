@@ -8,6 +8,7 @@ import {
   type Row,
 } from "./data";
 import type { PipelineInputs } from "./filter-gen";
+import { parseCategoryDoc } from "./category-doc";
 
 /*
  * Several MCATs in one run. The product file holds one group per MCAT (JSON `{"mcat-a": [...], ...}`
@@ -230,8 +231,9 @@ function splitUncached(inputs: PipelineInputs): McatSlice[] {
   const ids = new Map(
     ordered.map(([name, rows]) => [name, idKey ? String(rows[0]?.[idKey] ?? "").trim() : ""]),
   );
-  const context = splitDoc(inputs.context, names, ids);
-  const ranking = splitDoc(inputs.specs, names, ids);
+  // The category document as JSON isn't cut into sections: each run picks its own MCAT from it (skill 15).
+  const context = parseCategoryDoc(inputs.context) ? null : splitDoc(inputs.context, names, ids);
+  const ranking = parseCategoryDoc(inputs.specs) ? null : splitDoc(inputs.specs, names, ids);
 
   return ordered.map(([name, rows], index) => {
     const notes: string[] = [];

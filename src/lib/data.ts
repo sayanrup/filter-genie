@@ -1124,7 +1124,8 @@ export function profileListings(
       seen.add(role);
       f.filledRows++;
       // ISQ values are multi-select ("PVC, Stainless Steel"): count each option on its own.
-      const parts = key.startsWith(SPEC_PREFIX) ? raw.split(",") : [raw];
+      // A comma inside a number ("1,000 sq ft") is a thousands separator, not a new option.
+      const parts = key.startsWith(SPEC_PREFIX) ? raw.split(/,(?!\d{3}(?!\d))/) : [raw];
       for (const part of parts) {
         const label = part.trim().slice(0, 80);
         if (!label) continue;

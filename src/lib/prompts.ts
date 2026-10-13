@@ -11,6 +11,7 @@ import {
 import { composeSystemPrompt, MCAT_SKILLS } from "@/skills";
 import { describeKeywordSelection, type McatScope } from "./mcats";
 import type { FilterRow } from "./filter-gen";
+import type { DocMcat } from "./category-doc";
 
 /*
  * System prompts are assembled from the skill docs in src/skills (base.md + one .md per layer).
@@ -257,6 +258,26 @@ export function buildRangesUser(filters: FilterRow[], listing: ListingProfile | 
   return [
     `${sendable.length} filter(s) with numbers in their values.`,
     block("FILTERS", lines.join("\n")),
+  ].join("\n");
+}
+
+// ───────────────────────────── 5 · category document pairing ─────────────────────────────
+
+export const DOC_MATCH_SYSTEM = composeSystemPrompt("select");
+
+/**
+ * The ISQs that need the category document (measurements and thin ones, skill 15) with their values, and the
+ * document's ISQs for this MCAT. No numbers: pairing names doesn't need them, and code scores every value.
+ */
+export function buildDocMatchUser(mcatName: string, filters: FilterRow[], doc: DocMcat) {
+  const lines = filters.map(
+    (f, i) =>
+      `${i + 1}. ${f.name}: ${f.values.filter((v) => !/^other\b/i.test(v.trim())).join(" | ") || "(no values)"}`,
+  );
+  return [
+    `MCAT: ${mcatName}`,
+    block("ISQS", lines.join("\n")),
+    block("DOCUMENT_ISQS", doc.isqs.map((q) => `${q.name}: ${q.values.join(" | ")}`).join("\n")),
   ].join("\n");
 }
 

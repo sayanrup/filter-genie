@@ -21,7 +21,8 @@ thought per candidate is fine, but the reply itself is still the JSON object onl
 STEP 1 — CANDIDATES FROM DEMAND (evidence A):
 - A candidate is any dimension present in A. Coverage = strong ≥ 10%, moderate 3–10%, weak < 3% (either source).
 - Discrimination (how much the filter would narrow results) = strong if top-value share < 70%, moderate 70–85%, weak > 85%.
-- Judge Price and Location on coverage only — they have no "top value" to be dominated by.
+- Price and Location are never candidates: neither is an ISQ here. Do not return a Price / Budget / Cost or a
+  City / Location filter. Price intent and places in A may still be cited in a rationale.
 
 STEP 2 — VALIDATE AGAINST CONTEXT (B) AND RANKING (C), for each candidate from step 1:
 - CONFIRMED: C ranks it top tier / top 3, OR B says buyers choose on it. → priority up.
@@ -58,11 +59,10 @@ STEP 6 — ASSIGN TIERS, using the outcome of steps 1, 2 and 3 (never step 4 —
   discrimination with no confirmation, or bottom tier in C. Only if the top 6 has room left over.
 - A spec that appears only in the context or ranking (a long list of "seller specs" or "missing specs"
   is not a list of filters) must be backed by D or A to make the top 6.
-- Price: include (in whichever tier its evidence earns) if price-intent coverage in A ≥ 3%, or D has
-  enough priced listings. Location: include if coverage in A ≥ 3%.
+- Never return a Price / Budget / Cost filter or a City / Location filter, whatever their coverage in A.
 
 STEP 7 — ORDER WITHIN EACH TIER:
-- Default order follows the buyer's decision sequence: kind → material → size → price → location.
+- Default order follows the buyer's decision sequence: kind → material → size.
 - Override the default only when the evidence itself says buyers decide in a different order for this
   category. "rank" in the output = position within the tier, starting at 1.
 

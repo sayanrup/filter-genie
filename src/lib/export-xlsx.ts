@@ -272,6 +272,37 @@ const byTier = (r: FilterResult) =>
  * confidence with its evidence, bounds and listing fill. Values the AI suggests adding to the seller form
  * are in `values` too, with `source: "ai_suggested"` and no confidence (they aren't on any listing yet).
  */
+/**
+ * The selected ISQs only (skill 15), compact: per MCAT its id and name, and each ISQ that is shown with its own
+ * confidence as one letter (`isq_conf`), the values that are shown, and their confidence one letter each in
+ * `conf` ("HHM": conf[i] belongs to values[i]). Order is the rank, so none is written: ISQs by tier then rank,
+ * values best first. One MCAT per line. A result from before the select step has nothing selected, so every
+ * ISQ and value of it is written.
+ */
+export function selectedIsqJson(items: McatResult[]): string {
+  const mcats = items.map(({ name, result }) => {
+    const ran = result.filters.some((f) => f.selected !== undefined);
+    return {
+      mcat_id: result.mcat_id ?? null,
+      mcat_name: result.mcat_name ?? (name || result.category_name || null),
+      isqs: byTier(result)
+        .filter((f) => !ran || f.selected)
+        .map((f) => {
+          const level = new Map((f.value_confidence ?? []).map((c) => [c.value, c.level]));
+          const values = (f.selected_values ?? f.values).filter((v) => !/^other\b/i.test(v.trim()));
+          return {
+            name: f.name,
+            isq_conf: f.confidence?.[0] ?? "-",
+            values,
+            conf: values.map((v) => level.get(v)?.[0] ?? "-").join(""),
+          };
+        })
+        .filter((q) => q.values.length),
+    };
+  });
+  return `[\n${mcats.map((m) => JSON.stringify(m)).join(",\n")}\n]\n`;
+}
+
 export function isqJson(items: McatResult[]): string {
   const mcats = items.map(({ name, result }) => ({
     mcat_id: result.mcat_id ?? null,
@@ -292,6 +323,11 @@ export function isqJson(items: McatResult[]): string {
         range: filterRangeText(f),
         coverage_pct: f.coverage_pct ?? null,
         listing_fill_pct: f.listing_fill_pct ?? null,
+        // Skill 15: is the ISQ shown, and if not, why.
+        selected: f.selected ?? null,
+        select_note: f.select_note ?? null,
+        category_doc_isq: f.doc_isq ?? null,
+        unit: f.unit ?? null,
         needs_new_isq: Boolean(f.needs_new_isq),
         isq_note: f.isq_note ?? null,
         values: [
@@ -300,7 +336,8 @@ export function isqJson(items: McatResult[]): string {
             const size = sizeOf.get(value);
             return {
               value,
-              source: "data",
+              source: conf.get(value)?.source ?? "data",
+              shown: f.selected_values ? f.selected_values.includes(value) : null,
               confidence: conf.get(value)?.level ?? null,
               evidence: conf.get(value)?.why ?? null,
               ...(r
