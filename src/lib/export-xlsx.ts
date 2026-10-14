@@ -273,8 +273,8 @@ const byTier = (r: FilterResult) =>
  * are in `values` too, with `source: "ai_suggested"` and no confidence (they aren't on any listing yet).
  */
 /**
- * The selected ISQs only (skill 15), compact: per MCAT its id and name, and each ISQ that is shown with its own
- * confidence as one letter (`isq_conf`), the values that are shown, and their confidence one letter each in
+ * The selected ISQs only (skill 15), compact: per MCAT its id and name, and each ISQ that is shown with its tier
+ * (1, 2 or 3) and its own confidence as one letter (`isq_conf`), the values that are shown, and their confidence one letter each in
  * `conf` ("HHM": conf[i] belongs to values[i]). Order is the rank, so none is written: ISQs by tier then rank,
  * values best first. One MCAT per line. A result from before the select step has nothing selected, so every
  * ISQ and value of it is written.
@@ -292,6 +292,7 @@ export function selectedIsqJson(items: McatResult[]): string {
           const values = (f.selected_values ?? f.values).filter((v) => !/^other\b/i.test(v.trim()));
           return {
             name: f.name,
+            tier: Number(f.tier.replace(/\D/g, "")) || null,
             isq_conf: f.confidence?.[0] ?? "-",
             values,
             conf: values.map((v) => level.get(v)?.[0] ?? "-").join(""),
