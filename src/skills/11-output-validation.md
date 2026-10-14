@@ -22,6 +22,7 @@ All in code — **no second model call** (a repair turn would resend the whole p
 | More than 12 options | kept the first 11 + "Other" |
 | Options that are bare numbers or single characters | removed |
 | Tier 3 without `display only` | ui_pattern set to `display only` |
+| A Price / Budget / Cost or City / Location filter | removed — neither is shown as an ISQ (skill 15) |
 | Duplicate filter names | later duplicates removed |
 | Ranks with gaps or repeats | renumbered 1…n within each tier, keeping order |
 | `dimension` / `listing_spec` not found in the evidence | link cleared (numbers stay empty) |

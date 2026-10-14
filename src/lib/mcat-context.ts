@@ -9,10 +9,13 @@
 export const MCAT_CONTEXT_API = "http://glrapi.imutils.com/r/product/mcatskillcontext";
 export const SPEC_AUDIT_FILE = "seller_and_buyer_spec_audit.md";
 
-interface ContextFile {
+export type Json = string | number | null | string[] | { [key: string]: Json } | Json[];
+
+export interface ContextFile {
   fileName: string;
   format: string;
-  data: string;
+  /** Markdown text, or the parsed object for a .json file. */
+  data: Json;
 }
 
 interface ContextResponse {
@@ -21,7 +24,15 @@ interface ContextResponse {
   Data: { contextFiles?: ContextFile[]; mcat_id?: string; subcatId?: string } | null;
 }
 
-export type Json = string | number | null | string[] | { [key: string]: Json } | Json[];
+/** Everything the API holds for one MCAT, as it came. */
+export interface ContextFiles {
+  mcat_id: string;
+  subcat_id: string | null;
+  files: ContextFile[];
+}
+
+/** The API answered and said no (a bad id is "Invalid Mcat ID"), so asking again won't help. */
+export class McatApiError extends Error {}
 
 export interface SpecAudit {
   mcat_id: string;
@@ -48,35 +59,55 @@ const LIST_KEYS = new Set([
 const NUMBER_KEYS = new Set(["rank", "current_rank", "preferred_rank"]);
 const EMPTY = /^(—|-|_?none( flagged)?_?|n\/a)?$/i;
 
-export async function fetchMcatContext(mcatId: string, signal?: AbortSignal): Promise<McatContext> {
+export async function fetchContextFiles(
+  mcatId: string,
+  signal?: AbortSignal,
+): Promise<ContextFiles> {
   const resp = await fetch(`${MCAT_CONTEXT_API}?mcat_id=${encodeURIComponent(mcatId)}`, {
     signal: signal ?? null,
   });
   if (!resp.ok) throw new Error(`MCAT API answered ${resp.status}`);
   const body = (await resp.json()) as ContextResponse;
   // A bad id still comes back as HTTP 200, with Code "400" and the reason in Msg.
-  if (body.Code !== "200" || !body.Data) throw new Error(body.Msg || `MCAT API code ${body.Code}`);
+  if (body.Code !== "200" || !body.Data)
+    throw new McatApiError(body.Msg || `MCAT API code ${body.Code}`);
+  return {
+    mcat_id: body.Data.mcat_id ?? mcatId,
+    subcat_id: body.Data.subcatId ?? null,
+    files: body.Data.contextFiles ?? [],
+  };
+}
 
-  const files = body.Data.contextFiles ?? [];
-  const audit = files.find((f) => f.fileName === SPEC_AUDIT_FILE);
-  if (!audit) throw new Error(`MCAT ${mcatId} has no ${SPEC_AUDIT_FILE}`);
-  const index = files.find((f) => f.fileName === "index.md")?.data ?? "";
-  const name = index.match(/\*\*Mcat Name:\*\*\s*(.+)/)?.[1]?.trim() ?? null;
+/** The Seller & Buyer Spec Audit out of an MCAT's files, or null when it has none. */
+export function specAuditOf(context: ContextFiles): McatContext | null {
+  const textOf = (fileName: string) => {
+    const data = context.files.find((f) => f.fileName === fileName)?.data;
+    return typeof data === "string" ? data : null;
+  };
+  const audit = textOf(SPEC_AUDIT_FILE);
+  if (audit === null) return null;
+  const name = (textOf("index.md") ?? "").match(/\*\*Mcat Name:\*\*\s*(.+)/)?.[1]?.trim() ?? null;
 
-  const text = audit.data
+  const text = audit
     .split(/\n## Glossary/i)[0]!
     .replace(/\n-{3,}\s*$/, "")
     .trim();
   return {
     audit: {
-      mcat_id: body.Data.mcat_id ?? mcatId,
-      subcat_id: body.Data.subcatId ?? null,
+      mcat_id: context.mcat_id,
+      subcat_id: context.subcat_id,
       mcat_name: name,
       ...parseSpecAudit(text),
     },
     // The file's own title doesn't say which category it is; the context input needs that.
     markdown: name ? text.replace(/^# .*/, `# ${name} — Seller & Buyer Spec Audit`) : text,
   };
+}
+
+export async function fetchMcatContext(mcatId: string, signal?: AbortSignal): Promise<McatContext> {
+  const context = specAuditOf(await fetchContextFiles(mcatId, signal));
+  if (!context) throw new McatApiError(`MCAT ${mcatId} has no ${SPEC_AUDIT_FILE}`);
+  return context;
 }
 
 /**
@@ -141,15 +172,20 @@ function cell(key: string, raw: string): Json {
   return v;
 }
 
-/** Split on commas that aren't inside brackets: "MS (Mild Steel, IS 2062), GI" → 2 items. */
+/**
+ * Split on commas that aren't inside brackets or a number: "MS (Mild Steel, IS 2062), GI" → 2 items,
+ * "Up to 5,000 sq ft, Above 50,000 sq ft" → 2 items.
+ */
 function splitList(v: string): string[] {
   const items: string[] = [];
   let depth = 0;
   let cur = "";
-  for (const ch of v) {
+  for (let i = 0; i < v.length; i++) {
+    const ch = v[i]!;
     if (ch === "(" || ch === "[") depth++;
     if (ch === ")" || ch === "]") depth = Math.max(0, depth - 1);
-    if (ch === "," && depth === 0) {
+    const inNumber = /\d/.test(v[i - 1] ?? "") && /^\d{3}(?!\d)/.test(v.slice(i + 1));
+    if (ch === "," && depth === 0 && !inNumber) {
       items.push(cur);
       cur = "";
     } else cur += ch;

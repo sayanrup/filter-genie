@@ -69,6 +69,7 @@ import {
   downloadMcatWorkbook,
   downloadWorkbook,
   isqJson,
+  selectedIsqJson,
   type McatResult,
 } from "@/lib/export-xlsx";
 import { buildFullMarkdown, buildMarkdown, slugify, type InputBundle } from "@/lib/export";
@@ -216,6 +217,16 @@ function isqFileName(items: McatResult[], ext: string) {
 function downloadIsqs(items: McatResult[]) {
   if (!items.length) return;
   download(isqFileName(items, "json"), "application/json", isqJson(items));
+}
+
+/** Only the ISQs and values the select step shows (skill 15), compact: id, name, ISQs, values, confidence letters. */
+function downloadSelectedIsqs(items: McatResult[]) {
+  if (!items.length) return;
+  download(
+    isqFileName(items, "json").replace(/^isq-confidence-/, "isq-values-"),
+    "application/json",
+    selectedIsqJson(items),
+  );
 }
 
 /** A saved run only keeps the result and inputs; evidence is recomputed on the next Generate. */
@@ -1294,6 +1305,14 @@ function Index() {
                       >
                         ISQs .json
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadSelectedIsqs(savedItems(s))}
+                        title="Only the ISQs and values that are shown, compact, as JSON"
+                        className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                      >
+                        Selected .json
+                      </button>
                     </div>
                   </li>
                 ))}
@@ -1370,6 +1389,14 @@ function Index() {
                       className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
                     >
                       ISQs .json
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadSelectedIsqs(savedItems(s))}
+                      title="Only the ISQs and values that are shown, compact, as JSON"
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+                    >
+                      Selected .json
                     </button>
                     <button
                       type="button"
@@ -1671,8 +1698,8 @@ function Index() {
         <InputPanel
           step={3}
           title="Category context document"
-          hint="Buyer interview notes, display attributes, spec audits."
-          accept=".txt,.md,.csv"
+          hint="Buyer interview notes, display attributes, spec audits. Or the category document as JSON (saved-results/mcat-context.json): it is then used only to top up thin ISQs and to check measurements, per MCAT."
+          accept=".txt,.md,.csv,.json"
           placeholder="Paste the category context document here…"
           text={contextText}
           onTextChange={setContextText}
@@ -1823,6 +1850,15 @@ function Index() {
           className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
         >
           ISQs + confidence (.json)
+        </button>
+        <button
+          type="button"
+          onClick={() => downloadSelectedIsqs(currentItems())}
+          disabled={!result && !finishedMcats.length}
+          title="Only the ISQs and values that are shown (Tier 1, Tier 2 High; High / Medium values), compact: MCAT ID and name, ISQs, values and their confidence as H / M letters"
+          className="rounded-lg border border-border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
+        >
+          Selected ISQs (.json)
         </button>
         {mcats.length > 1 && finishedMcats.length > 0 ? (
           <>

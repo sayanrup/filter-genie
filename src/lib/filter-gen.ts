@@ -33,9 +33,9 @@ import {
   type Usage,
 } from "./llm";
 import {
+  DOC_MATCH_SYSTEM,
   FIELD_MAP_SYSTEM,
   LABEL_RETRY_NOTE,
-  RANGES_SYSTEM,
   TERM_LABEL_SYSTEM,
   TERM_LABEL_SYSTEM_MCAT,
   designSystemFor,
@@ -43,17 +43,20 @@ import {
   buildDesignUser,
   formatLakh,
   type PromptBudget,
+  buildDocMatchUser,
   buildFieldMapUser,
-  buildRangesUser,
   buildTermLabelUser,
 } from "./prompts";
+import type { DimensionSpec, ValueRange } from "./ranges";
 import {
-  applyRanges,
-  filterRangeText,
-  rangeLines,
-  type DimensionSpec,
-  type ValueRange,
-} from "./ranges";
+  docEntryFor,
+  docFromAuditMarkdown,
+  measurementPairs,
+  parseCategoryDoc,
+  parseDocPairs,
+  type DocMcat,
+} from "./category-doc";
+import { isExcludedIsq, isqsNeedingDoc, selectIsqs } from "./select-isqs";
 import type { ContextComparison } from "./compare";
 import {
   MIN_MCAT_KEYWORDS,
@@ -89,11 +92,25 @@ export interface FilterRow {
   needs_new_isq?: boolean;
   isq_note?: string | null;
   /**
+   * Only on results saved before skill 15: the model no longer suggests values (the category document
+   * supplies what the data lacks), and they are no longer shown.
    * Option values the model suggests adding to the seller form when this filter needs a new ISQ ("PEB",
    * "Modular", "LGSF"): the values of the red note, shown as "AI suggested" beside the real ones. Not in
    * `values`, so they carry no confidence, range or fill rate.
    */
   ai_values?: string[];
+  /**
+   * Skill 15: whether this ISQ is finally shown (Tier 1 at any confidence, Tier 2 only when High, at least
+   * two High / Medium values, …), and when it isn't, why. Absent on results from before that step.
+   */
+  selected?: boolean;
+  select_note?: string;
+  /** The values shown for this ISQ, best first: High and Medium only (only High when there are 4 or more). */
+  selected_values?: string[];
+  /** The category document's ISQ this one used, for thin values or as a measurement's reference. */
+  doc_isq?: string;
+  /** A measurement ISQ's one unit ("ft", "sq ft"): every value is written in it. */
+  unit?: string;
   /** The resolved evidence keys this filter is linked to (set by attachEvidence, never the model's
    *  raw string) — lets the UI show the exact dimension/spec rows this filter's numbers came from. */
   linked_dimension?: string | null;
@@ -159,7 +176,7 @@ export interface PipelineInputs {
 
 export type { StageId };
 
-export type StepId = "prepare" | "label" | "fields" | "design" | "check" | "ranges";
+export type StepId = "prepare" | "label" | "fields" | "design" | "check" | "select";
 export type StepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
 export interface StepStat {
@@ -343,10 +360,10 @@ export const INITIAL_STEPS: Step[] = [
     status: "pending",
   },
   {
-    id: "ranges",
-    label: "Lower & upper bounds",
+    id: "select",
+    label: "Select ISQs & values",
     description:
-      "Sends the final ISQ values to the model, which gives each numeric one (price, size, capacity…) a lower and an upper bound. Code keeps a bound only when the number is in the value's own text.",
+      "Cleans measurements to one unit and one count of numbers (from the category document when the data's own are poor), removes duplicate values, tops up thin ISQs from the document, keeps only High / Medium values, then picks the ISQs: Tier 1, and Tier 2 only when High. A final check verifies every rule.",
     status: "pending",
   },
 ];
@@ -464,20 +481,52 @@ const STEP_NAME = {
   label: "keyword-labelling",
   fields: "spec-merging",
   design: "master (filter design)",
-  ranges: "numeric-ranges",
+  select: "category-document pairing",
 } as const;
+
+/**
+ * The category document (skill 15), pasted or uploaded as JSON into input 3 (or input 4): this run's MCAT in
+ * it. The JSON is kept out of the model's prompt (it is only for thin ISQs and measurements), so that input is
+ * emptied; audit markdown in input 3 stays as it is and its "Buyer Attracting Seller Specs" table is read from it.
+ */
+function withCategoryDoc(inputs: PipelineInputs): {
+  inputs: PipelineInputs;
+  doc: DocMcat | null;
+  note: string | null;
+} {
+  const who = inputs.mcat
+    ? { id: inputs.mcat.id, name: inputs.mcat.name }
+    : mcatIdentity(inputs.listingRows, inputs.context);
+  // The document is looked for in input 3 first, then in input 4: wherever it was pasted, it is recognised
+  // by what it holds (MCATs with their ISQs and values), and that input is then not read as text.
+  const inContext = parseCategoryDoc(inputs.context);
+  const inSpecs = inContext ? null : parseCategoryDoc(inputs.specs);
+  const list = inContext ?? inSpecs;
+  if (!list) return { inputs, doc: docFromAuditMarkdown(inputs.context, who), note: null };
+  const doc = docEntryFor(list, who);
+  const label =
+    `${who?.name ?? ""}${who?.id ? ` (MCAT ID ${who.id})` : ""}`.trim() || "this run's MCAT";
+  return {
+    inputs: { ...inputs, ...(inContext ? { context: "" } : { specs: "" }) },
+    doc,
+    note: doc
+      ? null
+      : `Category document: input ${inContext ? 3 : 4} lists ${list.length} MCAT(s) but not ${label}, so its thin ISQs and measurements were not checked against it.`,
+  };
+}
 
 const COMPACT_NOTE = (step: string) =>
   `The ${step} prompt was too long for this model, so it was re-sent in compact form (shorter context excerpt, fewer values and specs).`;
 
 /** Prompts as they'd be sent, before any model call (for the "View prompts" panel). */
-export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
+export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
   // Several MCATs in the listings: every MCAT gets its own set of calls, so preview (and cost) all of them.
-  const slices = splitByMcat(inputs);
+  const slices = splitByMcat(rawInputs);
   if (slices.length > 1)
     return slices.flatMap((s) =>
       previewPrompts(s.inputs).map((p) => ({ ...p, title: `${s.name} · ${p.title}` })),
     );
+  const { inputs, doc } = withCategoryDoc(rawInputs);
 
   const prep = prepare(inputs);
   const include = prep.mcat ? MCAT_SKILLS : null;
@@ -534,21 +583,19 @@ export function previewPrompts(inputs: PipelineInputs): PromptRecord[] {
       },
     ],
   });
-  out.push({
-    id: "ranges",
-    stage: "ranges",
-    title: "4 · Numeric ranges — lower and upper bounds",
-    messages: [
-      { role: "system", content: RANGES_SYSTEM },
-      {
-        role: "user",
-        content:
-          "[Preview: at run time this lists the final filters (at most " +
-          MAX_FILTERS +
-          ") that have numbers in their ISQ values, with every value and the listing stats behind it.]",
-      },
-    ],
-  });
+  if (doc?.isqs.length)
+    out.push({
+      id: "select",
+      stage: "select",
+      title: "4 · Category document — pair ISQs and values",
+      messages: [
+        { role: "system", content: DOC_MATCH_SYSTEM },
+        {
+          role: "user",
+          content: `[Preview: at run time this lists the ISQs (at most ${MAX_FILTERS}) that are measurements or have one High value or none, with their values, and the category document's ${doc.isqs.length} ISQs for ${doc.name || "this MCAT"}:]\n${doc.isqs.map((q) => `${q.name}: ${q.values.join(" | ")}`).join("\n")}`,
+        },
+      ],
+    });
   return out;
 }
 
@@ -659,17 +706,8 @@ function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } 
       rationale: String(f?.rationale ?? "").trim(),
       needs_new_isq: Boolean(f?.needs_new_isq),
       isq_note: f?.isq_note ? String(f.isq_note) : null,
-      ...(Array.isArray(f?.suggested_values)
-        ? {
-            ai_values: [
-              ...new Set(
-                f.suggested_values
-                  .map((v: unknown) => String(v).trim().slice(0, 40))
-                  .filter(Boolean),
-              ),
-            ] as string[],
-          }
-        : {}),
+      // "suggested_values" is no longer asked for or read: what the data lacks comes from the category
+      // document (skill 15), not from the model.
     };
   });
   const result: FilterResult = {
@@ -859,6 +897,13 @@ export function fixResult(
   const confScore: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
   const byTier = (t: Tier) => r.filters.filter((f) => f.tier === t).sort((a, b) => a.rank - b.rank);
 
+  // Price and seller location are never ISQs (skill 15): out before the tier counts, so they take no slot.
+  r.filters = r.filters.filter((f) => {
+    if (!isExcludedIsq(f.name)) return true;
+    fixes.push(`Removed "${f.name}": price and location are not shown as ISQs.`);
+    return false;
+  });
+
   // Duplicates (same normalised name) — keep the first.
   const seen = new Set<string>();
   r.filters = r.filters.filter((f) => {
@@ -991,10 +1036,12 @@ const pctOf = (n: number, d: number) => (d ? `${Math.round((n / d) * 100)}%` : "
 
 export async function runPipeline(
   settings: LlmSettings,
-  inputs: PipelineInputs,
+  rawInputs: PipelineInputs,
   hooks: RunHooks,
 ): Promise<PipelineRun> {
   const { onStep, signal } = hooks;
+  // Input 3 as the category document: this MCAT's entry, used only by the select step (skill 15).
+  const { inputs, doc, note: docNote } = withCategoryDoc(rawInputs);
   const from = hooks.from;
   // Re-running from a step asks the model afresh for that step (from "prepare": for every step).
   // Labelling and spec merging don't depend on each other; the design step is always asked afresh
@@ -1007,7 +1054,7 @@ export async function runPipeline(
   let usage: Usage = {};
   let calls = 0;
   const prompts: PromptRecord[] = [];
-  const warnings: string[] = [];
+  const warnings: string[] = docNote ? [docNote] : [];
 
   const started: Partial<Record<StepId, number>> = {};
   const step = (id: StepId, status: StepStatus, patch: Partial<Step> = {}) => {
@@ -1125,7 +1172,7 @@ export async function runPipeline(
    * compact form if the provider says it's too long for the model.
    */
   const ask = async (
-    id: "label" | "fields" | "design" | "ranges",
+    id: "label" | "fields" | "design" | "select",
     title: string,
     build: (budget: PromptBudget) => ChatMessage[],
     maxTokens: number,
@@ -1388,7 +1435,7 @@ export async function runPipeline(
     // read better than a terse answer, so this is sized generously rather than minimised.
     uiDesign ? 3200 : 2200,
     "medium",
-    from === "check",
+    from === "check" || from === "select",
     MCAT_SKILLS.design && prep.mcat ? MCAT_SKILLS.design : [],
   );
   const { result, links } = normalizeResult(designData);
@@ -1472,75 +1519,93 @@ export async function runPipeline(
         .join("\n")}`,
   });
 
-  // 6 · lower and upper bounds for the numeric ISQ values: one small call on the final filters. Code keeps
-  // a bound only when its number is in the option's own text, so a failure here only leaves plain labels.
-  if (!result.filters.some((f) => f.values.some((v) => /\d/.test(v)))) {
-    step("ranges", "skipped", { calls: 0, detail: "no ISQ value has a number" });
-  } else {
-    step("ranges", "running");
-    try {
-      const {
-        data,
-        cached,
-        usage: rangesUsage,
-        compact,
-      } = await ask(
-        "ranges",
-        "4 · Numeric ranges — lower and upper bounds",
-        () => [
-          { role: "system", content: RANGES_SYSTEM },
-          { role: "user", content: buildRangesUser(result.filters, listing) },
-        ],
-        2500,
-        "off",
-        from !== "ranges" && from !== "prepare",
-      );
-      const applied = applyRanges(result.filters, data, listing);
-      if (applied.skipped.length)
-        warnings.push(
-          `Ranges: ${applied.skipped.length} option(s) stay plain labels because the bounds the model gave aren't in the option's own text (${applied.skipped.slice(0, 5).join("; ")}${applied.skipped.length > 5 ? "; …" : ""}).`,
-        );
-      step("ranges", "done", {
-        calls: cached ? 0 : 1,
-        cached,
-        usage: rangesUsage,
-        detail: `${applied.options} option(s) in ${applied.filters} filter(s) have bounds${applied.inferred ? ` · ${applied.inferred} read by code` : ""}${applied.regrouped ? ` · ${applied.regrouped} regrouped` : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
-        stats: [
-          { label: "filters with bounds", value: applied.filters },
-          { label: "options with bounds", value: applied.options },
-          { label: "filters read by code", value: applied.inferred },
-          { label: "filters regrouped into ranges", value: applied.regrouped },
-          { label: "options left as labels", value: applied.skipped.length },
-        ],
-        output: [
-          ...result.filters
-            .filter((f) => f.ranges?.length || f.dimensions)
-            .map(
-              (f) =>
-                `${f.name}  (${filterRangeText(f)}):\n${rangeLines(f)
-                  .map((l) => `  ${l}`)
-                  .join("\n")}`,
-            ),
-          JSON.stringify(data, null, 2),
-        ].join("\n\n"),
-      });
-    } catch (err) {
-      if ((err as Error).name === "AbortError") throw err;
-      // The model call failed: code still reads the numeric filters, so none is left unprocessed.
-      let applied = { inferred: 0 };
+  // 6 · select the ISQs and values that are shown (skill 15): measurements cleaned to one unit, duplicates
+  // removed, thin ISQs topped up, High / Medium values only, then the tier rules and a check of all of it.
+  // One small call pairs the ISQs that need it with the category document. The bounds step is switched off.
+  step("select", "running");
+  {
+    const need = doc?.isqs.length ? isqsNeedingDoc(result.filters, evidence) : [];
+    // Measurements are paired with the document by name, in code; only the rest (thin ISQs) need the model.
+    const sure = doc ? measurementPairs(need, doc) : new Map();
+    const toAsk = need.filter((f) => !sure.has(f));
+    let data: unknown = null;
+    let stepCalls = 0;
+    let stepUsage: Usage = {};
+    let cached = false;
+    let compact = false;
+    let failedCall = "";
+    if (doc && toAsk.length) {
       try {
-        applied = applyRanges(result.filters, null, listing);
-      } catch {
-        // the filters stay as plain labels
+        const out = await ask(
+          "select",
+          "4 · Category document — pair ISQs and values",
+          () => [
+            { role: "system", content: DOC_MATCH_SYSTEM },
+            { role: "user", content: buildDocMatchUser(prep.mcat?.name ?? doc.name, toAsk, doc) },
+          ],
+          Math.min(1800, 300 + toAsk.length * 150),
+          "off",
+          from !== "select" && from !== "prepare",
+        );
+        ({ data, cached, compact } = out);
+        stepUsage = out.usage;
+        stepCalls = cached ? 0 : 1;
+      } catch (err) {
+        if ((err as Error).name === "AbortError") throw err;
+        // Code still pairs identical names and values, so the step isn't lost.
+        failedCall = (err as Error).message;
+        warnings.push(
+          `Category document: the pairing call failed (${failedCall}); only names and values that are the same in both were paired.`,
+        );
       }
-      warnings.push(
-        `Numeric ranges: the model call failed (${(err as Error).message}); ${applied.inferred ? `${applied.inferred} filter(s) were read by code instead` : "no filter could be read by code, so the ISQ values stay as plain labels"}.`,
-      );
-      step("ranges", "error", {
-        detail: `model call failed · ${applied.inferred} filter(s) read by code`,
-        output: (err as Error).message,
-      });
     }
+    const pairs = doc ? parseDocPairs(data, need, doc) : [];
+    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking);
+    warnings.push(...report.warnings, ...report.failed.map((x) => `Check failed: ${x}`));
+    const shown = result.filters.filter((f) => f.selected);
+    step("select", report.failed.length ? "error" : "done", {
+      calls: stepCalls,
+      cached,
+      usage: stepUsage,
+      detail: `${report.selected} of ${report.total} ISQs shown · ${shown.reduce((n, f) => n + (f.selected_values?.length ?? 0), 0)} values${doc ? ` · category document used on ${report.usedDoc}` : " · no category document for this MCAT"}${report.failed.length ? ` · ${report.failed.length} check(s) failed` : " · all checks passed"}${failedCall ? " · pairing call failed" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+      stats: [
+        { label: "ISQs shown", value: report.selected },
+        { label: "not shown", value: report.total - report.selected },
+        {
+          label: "values shown",
+          value: shown.reduce((n, f) => n + (f.selected_values?.length ?? 0), 0),
+        },
+        { label: "measurements paired by code", value: sure.size },
+        { label: "sent to the model for pairing", value: toAsk.length },
+        { label: "paired with the document", value: pairs.length },
+        { label: "used the document", value: report.usedDoc },
+        { label: "checks failed", value: report.failed.length },
+      ],
+      input: doc
+        ? `Category document for ${doc.name || "this MCAT"} (${doc.isqs.length} ISQs):\n${doc.isqs.map((q) => `  ${q.name}: ${q.values.join(" | ")}`).join("\n")}`
+        : (docNote ?? "No category document in input 3 for this MCAT."),
+      output: [
+        `Shown:\n${shown.map((f) => `  ${f.tier} · ${f.confidence} · ${f.name}${f.unit ? ` [${f.unit}]` : ""}: ${(f.selected_values ?? []).map((v) => `${v} (${f.value_confidence?.find((c) => c.value === v)?.level[0] ?? "-"})`).join(", ")}`).join("\n") || "  (none)"}`,
+        `Not shown:\n${
+          result.filters
+            .filter((f) => !f.selected)
+            .map((f) => `  ${f.tier} · ${f.confidence} · ${f.name} — ${f.select_note ?? ""}`)
+            .join("\n") || "  (none)"
+        }`,
+        pairs.length
+          ? `Paired with the category document:\n${pairs.map((p) => `  ${p.filter.name} ↔ ${p.isq.name}`).join("\n")}`
+          : "",
+        report.notes.length
+          ? `What was changed:\n${report.notes.map((x) => `  • ${x}`).join("\n")}`
+          : "",
+        report.failed.length
+          ? `Check failed:\n${report.failed.map((x) => `  • ${x}`).join("\n")}`
+          : "Check: every rule holds.",
+        data ? JSON.stringify(data, null, 2) : failedCall,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+    });
   }
 
   // A multi-MCAT run is named after its MCAT, not after whatever the model made of the shared keywords.
@@ -1590,11 +1655,11 @@ export function estimateRun(prompts: PromptRecord[]): RunEstimate {
       // brief reasoning pass per candidate (skill 08) — sized for that, not for minimum output.
       outputTokens += p.messages[1]?.content.includes("UI DESIGN IS SWITCHED OFF") ? 1400 : 2200;
   }
-  // The ranges prompt is only a placeholder before the run: its real message lists up to MAX_FILTERS filters
-  // with all their values, and the answer is one entry per numeric option.
-  if (prompts.some((p) => p.id === "ranges")) {
-    inputTokens += 700;
-    outputTokens += 500;
+  // The pairing prompt is a placeholder before the run: its real message also lists the ISQs that need the
+  // category document with their values, and the answer is one short pair per ISQ.
+  if (prompts.some((p) => p.id === "select")) {
+    inputTokens += 400;
+    outputTokens += 350;
   }
   // The design step's evidence grows once step 1's labels are added.
   if (prompts.some((p) => p.id === "label")) inputTokens += 600;

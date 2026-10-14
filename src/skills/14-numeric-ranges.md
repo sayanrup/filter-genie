@@ -1,5 +1,9 @@
 # Skill 14 · Numeric ranges (lower and upper bounds for ISQ values)
 
+> **Switched off.** The pipeline no longer runs this step: measurements are now cleaned to one spelling and
+> one unit, and checked, in the select step (skill 15). The code (`src/lib/ranges.ts`) and this doc are kept,
+> so saved results that carry ranges still show them.
+
 Some ISQ values are quantities: a price band, a size, a capacity, a thickness. As plain text they can only
 be matched as text. This step gives each such value a **lower and an upper bound**, so a search can match
 listings by number ("100–200 sq ft") instead of by the option's label. Values that are sizes written as
