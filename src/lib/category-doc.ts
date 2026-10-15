@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- the document and the model's reply are untyped JSON, read field by field */
 import type { FilterRow } from "./filter-gen";
 import { parseSpecAudit, type Json } from "./mcat-context";
-import { parseQuantity } from "./quantity";
+import { measureKind, parseQuantity } from "./quantity";
 
 /*
  * The category document (skill 15): per MCAT, the "Buyer Attracting Seller Specs" of its Seller & Buyer Spec
@@ -13,6 +13,10 @@ import { parseQuantity } from "./quantity";
  *   - the JSON saved by scripts/fetch-mcat-context.ts (`[{mcat_id, mcat_name, buyer_attracting_seller_specs:
  *     [{attribute, values}]}, …]`), which is then kept out of the model's context, or
  *   - the audit's own markdown (what "Load spec audit" puts there), which the model still reads as before.
+ *
+ * Input 4 can be JSON of the same kind, such as the live ISQs saved by scripts/fetch-isq.ts (`isqs: [{name,
+ * values}]`, or `options: [{value}]` as the API gives them). When input 3 is the document, input 4 is read as the
+ * ranking: this MCAT's ISQ names in their order (rankingText). Otherwise input 4 is the document.
  */
 
 export interface DocIsq {
@@ -65,6 +69,18 @@ export function rejoinCutNumbers(values: string[]): string[] {
   return out;
 }
 
+/** Questions every buyer form asks (in the getisq API's lists): not product attributes, so never ISQs here. */
+const BUYER_FORM =
+  /^(quantity|quantity unit|i am interested in|finance\s*\/?\s*loan requirement|business type)$/i;
+
+/** A value as text: a string, or an option object (`{value}`, as the getisq API's options are), unless inactive. */
+const valueText = (v: any): string | null =>
+  typeof v === "string"
+    ? v
+    : v && typeof v === "object" && typeof v.value === "string" && v.active !== false
+      ? v.value
+      : null;
+
 function isqsOf(rows: unknown): DocIsq[] {
   const out: DocIsq[] = [];
   for (const row of Array.isArray(rows) ? rows : []) {
@@ -73,9 +89,13 @@ function isqsOf(rows: unknown): DocIsq[] {
     const name = ISQ_NAME_KEYS.map((k) => rec[k]).find((x) => typeof x === "string" && x.trim());
     const values = ISQ_VALUE_KEYS.map((k) => rec[k]).find((x) => Array.isArray(x));
     if (typeof name !== "string" || !Array.isArray(values)) continue;
+    if (rec.active === false || BUYER_FORM.test(clean(name))) continue;
     const seen = new Set<string>();
     const list: string[] = [];
-    const texts = values.filter((v: unknown): v is string => typeof v === "string").map(clean);
+    const texts = values
+      .map(valueText)
+      .filter((v: string | null): v is string => v !== null)
+      .map(clean);
     for (const v of rejoinCutNumbers(texts)) {
       if (!v || seen.has(norm(v))) continue;
       seen.add(norm(v));
@@ -127,6 +147,14 @@ export function parseCategoryDoc(text: string): DocMcat[] | null {
   }
   lastParse = { text, list };
   return list;
+}
+
+/**
+ * An MCAT's ISQs as a ranking in the plain form input 4 takes, one per line in their order:
+ * "1-Candy Type\n2-Automation Grade". Values are left out: the ranking is about which ISQs matter.
+ */
+export function rankingText(m: DocMcat): string {
+  return m.isqs.map((q, i) => `${i + 1}-${q.name}`).join("\n");
 }
 
 /** This run's MCAT in the document: by id, then by name; a document of one MCAT is that MCAT's. */
@@ -187,16 +215,26 @@ export interface DocPair {
 }
 
 const MEASURE_WORD =
-  /\b(area|size|dimensions?|length|width|breadth|height|thickness|diameter|depth|span)\b/gi;
+  /\b(area|size|dimensions?|length|width|breadth|height|thickness|diameter|depth|span|capacity|output|throughput|power|wattage|weight|load|volume)\b/gi;
+const FIGURE_WORD = /^(capacity|power|weight|volume)$/;
 
-/** The measurement words in an ISQ's name: "Cabin Dimensions" → ["size"], "Clear Span Width" → ["span", "width"]. */
+/**
+ * The measurement words in an ISQ's name: "Cabin Dimensions" → ["size"], "Clear Span Width" → ["span", "width"],
+ * "Production Output" → ["capacity"]. Machine-figure words count only when the name is a figure (measureKind),
+ * so "Power Source" has none.
+ */
 function measureWords(name: string): string[] {
+  const figure = Boolean(measureKind(name));
   const out: string[] = [];
   for (const m of name.matchAll(MEASURE_WORD)) {
     const w = m[0]
       .toLowerCase()
       .replace(/^dimensions?$/, "size")
-      .replace("breadth", "width");
+      .replace("breadth", "width")
+      .replace(/^(output|throughput)$/, "capacity")
+      .replace("wattage", "power")
+      .replace("load", "weight");
+    if (FIGURE_WORD.test(w) && !figure) continue;
     if (!out.includes(w)) out.push(w);
   }
   return out;

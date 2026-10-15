@@ -19,9 +19,10 @@ export interface ValueConfidence {
   demand_pct?: number | null;
   /**
    * Where the value came from (skill 15): the filter's own values ("data"), a listing value added because the
-   * ISQ was thin ("listing"), or the category document ("doc"). Absent on results from before that step.
+   * ISQ was thin ("listing"), the category document ("doc"), or the live ISQ in input 4 ("live"), which a text
+   * ISQ mixing figures with words takes its values from. Absent on results from before that step.
    */
-  source?: "data" | "listing" | "doc";
+  source?: "data" | "listing" | "doc" | "live";
   /** The category document lists this value, which raised its level by one. */
   lifted?: boolean;
 }

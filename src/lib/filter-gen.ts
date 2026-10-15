@@ -54,6 +54,7 @@ import {
   measurementPairs,
   parseCategoryDoc,
   parseDocPairs,
+  rankingText,
   type DocMcat,
 } from "./category-doc";
 import { isExcludedIsq, isqsNeedingDoc, selectIsqs } from "./select-isqs";
@@ -488,10 +489,13 @@ const STEP_NAME = {
  * The category document (skill 15), pasted or uploaded as JSON into input 3 (or input 4): this run's MCAT in
  * it. The JSON is kept out of the model's prompt (it is only for thin ISQs and measurements), so that input is
  * emptied; audit markdown in input 3 stays as it is and its "Buyer Attracting Seller Specs" table is read from it.
+ * With the document in input 3, JSON in input 4 (the live ISQs) becomes this MCAT's ranking: its ISQ names in order.
  */
 function withCategoryDoc(inputs: PipelineInputs): {
   inputs: PipelineInputs;
   doc: DocMcat | null;
+  /** This MCAT's live ISQs (input 4 as JSON beside the document): cluttered text ISQs take their values. */
+  live: DocMcat | null;
   note: string | null;
 } {
   const who = inputs.mcat
@@ -500,18 +504,30 @@ function withCategoryDoc(inputs: PipelineInputs): {
   // The document is looked for in input 3 first, then in input 4: wherever it was pasted, it is recognised
   // by what it holds (MCATs with their ISQs and values), and that input is then not read as text.
   const inContext = parseCategoryDoc(inputs.context);
-  const inSpecs = inContext ? null : parseCategoryDoc(inputs.specs);
+  const specsJson = parseCategoryDoc(inputs.specs);
+  const inSpecs = inContext ? null : specsJson;
   const list = inContext ?? inSpecs;
-  if (!list) return { inputs, doc: docFromAuditMarkdown(inputs.context, who), note: null };
-  const doc = docEntryFor(list, who);
   const label =
     `${who?.name ?? ""}${who?.id ? ` (MCAT ID ${who.id})` : ""}`.trim() || "this run's MCAT";
+  // Input 3 is the document and input 4 is JSON too (the live ISQs, say): input 4 is this MCAT's ranking, as
+  // its ISQ names in order, so the model and the ranking reader see a plain ranked list, not JSON.
+  const ranked = inContext && specsJson ? docEntryFor(specsJson, who) : null;
+  const rankingNote =
+    inContext && specsJson && !ranked?.isqs.length
+      ? `Ranking: input 4 lists ${specsJson.length} MCAT(s) but no ISQs for ${label}, so this run has no ranking.`
+      : null;
+  const specs = inContext && specsJson ? { specs: ranked ? rankingText(ranked) : "" } : {};
+  if (!list)
+    return { inputs, doc: docFromAuditMarkdown(inputs.context, who), live: null, note: null };
+  const doc = docEntryFor(list, who);
+  const docNote = doc
+    ? null
+    : `Category document: input ${inContext ? 3 : 4} lists ${list.length} MCAT(s) but not ${label}, so its thin ISQs and measurements were not checked against it.`;
   return {
-    inputs: { ...inputs, ...(inContext ? { context: "" } : { specs: "" }) },
+    inputs: { ...inputs, ...(inContext ? { context: "", ...specs } : { specs: "" }) },
     doc,
-    note: doc
-      ? null
-      : `Category document: input ${inContext ? 3 : 4} lists ${list.length} MCAT(s) but not ${label}, so its thin ISQs and measurements were not checked against it.`,
+    live: ranked?.isqs.length ? ranked : null,
+    note: [docNote, rankingNote].filter(Boolean).join(" ") || null,
   };
 }
 
@@ -1041,7 +1057,7 @@ export async function runPipeline(
 ): Promise<PipelineRun> {
   const { onStep, signal } = hooks;
   // Input 3 as the category document: this MCAT's entry, used only by the select step (skill 15).
-  const { inputs, doc, note: docNote } = withCategoryDoc(rawInputs);
+  const { inputs, doc, live, note: docNote } = withCategoryDoc(rawInputs);
   const from = hooks.from;
   // Re-running from a step asks the model afresh for that step (from "prepare": for every step).
   // Labelling and spec merging don't depend on each other; the design step is always asked afresh
@@ -1560,7 +1576,7 @@ export async function runPipeline(
       }
     }
     const pairs = doc ? parseDocPairs(data, need, doc) : [];
-    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking);
+    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking, live);
     warnings.push(...report.warnings, ...report.failed.map((x) => `Check failed: ${x}`));
     const shown = result.filters.filter((f) => f.selected);
     step("select", report.failed.length ? "error" : "done", {

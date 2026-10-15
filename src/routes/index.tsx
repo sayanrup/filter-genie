@@ -1716,8 +1716,8 @@ function Index() {
         <InputPanel
           step={4}
           title="Spec importance ranking"
-          hint="The category manager's ranked spec list or tiers."
-          accept=".txt,.md,.csv"
+          hint="The category manager's ranked spec list or tiers. Or JSON with each MCAT's ISQs (saved-results/…isqforupload.json): with the category document in input 3, each MCAT's ISQs, in their order, are its ranking."
+          accept=".txt,.md,.csv,.json"
           placeholder={
             "Green (top): 1-Size, 2-Material, 3-Application\nYellow (mid): 4-Built Type, 5-Insulation\nPurple (low): 6-Brand, 7-Roof Type"
           }

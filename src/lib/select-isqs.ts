@@ -1,10 +1,16 @@
 import type { Evidence, FilterRow } from "./filter-gen";
-import type { DocPair } from "./category-doc";
+import type { DocMcat, DocPair } from "./category-doc";
 import {
   axisOf,
   conform,
+  countsFor,
   dominantShape,
+  figuresIn,
   formatQuantity,
+  isSpatial,
+  KIND_PLURAL,
+  kindName,
+  MEASURE_PLURAL,
   measureKind,
   parseQuantity,
   quantityKey,
@@ -18,7 +24,8 @@ import { HIGH_AT, MEDIUM_AT, type ValueConfidence, type ValueLevel } from "./val
  * Skill 15 · which ISQs and which of their values are finally shown. Runs after the check step, all in code
  * (one small model call before it pairs ISQs with the category document, see category-doc.ts):
  *
- *   values   1. measurements (Area, Size, Length, Width, Height…) get one spelling, one unit and one count of
+ *   values   1. measurements (Area, Size, Length, Width, Height…, and machine figures: Capacity, Output, Power,
+ *               Weight, Volume in kg/hr, L, kW…) get one spelling, one unit and one count of
  *               numbers (a Length or Width is one; an Area or Size one, two or three, as the category document
  *               writes it). When the document has the same measurement, the ISQ's values ARE the document's
  *               (paired by name, in code; nothing of ours is added, the data only scores them). Without one,
@@ -277,6 +284,8 @@ interface Work {
   usedDoc: boolean;
   /** A measurement whose values were taken from the category document: nothing else is added to them. */
   fromDoc: boolean;
+  /** The live ISQ (input 4) whose values this text ISQ took because its own mixed figures with words. */
+  fromLive: string | null;
   notes: string[];
   warnings: string[];
 }
@@ -318,6 +327,7 @@ function buildWork(
     mergedInto: null,
     usedDoc: false,
     fromDoc: false,
+    fromLive: null,
     notes: [],
     warnings: [],
   };
@@ -337,14 +347,14 @@ function buildWork(
           measure,
         )
       : null;
-  // The category document's ISQ makes it a measurement whatever our own values look like.
-  if (
-    measure &&
-    (docShape || (base.length && parsed.filter(Boolean).length / base.length >= 0.3))
-  ) {
+  const counted = parsed.filter((q) => q && countsFor(q, measure ?? "size")).length;
+  // The category document's ISQ makes an area, length or size a measurement whatever our own values look like.
+  // A machine figure needs at least one number of its own too, so "Output" holding "Single", "Dual" stays text.
+  const docMakesIt = Boolean(docShape) && (isSpatial(measure ?? "size") || counted > 0);
+  if (measure && (docMakesIt || (base.length && counted / base.length >= 0.3))) {
     if (pair && !docShape) {
       w.notes.push(
-        `"${f.name}": the category document's "${pair.isq.name}" doesn't hold ${measure === "area" ? "areas" : measure === "length" ? "lengths" : "sizes"}, so it wasn't used.`,
+        `"${f.name}": the category document's "${pair.isq.name}" doesn't hold ${MEASURE_PLURAL[measure]}, so it wasn't used.`,
       );
       w.pair = null;
     }
@@ -389,7 +399,7 @@ function buildWork(
       });
       if (dropped.length)
         w.notes.push(
-          `"${f.name}": left out ${dropped.join(", ")}; its values are ${shape.kind === "dims" ? `${shape.axes} numbers (${shape.axes === 2 ? "length x width" : "length x width x height"})` : `one number (${shape.kind === "area" ? "an area" : "a length"})`} in ${shape.unit}${docShape ? `, as in the category document's "${pair!.isq.name}"` : ""}.`,
+          `"${f.name}": left out ${dropped.join(", ")}; its values are ${shape.kind === "dims" ? `${shape.axes} numbers (${shape.axes === 2 ? "length x width" : "length x width x height"})` : `one number (${kindName(shape.kind)})`} in ${shape.unit}${docShape ? `, as in the category document's "${pair!.isq.name}"` : ""}.`,
         );
     }
   }
@@ -591,8 +601,12 @@ function boost(w: Work) {
     for (const it of w.items) {
       if (it.vc.level === "High" || it.vc.source === "doc") continue;
       const paired = it.origs.map((o) => pair.values.get(o)).find(Boolean);
-      const docLabel = docKeys.get(it.key) ?? (paired ? w.labelOf(paired) : undefined);
-      if (!docLabel) continue;
+      const found = docKeys.get(it.key) ?? (paired ? w.labelOf(paired) : undefined);
+      if (!found) continue;
+      // Our wording stays when the document's adds a figure ours doesn't have: "Electric" is not
+      // "0.5 kW Electric", which is one of several ratings the document wrote into one value.
+      const docLabel =
+        !w.measure && hasFigure(found) && !hasFigure(it.vc.value) ? it.vc.value : found;
       const to = lift(it.vc.level);
       lifted.push(
         `${it.vc.value}${docLabel !== it.vc.value ? ` → ${docLabel}` : ""} (${it.vc.level} → ${to})`,
@@ -659,6 +673,179 @@ function boost(w: Work) {
   if (added.length) w.notes.push(`"${w.f.name}" was thin: added ${added.join(", ")}.`);
 }
 
+// ───────────────────────────── 4 · a text ISQ that mixes figures with words ─────────────────────────────
+
+/** A value with a number and a unit in it ("1 HP", "0.5 kW Electric"); counts like "2 Seater" have none. */
+const hasFigure = (v: string) => figuresIn(v).length > 0;
+
+/**
+ * This ISQ in the live ISQs (input 4): the same name (ignoring filler words like "Type"), one name inside the
+ * other, or else the one live ISQ that shares the most values with it (a tie is none).
+ */
+function liveFor(w: Work, live: DocMcat): DocMcat["isqs"][number] | null {
+  const mine = nameTokens(w.f.name).join(" ");
+  const named = live.isqs.find((q) => nameTokens(q.name).join(" ") === mine);
+  if (named) return named;
+  const own = new Set(nameTokens(w.f.name));
+  const inside = live.isqs.filter((q) => {
+    const t = nameTokens(q.name);
+    return (
+      t.length > 0 &&
+      own.size > 0 &&
+      (t.every((x) => own.has(x)) || [...own].every((x) => t.includes(x)))
+    );
+  });
+  if (inside.length === 1) return inside[0]!;
+  const keys = new Set(w.items.map((it) => it.key));
+  const scored = live.isqs
+    .map((q) => ({ q, n: q.values.filter((v) => keys.has(w.keyOf(v) ?? "")).length }))
+    .filter((x) => x.n >= 2)
+    .sort((a, b) => b.n - a.n);
+  return scored[0] && scored[0].n !== scored[1]?.n ? scored[0].q : null;
+}
+
+/** A name that counts something: "Number of Trays", "No. of Decks", "Capacity (Trays)", "Tray Count". */
+const COUNT_NAME = /\b(number|no|nos|count|capacity)\b/i;
+const COUNT_FILLER = new Set([
+  "number",
+  "no",
+  "nos",
+  "count",
+  "capacity",
+  "of",
+  "the",
+  "per",
+  "and",
+]);
+const COUNT_VALUE = /^(\d+(?:\.\d+)?)\s*([a-z]+)$/i;
+/** A count word without its plural, for comparing "Tray" with "Trays". */
+const countStem = (word: string) => stem(word.toLowerCase());
+
+/**
+ * What a count ISQ counts, from its name and its values: "Number of Trays" with "24 Tray", "40 Trays" → tray,
+ * written "Tray" / "Trays" as the name has it. null when the name isn't a count or fewer than two values are.
+ */
+function countOf(w: Work): { stem: string; singular: string; plural: string } | null {
+  if (!COUNT_NAME.test(w.f.name)) return null;
+  let best: { word: string; n: number } | null = null;
+  for (const word of w.f.name.match(/[a-z]+/gi) ?? []) {
+    if (word.length < 3 || COUNT_FILLER.has(word.toLowerCase())) continue;
+    const n = w.items.filter((it) => {
+      const m = it.vc.value.trim().match(COUNT_VALUE);
+      return m && countStem(m[2]!) === countStem(word);
+    }).length;
+    if (n >= 2 && (!best || n > best.n)) best = { word, n };
+  }
+  if (!best) return null;
+  const plural = /s$/i.test(best.word) ? best.word : `${best.word}s`;
+  return { stem: countStem(best.word), singular: plural.replace(/(e?s)$/i, ""), plural };
+}
+
+/**
+ * A text ISQ that holds two attributes: its values mix figures with words ("0.5 kW Electric", "Gas", "1 HP",
+ * "20 kW" under Power Source), or a count ISQ has values that aren't counts ("Conical Rounder" and "10 Kg/Hour"
+ * among "24 Tray", "40 Trays" under Number of Trays). With the live ISQ in input 4, its values are the live
+ * ISQ's, scored on the data and Medium at the least. Without one, what doesn't belong goes: the non-counts of a
+ * count ISQ when counts are most of its values, else the figures when words are; otherwise it is left as it is,
+ * with a warning. A count ISQ's own values are written one way ("1 Tray", "24 Trays").
+ */
+function declutter(w: Work, live: DocMcat | null) {
+  if (!w.eligible || w.mergedInto || w.measure) return;
+  const list = (items: Item[]) => items.map((it) => it.vc.value).join(", ");
+  const figures = w.items.filter((it) => hasFigure(it.vc.value));
+  const words = w.items.filter((it) => !hasFigure(it.vc.value));
+  const mixed = figures.length > 0 && words.length > 0;
+  // Figures go when words are most of the values; what is left is then checked as a count.
+  const kept = mixed && words.length >= figures.length ? words : w.items;
+  const count = countOf(w);
+  const isCount = (it: Item) => {
+    const m = it.vc.value.trim().match(COUNT_VALUE);
+    return Boolean(count && m && countStem(m[2]!) === count.stem);
+  };
+  const counts = kept.filter(isCount);
+  const strays = count ? kept.filter((it) => !isCount(it)) : [];
+  // Counts must be a clear majority before anything else in a count ISQ is called a stray.
+  const countISQ = Boolean(count) && counts.length >= 2 * strays.length;
+  const strayCounts = countISQ && strays.length > 0;
+
+  const tidyCounts = () => {
+    for (const it of counts) {
+      const n = it.vc.value.trim().match(COUNT_VALUE)![1]!;
+      const label = `${n} ${Number(n) === 1 ? count!.singular : count!.plural}`;
+      if (label !== it.vc.value) it.vc = { ...it.vc, value: label };
+    }
+  };
+  if (!mixed && !strayCounts) {
+    if (countISQ) tidyCounts();
+    return;
+  }
+  const mixes = [
+    mixed ? `figures (${list(figures)}) with words (${list(words)})` : "",
+    strayCounts
+      ? `${count!.plural.toLowerCase()} (${list(counts)}) with other things (${list(strays)})`
+      : "",
+  ];
+  const why = `its values mixed ${mixes.filter(Boolean).join(", and ")}`;
+
+  const isq = live ? liveFor(w, live) : null;
+  if (isq) {
+    const items: Item[] = [];
+    for (const v of isq.values) {
+      const key = w.keyOf(v);
+      if (!key || items.some((it) => it.key === key)) continue;
+      const own = w.items.find((it) => it.key === key);
+      const s = score(w.groups.get(key), w.src);
+      items.push({
+        key,
+        origs: own?.origs ?? [],
+        vc: {
+          value: w.labelOf(v),
+          ...s,
+          level: s.level === "Low" ? "Medium" : s.level,
+          why: `${s.level === "Low" && s.listings === 0 && s.demand_pct === null ? "" : `${s.why} · `}from the live ISQ ${isq.name}`,
+          source: "live",
+        },
+      });
+    }
+    if (items.length >= MIN_VALUES) {
+      w.notes.push(
+        `"${w.f.name}": ${why}, so they were taken from the live ISQ "${isq.name}" (input 4): ${list(items)}.`,
+      );
+      w.items = items;
+      w.fromLive = isq.name;
+      return;
+    }
+  }
+
+  // Without a live ISQ: what doesn't belong goes.
+  if (mixed) {
+    if (words.length < figures.length) {
+      w.warnings.push(
+        `"${w.f.name}" mixes figures (${list(figures)}) with words (${list(words)}), and input 4 has no live ISQ for it to take values from.`,
+      );
+      return;
+    }
+    const kinds = [
+      ...new Set(
+        figures.flatMap((it) =>
+          figuresIn(it.vc.value).map((q) => KIND_PLURAL[q.kind as keyof typeof KIND_PLURAL]),
+        ),
+      ),
+    ];
+    w.items = words;
+    w.notes.push(
+      `"${w.f.name}": left out ${list(figures)}: ${kinds.join(" and ")}, not ${w.f.name} values.`,
+    );
+  }
+  if (strayCounts) {
+    w.items = counts;
+    w.notes.push(
+      `"${w.f.name}": left out ${list(strays)}: not numbers of ${count!.plural.toLowerCase()}.`,
+    );
+  }
+  if (countISQ) tidyCounts();
+}
+
 /**
  * Numeric values are listed smallest first: a measurement by its numbers ("4 x 4 ft" before "4 x 6 ft" before
  * "10 x 10 ft"; a range by where it starts, "Up to …" first and "Above …" last), and text values that all begin
@@ -706,7 +893,15 @@ function inOrder(w: Work, items: Item[]): Item[] {
  */
 function shown(w: Work): Item[] {
   const high = highs(w);
-  return inOrder(w, sorted(high.length >= HIGH_ONLY_AT ? high : strong(w)));
+  return ordered(w, high.length >= HIGH_ONLY_AT ? high : strong(w));
+}
+
+/**
+ * Values in their display order: a live ISQ's in its own order, the rest best first; either way, values that
+ * all begin with a number go smallest first ("1 Tray", "2 Trays", "4 Trays").
+ */
+function ordered(w: Work, items: Item[]): Item[] {
+  return inOrder(w, w.fromLive ? w.items.filter((it) => items.includes(it)) : sorted(items));
 }
 
 // ───────────────────────────── the MCAT's ISQs ─────────────────────────────
@@ -784,6 +979,8 @@ export function selectIsqs(
   ev: Pick<Evidence, "aggregation" | "listing">,
   pairs: DocPair[],
   ranking: string[] = [],
+  /** This MCAT's live ISQs (input 4 as JSON): where a text ISQ mixing figures with words takes its values. */
+  liveIsqs: DocMcat | null = null,
 ): SelectReport {
   const pairOf = new Map(pairs.map((p) => [p.filter, p]));
   const works = filters.map((f) =>
@@ -815,6 +1012,7 @@ export function selectIsqs(
   }
 
   for (const w of works) boost(w);
+  for (const w of works) declutter(w, liveIsqs);
 
   // A value shown under two ISQs stays under the one where it is stronger (text values only).
   const shownOf = new Map(works.map((w) => [w, shown(w)]));
@@ -867,7 +1065,7 @@ export function selectIsqs(
   // Write the result back onto the filters.
   for (const w of works) {
     const f = w.f;
-    const all = inOrder(w, sorted(w.items));
+    const all = ordered(w, w.items);
     f.values = all.map((it) => it.vc.value);
     if (all.length) f.value_confidence = all.map((it) => it.vc);
     else delete f.value_confidence;
