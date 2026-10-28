@@ -223,11 +223,32 @@ const VOLUME_NAME = /\bvolume\b/i;
 const NOT_A_FIGURE =
   /\b(type|source|supply|mode|method|grade|material|phase|system|backup|factor)\b/i;
 
+/**
+ * The brackets of a name say what is counted: "Capacity (Trays)", "Capacity (People)". Brackets with a unit or a
+ * time ("Capacity (kg/hr)", "Capacity (Litres)", "Output (per hour)") don't: those are figures.
+ */
+export function countedInBrackets(name: string): string | null {
+  const inner = name.match(/\(([^)]*)\)/)?.[1]?.trim();
+  if (!inner || !/^[a-z ]+$/i.test(inner)) return null;
+  const words = inner.toLowerCase().split(/\s+/);
+  const unitish = (w: string) =>
+    Boolean(unitOf(w)) || /^(per|or|min|minutes?|hrs?|hours?|shifts?|days?)$/.test(w);
+  return words.some(unitish) ? null : inner;
+}
+
+/**
+ * Things a machine has a number of, so a name with one counts them: "Tray Capacity" is how many trays, never kg/hr;
+ * likewise decks, trolleys, burners, seats, heads, moulds, nozzles, flavours. A container is not one of them: a
+ * "Tank Capacity" or "Bowl Capacity" is a volume.
+ */
+export const COUNT_NOUN =
+  /\b(trays?|decks?|trolleys?|burners?|seats?|beds?|persons?|people|heads?|moulds?|molds?|nozzles?|outlets?|flavou?rs?|stations?|lanes?|cavit(y|ies)|wheels?|rolls?|doors?|compartments?|pans?|racks?|shelf|shelves|cylinders?|pistons?)\b/i;
+
 export function measureKind(name: string): MeasureKind | null {
   if (AREA_NAME.test(name)) return "area";
   if (LENGTH_NAME.test(name)) return "length";
   if (SIZE_NAME.test(name)) return "size";
-  if (NOT_A_FIGURE.test(name)) return null;
+  if (NOT_A_FIGURE.test(name) || countedInBrackets(name) || COUNT_NOUN.test(name)) return null;
   if (CAPACITY_NAME.test(name)) return "capacity";
   if (POWER_NAME.test(name)) return "power";
   if (WEIGHT_NAME.test(name)) return "weight";

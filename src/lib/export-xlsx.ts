@@ -2,6 +2,7 @@ import * as XLSX from "xlsx";
 import type { ContextComparison } from "./compare";
 import type { FilterResult } from "./filter-gen";
 import { filterRangeText, sizeText } from "./ranges";
+import { isShown } from "./select-isqs";
 import { valuesWithConfidence } from "./value-confidence";
 
 const TIER_ORDER: Record<string, number> = { "Tier 1": 0, "Tier 2": 1, "Tier 3": 2 };
@@ -273,23 +274,25 @@ const byTier = (r: FilterResult) =>
  * are in `values` too, with `source: "ai_suggested"` and no confidence (they aren't on any listing yet).
  */
 /**
- * The selected ISQs only (skill 15), compact: per MCAT its id and name, and each ISQ that is shown with its tier
- * (1, 2 or 3) and its own confidence as one letter (`isq_conf`), the values that are shown, and their confidence one letter each in
- * `conf` ("HHM": conf[i] belongs to values[i]). Order is the rank, so none is written: ISQs by tier then rank,
- * values best first. One MCAT per line. A result from before the select step has nothing selected, so every
- * ISQ and value of it is written.
+ * The shown ISQs only (skill 15, isShown): every Tier 1 ISQ (High, Medium or Low) and every Tier 2 High one, and
+ * nothing else. Compact: per MCAT its id and name, and each ISQ with its tier (1 or 2) and its own confidence as one
+ * letter (`isq_conf`), the values that are shown (its High and Medium ones; an ISQ with none of those, all it has),
+ * and their confidence one letter each in `conf` ("HHM": conf[i] belongs to values[i]). Order is the rank, so none
+ * is written: ISQs by tier then rank, values best first. One MCAT per line.
  */
 export function selectedIsqJson(items: McatResult[]): string {
   const mcats = items.map(({ name, result }) => {
-    const ran = result.filters.some((f) => f.selected !== undefined);
     return {
       mcat_id: result.mcat_id ?? null,
       mcat_name: result.mcat_name ?? (name || result.category_name || null),
       isqs: byTier(result)
-        .filter((f) => !ran || f.selected)
+        // Every Tier 1 ISQ (any confidence) and every Tier 2 High one; Tier 3 and Tier 2 below High never.
+        .filter(isShown)
         .map((f) => {
           const level = new Map((f.value_confidence ?? []).map((c) => [c.value, c.level]));
-          const values = (f.selected_values ?? f.values).filter((v) => !/^other\b/i.test(v.trim()));
+          const values = (f.selected_values?.length ? f.selected_values : f.values).filter(
+            (v) => !/^other\b/i.test(v.trim()),
+          );
           return {
             name: f.name,
             tier: Number(f.tier.replace(/\D/g, "")) || null,
@@ -297,8 +300,7 @@ export function selectedIsqJson(items: McatResult[]): string {
             values,
             conf: values.map((v) => level.get(v)?.[0] ?? "-").join(""),
           };
-        })
-        .filter((q) => q.values.length),
+        }),
     };
   });
   return `[\n${mcats.map((m) => JSON.stringify(m)).join(",\n")}\n]\n`;

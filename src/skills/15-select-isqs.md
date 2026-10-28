@@ -68,8 +68,14 @@ exist, their tier or their confidence.
      value: the stronger spelling stays (the specific one on a tie) and their numbers are added. With
      **several** (`Wood` beside `Pine Wood` and `Teak Wood`) the specifics are the real options, so the
      generic goes. A combination (`MS With GI`, `FRP And PVC`) is not a kind of its parts, so both stay.
-   - not values at all, and left out: `Other`, `All`, `Any`, `Etc`, `NA`, `Custom`, `As per requirement`
-     (`JUNK`); a trailing `etc` is cut (`Gray etc` → `Gray`).
+   - a short form run into its number, and spellings of one word: `SS304` = `SS 304` = `Stainless Steel 304`;
+     `Hr` = `Hour`; `Automated` = `Automatic`; `Auto` = `Automatic`; `Flavour` = `Flavor`
+   - not values at all, and left out: `Other`, `All`, `Any`, `Etc`, `NA`, `Custom`, `As per requirement` (also
+     written `Asper`), `Text` (`JUNK`); and a choice or span of options rather than one (`Large or Small`, `Both
+Thick or Thin`: `VAGUE`). A trailing `etc` is cut (`Gray etc` → `Gray`).
+   - **one way of writing**: each word capitalised the same way (`FULLY AUTOMATED` → `Fully Automated`,
+     `Line type` → `Line Type`, `Stainless Steel(SS)` → `Stainless Steel (SS)`); short forms (`SS`, `PUF`, `HP`),
+     joining words and units (`kg/hr`) stay as written.
    - of the spellings merged into one value, the one the data uses most is shown; on a tie, the standard
      one (`PUF`, not `Puff`).
 3. **Confidence per value** — the usual rule (skill 09): High ≥ 20% of the keyword demand or of the listings
@@ -81,13 +87,17 @@ exist, their tier or their confidence.
      figure ours doesn't have (`Electric` stays `Electric`, not the document's `0.5 kW Electric`); values of its
      own are added at the level the data gives them, **Medium** at the least.
    - At most **3** values are added (`MAX_ADDED`), and only up to **4** High / Medium values (`THIN_TARGET`).
-5. **A text ISQ that holds two attributes** (`declutter()`):
-   - its values **mix figures with words**: `Electric`, `Gas`, `1 HP`, `20 kW` under Power Source. A figure is
+5. **A text ISQ keeps only its own values** (`declutter()`):
+   - **the MCAT itself is not an option**: `Dough Mixers` under the Dough Mixers MCAT's Mixer Type, `Milk
+Processing Plant` under Milk Processing Plant and Machines, are left out;
+   - values that **mix figures with words**: `Electric`, `Gas`, `1 HP`, `20 kW` under Power Source. A figure is
      a number with a unit (`1 HP`, `0.5 kW Electric`); counts and codes are not (`2 Seater`, `4 Trays`,
-     `SS 304`, `G+1`, `3 Phase`), so ISQs like those are never touched by this;
-   - or a **count ISQ** — its name counts something (`Number of Trays`, `No. of Decks`, `Capacity (Trays)`)
-     and at least two thirds of its values are that count (`24 Tray`, `40 Trays`) — has other values too
-     (`Conical Rounder`).
+     `SS 304`, `G+1`, `3 Phase`);
+   - a **count ISQ** with values that aren't counts (`Conical Rounder` among `24 Tray`, `40 Trays`, when counts
+     are at least two thirds), or **whose name counts something its values don't** (`Tray Capacity` or
+     `Capacity (Trays)` holding kg/hr or kg/day);
+   - a **power or fuel source ISQ** (`Power Source`, `Fuel Type`, `Heating Source`) with values that aren't
+     sources (`Liner`, `Milking Cluster` beside `Electric`).
 
    Then:
    - With the **live ISQs in input 4** (JSON, beside the document in input 3), the ISQ's values are the live
@@ -96,8 +106,19 @@ exist, their tier or their confidence.
      and **Medium** at the least.
    - Without one, what doesn't belong is **left out**: the figures when words are most of the values ("left
      out 1 HP, 20 kW: power ratings, not Power Source values"; when figures are most, the ISQ is left as it
-     is, with a warning), then a count ISQ's other values ("left out Conical Rounder: not numbers of trays").
-   - A count ISQ's values are written one way: `1 Tray`, `24 Trays`.
+     is, with a warning); a count ISQ's other values ("left out Conical Rounder: not numbers of trays"); a
+     count ISQ whose values are all figures has none left, so it isn't shown; a source ISQ's non-sources.
+   - **A source the MCAT's name fixes**: under an `Electric Rotary Rack Oven` a power source without
+     `Electric` (`Gas`, `Wood`) contradicts the MCAT and goes; with fewer than 2 values left the ISQ isn't
+     shown — the name already says it (`Diesel Rotary Rack Oven` › `Electric`, `Diesel`).
+
+   A **count ISQ** is one whose name counts something — `Number of Trays`, `No. of Decks`, `Tray Count`,
+   `Capacity (Trays)` (brackets that name a thing, not a unit: `Capacity (kg/hr)` is a figure), or a thing a
+   machine has a number of (`Tray Capacity`, `Trolley Capacity`: `COUNT_NOUN`; a container's capacity — tank,
+   bowl, can — is a volume). It is never a weight or volume. Its values are compared **by number**: `10`,
+   `10 Tray`, `10 trays` are one value, written `10 Trays` (`1 Tray` for one); British and American spellings are
+   one (`Flavours` = `Flavors`); number words count (`Single Flavour` = `1 Flavor`; dual, double, twin = 2;
+   triple = 3); a bare number counts when the name states the noun; a sum (`2+1 Flavour`) is kept as written.
 
 6. **Shown values:** only High and Medium. With **4 or more High** values, the Medium ones are not shown.
    Values taken from a live ISQ keep the live order.
@@ -110,13 +131,28 @@ exist, their tier or their confidence.
 
 7. **Never** Price / Budget / Cost or City / Location (removed in the check step), and never Tier 3.
 8. **Tier 1** at any confidence; **Tier 2 only when High**.
-9. Two ISQs for one attribute are one (`Type/Application` + `Usage/Application`, `Size` + `Dimensions`): the
-   better one keeps the other's values. A value shown under two ISQs stays under the one where it is stronger.
-10. An ISQ needs **2** shown values.
-11. With **3 or more Tier 1 High / Medium ISQs**, Tier 1 Low and Tier 2 ISQs are not shown. This is also
-    checked **early** (`isqsNeedingDoc()`): when 3 such ISQs already have their values, the Tier 1 Low and
-    Tier 2 ones aren't sent to the pairing call, and when nothing needs the document no call is made.
+9. Two ISQs for one attribute (`Size` and `Dimensions`) are **both** shown, not merged; a value shown under
+   both stays under the one where it is stronger.
+10. The **tier is the only test**: how many values an ISQ has doesn't decide whether it is shown. Its values are
+    its High and Medium ones; an ISQ with none of those shows the values it has (Low).
+11. **Every Tier 1 ISQ (High, Medium or Low) and every Tier 2 High ISQ is shown** — there is no cap on how many.
+    When nothing needs the document, no pairing call is made (`isqsNeedingDoc()`).
 12. The spec importance ranking (input 4) is used **last**: only to choose between two otherwise equal ISQs.
+13. **An MCAT shows at least 3 ISQs** (`fillThin()`, `MIN_SHOWN_ISQS`). One that shows fewer — a few listings,
+    where the model left everything in Tier 3 — is given more: the **live ISQs** (input 4) in their priority
+    order, then the **category document's** ISQs, each with its own values (junk left out, at least 2), scored
+    on the data and **Medium** at the least, a source the MCAT's name fixes still applied. A list that only
+    repeats an ISQ already shown (2 of its values shown elsewhere) is skipped. Lists the model also made a
+    Tier 1 or Tier 2 High ISQ for go first, and that ISQ is the one shown, with its listing evidence; a list the
+    model put in Tier 3 (or Tier 2 below High) isn't used, the tier is the model's call. Otherwise a new Tier 1
+    ISQ is added. Either way it is marked `added_from` (`live` / `doc`) and its note says why.
+
+**Shown** (`isShown()`) means Tier 1 (High, Medium or Low) or Tier 2 High — nothing else (never Price or
+Location). The "Shown" tag, the table's "N ISQs shown" count and the "Selected ISQs (.json)" download all use it,
+so a result saved under earlier rules reads the same way: every Tier 1 / Tier 2 High ISQ is in the download.
+
+**Measurements**: an exact value inside one of the ISQ's own ranges is that range (`1000 L` beside `500 - 1000 L`)
+and is left out; the range already counts it.
 
 **The check** (`checkSelection()`): every rule above is verified again on the finished result — tiers, price
 and location, High / Medium only, the 4-High rule, 2 values per ISQ, one unit and kind per measurement, no

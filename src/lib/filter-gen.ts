@@ -106,6 +106,11 @@ export interface FilterRow {
    */
   selected?: boolean;
   select_note?: string;
+  /**
+   * Shown because the MCAT had too few ISQs (skill 15, fillThin): its values come from the live ISQ in input 4
+   * ("live") or the category document ("doc"), whatever the model's tier for it was.
+   */
+  added_from?: "live" | "doc";
   /** The values shown for this ISQ, best first: High and Medium only (only High when there are 4 or more). */
   selected_values?: string[];
   /** The category document's ISQ this one used, for thin values or as a measurement's reference. */
@@ -1576,7 +1581,10 @@ export async function runPipeline(
       }
     }
     const pairs = doc ? parseDocPairs(data, need, doc) : [];
-    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking, live);
+    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking, live, {
+      mcat: prep.mcat?.name ?? doc?.name ?? result.category_name,
+      doc,
+    });
     warnings.push(...report.warnings, ...report.failed.map((x) => `Check failed: ${x}`));
     const shown = result.filters.filter((f) => f.selected);
     step("select", report.failed.length ? "error" : "done", {
