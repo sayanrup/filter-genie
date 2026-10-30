@@ -35,8 +35,15 @@ added to the master prompt only in those runs.
    - **Coverage, not a score.** A keyword's coverage of an MCAT is the share of the MCAT's name weight it holds
      ("bakery oven" holds all of Bakery Oven and a sliver of Combi Oven; "oven" alone a fifth of Bakery Oven).
      The keyword is the MCAT's when coverage ≥ 0.5 and ≥ 0.75 × the best coverage any MCAT gets from it, so
-     a loose match can't take a keyword that clearly belongs to another MCAT. A word in nearly every keyword of
-     the file is ignored.
+     a loose match can't take a keyword that clearly belongs to another MCAT. A word in most of the file's
+     keywords ("car", "machine") can't pick an MCAT on its own, but counts beside one of the MCAT's rarer name
+     words ("honda car").
+   - **A whole name wins.** A keyword that holds some MCAT's whole name (keyword words split at hyphens, as
+     names are) goes to the MCATs whose whole name it holds, however common their words are, and to no other:
+     "diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not Honda Motorcycle's.
+   - **The narrower name wins.** Of those, one whose narrower sibling's whole name is in the keyword too doesn't
+     get it: "electric scooter 60 v" is Electric Scooter's, not Scooter's; "honda car price" is Honda Car's, not
+     Cars'. Coverage only decides keywords that hold no MCAT's whole name.
    - **Listing words must be confirmed.** A word only the MCAT's listings use ("genset") counts only if the
      keywords holding it that are already assigned by name go mostly (≥ 60%, from ≥ 2) to that MCAT. "Sale" or
      "small" are spread over every MCAT and never count.

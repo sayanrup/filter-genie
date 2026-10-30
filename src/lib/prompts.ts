@@ -1,11 +1,14 @@
 import {
+  NO_UNIT,
   SOURCE_LABEL,
+  THIN_LISTINGS,
   type Aggregation,
   type KeywordTable,
   type ListingProfile,
   type TermMining,
   type TermStat,
   type DimensionCandidates,
+  type UnitGroup,
   type specSummary,
 } from "./data";
 import { composeSystemPrompt, MCAT_SKILLS } from "@/skills";
@@ -16,7 +19,7 @@ import type { DocMcat } from "./category-doc";
 /*
  * System prompts are assembled from the skill docs in src/skills (base.md + one .md per layer).
  * This file only builds the per-run USER messages — the data blocks the model reads:
- *   1. term labelling    — mined keyword terms (the ones code couldn't label itself)
+ *   1. term labelling    — mined keyword terms, and the numbers typed in them grouped by unit word
  *   2. field mapping     — canonical spec names to merge or drop
  *   3. filter design     — the computed evidence (dimension tables, context, ranking, listing profile)
  *   4. numeric ranges    — the final filters with their ISQ values (lower / upper bounds, skill 14)
@@ -163,8 +166,9 @@ export function buildTermLabelUser(
   context: string,
   budget: PromptBudget = BUDGETS.normal,
   mcat: McatScope | null = null,
+  units: UnitGroup[] = [],
 ) {
-  // No numbers: labelling doesn't need them. Skip the example when it's just the term itself.
+  // No demand numbers: labelling doesn't need them. Skip the example when it's just the term itself.
   const lines = terms
     .slice(0, budget.labelTerms)
     .map((t) => (t.example.toLowerCase().trim() === t.term ? t.term : `${t.term} | ${t.example}`));
@@ -199,7 +203,17 @@ export function buildTermLabelUser(
     ...dims.listing.map((d) => d.name),
   ]);
   if (ctx) parts.push(block("CATEGORY_CONTEXT_EXCERPT", ctx));
-  parts.push(block("TERMS", `term | example keyword\n${lines.join("\n")}`));
+  if (lines.length) parts.push(block("TERMS", `term | example keyword\n${lines.join("\n")}`));
+  // Numbers typed with a word after them, one line per word: the model says once what that word's numbers measure.
+  if (units.length)
+    parts.push(
+      block(
+        "UNIT_TERMS",
+        `unit | numbers seen | example keyword\n${units
+          .map((u) => `${u.unit || NO_UNIT} | ${u.amounts.slice(0, 8).join(", ")} | ${u.example}`)
+          .join("\n")}`,
+      ),
+    );
   return parts.join("\n");
 }
 
@@ -589,6 +603,11 @@ export function buildDesignUser(ev: DesignEvidence) {
     parts.push(
       "",
       'NOTE: the listing data (D) is a DEMO SAMPLE, not the full catalogue. Low fill rates are expected: do NOT drop or demote a filter because of low fill. Keep it in the tier its demand and context earn, and add the fill note to its rationale (e.g. "(only 12% of sample listings fill this — needs ISQ push)").',
+    );
+  if (ev.listing && ev.listing.count < THIN_LISTINGS)
+    parts.push(
+      "",
+      `NOTE: D holds only ${ev.listing.count} listing(s), so its fill rates and common values are rough. Do NOT drop or demote a filter for low fill on so few listings, and say in its rationale that the listing evidence is thin.`,
     );
   if (ev.uiDesign === false) parts.push("", NO_UI_NOTE);
   parts.push("", "Design the filter panel now. Reply with the JSON object only.");

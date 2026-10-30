@@ -1,17 +1,21 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- model replies are untyped JSON and are normalised field by field */
 import {
   aggregate,
-  alignAutoLabels,
-  autoLabels,
   dimensionCandidates,
   flattenListing,
   heuristicFieldMap,
   mineTerms,
+  LISTING_SAMPLE,
+  NO_UNIT,
+  numberLabels,
   profileListings,
+  sampleRows,
+  THIN_LISTINGS,
   SOURCE_LABEL,
   specSummary,
   termsForModel,
   toKeywordTable,
+  unitGroups,
   type Aggregation,
   type DimensionStats,
   type KeywordTable,
@@ -23,6 +27,7 @@ import {
   type TermMining,
   type TermStat,
   type DimensionCandidates,
+  type UnitGroup,
 } from "./data";
 import {
   ContextLimitError,
@@ -63,6 +68,7 @@ import {
   MIN_MCAT_KEYWORDS,
   describeKeywordSelection,
   mcatIdentity,
+  nameTokens,
   selectMcatKeywords,
   splitByMcat,
   withMcatIdentity,
@@ -231,14 +237,13 @@ function labelSplit(mining: TermMining | null, modelLabels: TermLabel[]): StepSp
   const demandOf = (t: TermStat) =>
     Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0);
   // mining.terms is already ranked by demand share, highest first.
-  const eligible = mining.terms.filter((t) => t.auto !== "skip");
-  eligible.forEach((t, i) => {
+  mining.terms.forEach((t, i) => {
     if (i >= LABEL_SCOPE) {
       terms.outside++;
       demand.outside += demandOf(t);
       return;
     }
-    const who = t.auto ? "code" : byModel.has(t.term) ? "model" : "none";
+    const who = byModel.has(t.term) ? "model" : "none";
     terms[who]++;
     demand[who] += demandOf(t);
   });
@@ -247,22 +252,25 @@ function labelSplit(mining: TermMining | null, modelLabels: TermLabel[]): StepSp
 
 /**
  * The terms nobody labelled, highest search demand first, with why: never sent to the model (past its
- * term cap), or sent but the model gave no label. Shown in the label step's "See the working".
+ * term or unit cap), or sent but the model gave no label. Shown in the label step's "See the working".
  */
 function unlabelledReport(
   mining: TermMining | null,
   sent: TermStat[],
+  units: UnitGroup[],
   modelLabels: TermLabel[],
 ): string {
   if (!mining) return "";
   const sentSet = new Set(sent.map((t) => t.term));
+  const sentUnits = new Set(units.map((u) => u.unit));
+  for (const t of mining.terms) if (t.number && sentUnits.has(t.number.unit)) sentSet.add(t.term);
   const labelled = new Set(modelLabels.map((l) => l.term));
   const rows = mining.terms
-    .filter((t) => !t.auto && !labelled.has(t.term))
+    .filter((t) => !labelled.has(t.term))
     .map((t) => ({
       term: t.term,
       demand: Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0),
-      why: sentSet.has(t.term) ? "sent, model gave no label" : "not sent (over the term cap)",
+      why: sentSet.has(t.term) ? "sent, model gave no label" : "not sent (over the cap)",
     }))
     .sort((a, b) => b.demand - a.demand);
   if (!rows.length) return "";
@@ -334,14 +342,14 @@ export const INITIAL_STEPS: Step[] = [
     id: "prepare",
     label: "Read & total the data",
     description:
-      "Reads every input, finds the keyword and listing columns, mines search terms and labels price words, places and sizes itself. No model involved.",
+      "Reads every input, finds the keyword and listing columns, mines search terms and groups the numbers typed in them by the word after them (150 cc, 60 V). No model involved.",
     status: "pending",
   },
   {
     id: "label",
     label: "Label keyword terms",
     description:
-      "Sends only the terms code couldn't label to the model, which maps each one to a dimension and value using the category's own spec names.",
+      "Sends the mined terms to the model, which maps each one to a dimension and value using the category's own spec names, and says once per unit word what its numbers measure.",
     status: "pending",
   },
   {
@@ -384,8 +392,10 @@ export function messagesText(messages: ChatMessage[]): string {
 export interface Prepared {
   tables: KeywordTable[];
   mining: TermMining | null;
-  /** Terms code couldn't label itself — the only ones sent to the model. */
+  /** The terms the model labels one by one (the top ones by demand). */
   modelTerms: TermStat[];
+  /** The number terms grouped by unit word: the model says once per unit what its numbers measure. */
+  units: UnitGroup[];
   flatListings: Record<string, string>[];
   /** Code-only field roles / canonical spec names for every source field. */
   fieldMap: Map<string, string>;
@@ -406,13 +416,17 @@ export function prepare(inputs: PipelineInputs): Prepared {
   // here in code, so the terms, labels, coverage and shares below are all that MCAT's own.
   const picked = inputs.mcat ? selectMcatKeywords(allTables, inputs.mcat) : null;
   const tables = picked ? picked.tables : allTables;
-  const mining = tables.length ? mineTerms(tables) : null;
-  const flatListings = inputs.listingRows.slice(0, 500).map((r) => flattenListing(r));
+  // The category's own name words: only these can be core words, so "price" or a city never is.
+  const who = inputs.mcat ?? mcatIdentity(inputs.listingRows, inputs.context);
+  const names = [who?.name, who?.pmcat?.name].flatMap((n) => (n ? nameTokens(n) : []));
+  const mining = tables.length ? mineTerms(tables, undefined, names) : null;
+  const flatListings = sampleRows(inputs.listingRows).map((r) => flattenListing(r));
   const fieldMap = heuristicFieldMap(flatListings);
   return {
     tables,
     mining,
     modelTerms: mining ? termsForModel(mining) : [],
+    units: mining ? unitGroups(mining) : [],
     flatListings,
     fieldMap,
     specs: specSummary(flatListings, fieldMap),
@@ -447,6 +461,7 @@ function labelMessages(
         prep.context,
         budget,
         prep.mcat,
+        prep.units,
       ).concat(note ? "\n\n" + note : ""),
     },
   ];
@@ -552,7 +567,7 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
   const prep = prepare(inputs);
   const include = prep.mcat ? MCAT_SKILLS : null;
   const out: PromptRecord[] = [];
-  if (prep.modelTerms.length) {
+  if (prep.modelTerms.length || prep.units.length) {
     out.push({
       id: "label",
       stage: "label",
@@ -569,7 +584,6 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
       messages: fieldMessages(prep),
     });
   }
-  const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
   out.push({
     id: "design",
     stage: "design",
@@ -586,8 +600,8 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
           category: null,
           tables: prep.tables,
           mining: prep.mining,
-          // Preview with the labels code already knows; step 1's labels are added at run time.
-          aggregation: auto.length ? aggregate(prep.tables, auto) : null,
+          // The dimension tables need the terms labelled in step 1, so the preview shows the raw terms.
+          aggregation: null,
           context: inputs.context,
           specs: inputs.specs,
           listing: prep.flatListings.length
@@ -597,8 +611,8 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
           uiDesign: inputs.uiDesign !== false,
           mcat: prep.mcat,
         }).concat(
-          prep.modelTerms.length
-            ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
+          prep.mining
+            ? "\n\n[Preview: at run time the raw terms above are replaced by dimension tables built from the terms labelled in step 1.]"
             : "",
         ),
       },
@@ -664,6 +678,59 @@ export function parseLabels(data: any, known: Set<string>): TermLabel[] {
       if (Array.isArray(l)) push(l[0], l[1], l[2]);
       else push(l?.term, l?.dimension, l?.value);
     }
+  }
+  return out;
+}
+
+/** `short`'s letters appear in `long` in order: "l" in "ltr", "v" in "volt". */
+const inOrder = (short: string, long: string) => {
+  let i = 0;
+  for (const c of long) if (c === short[i]) i++;
+  return i === short.length;
+};
+
+/** At most one letter changed, added or dropped. */
+function withinOneEdit(a: string, b: string): boolean {
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  while (i < a.length && a[i] === b[i]) i++;
+  return (
+    a.slice(i + 1) === b.slice(i + 1) ||
+    a.slice(i) === b.slice(i + 1) ||
+    a.slice(i + 1) === b.slice(i)
+  );
+}
+
+/**
+ * {"units": {"cc": {"dimension": "Engine Displacement", "unit": "cc"}}} → what each unit word's numbers measure.
+ * Only units that were sent count. The unit may be respelled ("v" → "V", "ltr" → "L", "seaters" → "Seater") or
+ * left out when the word isn't one ("2024 model" → "2024"), but not swapped for another ("cc" → "kg" falls back to
+ * "cc"); sizes typed without a unit get none.
+ */
+export function parseUnits(
+  data: any,
+  groups: UnitGroup[],
+): Map<string, { dimension: string; unit: string }> {
+  const out = new Map<string, { dimension: string; unit: string }>();
+  const sent = new Set(groups.map((g) => g.unit));
+  const units = data?.units;
+  if (!units || typeof units !== "object" || Array.isArray(units)) return out;
+  const letters = (s: string) => s.toLowerCase().replace(/[^a-z]/g, "");
+  for (const [key, v] of Object.entries(units as Record<string, any>)) {
+    const typed = key.trim() === NO_UNIT ? "" : key.trim().toLowerCase();
+    const dimension = typeof v?.dimension === "string" ? v.dimension.trim() : "";
+    if (!sent.has(typed) || out.has(typed) || !dimension) continue;
+    const written = typeof v?.unit === "string" ? v.unit.trim() : null;
+    const a = letters(written ?? "");
+    const unit =
+      written === null
+        ? typed
+        : !a
+          ? ""
+          : inOrder(a, typed) || inOrder(typed, a) || withinOneEdit(a, typed)
+            ? written
+            : typed;
+    out.set(typed, { dimension, unit: typed ? unit : "" });
   }
   return out;
 }
@@ -1092,7 +1159,12 @@ export async function runPipeline(
   step("prepare", "running");
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
-  const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
+  const numberCount = prep.units.reduce((s, u) => s + u.amounts.length, 0);
+  // A run of several MCATs says this in each MCAT's notes (splitByMcat).
+  if (!prep.mcat && prep.flatListings.length && prep.flatListings.length < THIN_LISTINGS)
+    warnings.push(
+      `Listings: only ${prep.flatListings.length} listing(s), so fill rates and common values are rough.`,
+    );
   if (prep.mcat) {
     warnings.push(...prep.mcat.notes);
     const sel = prep.mcat.keywordSelection ?? [];
@@ -1114,8 +1186,9 @@ export async function runPipeline(
       if (bySource("serp")) stats.push({ label: "SERP keywords", value: bySource("serp") });
       stats.push(
         { label: "terms mined", value: prep.mining?.terms.length ?? 0 },
-        { label: "labelled by code", value: auto.length },
         { label: "terms for the model", value: prep.modelTerms.length },
+        { label: "number terms", value: numberCount },
+        { label: "unit words", value: prep.units.length },
       );
     }
     if (prep.flatListings.length)
@@ -1140,15 +1213,17 @@ export async function runPipeline(
       ),
       `context document: ${inputs.context.length.toLocaleString()} characters`,
       `spec ranking: ${inputs.specs.trim() ? inputs.specs.trim().split(/\n/).length + " line(s)" : "none"}`,
-      `listings: ${inputs.listingRows.length} row(s)${inputs.listingRows.length > 500 ? " (first 500 used)" : ""}`,
+      `listings: ${inputs.listingRows.length} row(s)${inputs.listingRows.length > LISTING_SAMPLE ? ` (${LISTING_SAMPLE} taken evenly across them)` : ""}`,
     ];
     const outputLines = [
       prep.mining ? `Core category words: ${prep.mining.coreTerms.join(", ") || "none"}` : "",
-      auto.length
-        ? `Labelled by code (${auto.length}):\n${auto
-            .slice(0, 60)
-            .map((l) => `  ${l.term} → ${l.dimension} = ${l.value}`)
-            .join("\n")}${auto.length > 60 ? `\n  … ${auto.length - 60} more` : ""}`
+      prep.units.length
+        ? `Numbers by unit word, for the model to say what each unit measures (${prep.units.length}):\n${prep.units
+            .map(
+              (u) =>
+                `  ${u.unit || NO_UNIT}: ${u.amounts.slice(0, 8).join(", ")}${u.amounts.length > 8 ? ", …" : ""} · e.g. "${u.example}"`,
+            )
+            .join("\n")}`
         : "",
       prep.modelTerms.length
         ? `Terms left for the model (${prep.modelTerms.length}): ${prep.modelTerms
@@ -1176,7 +1251,7 @@ export async function runPipeline(
       calls: 0,
       detail: [
         kwCount
-          ? `${kwCount.toLocaleString()} keywords · ${auto.length} terms labelled by code`
+          ? `${kwCount.toLocaleString()} keywords · ${prep.mining?.terms.length ?? 0} terms mined · ${prep.units.length} unit words`
           : "no keywords",
         prep.flatListings.length ? `${prep.flatListings.length} listings` : "",
       ]
@@ -1233,19 +1308,26 @@ export async function runPipeline(
 
   // 2 + 3 · labelling and spec-name merging run in parallel
   const labelTask = async (): Promise<{ labels: TermLabel[]; category: string | null }> => {
-    if (!prep.mining || prep.modelTerms.length === 0) {
+    const mining = prep.mining;
+    if (!mining || (prep.modelTerms.length === 0 && prep.units.length === 0)) {
       step("label", "skipped", {
         calls: 0,
-        detail: prep.mining ? "all terms labelled by code" : "no keyword data",
-        split: labelSplit(prep.mining, []),
+        detail: mining ? "no terms to label" : "no keyword data",
+        split: labelSplit(mining, []),
       });
-      return { labels: auto, category: null };
+      return { labels: [], category: null };
     }
     const known = new Set(prep.modelTerms.map((t) => t.term));
+    // The terms the model labelled, and every number term of the units it named.
+    const labelsOf = (data: unknown) => {
+      const words = parseLabels(data, known);
+      const units = parseUnits(data, prep.units);
+      return { words, units, labels: [...words, ...numberLabels(mining, units)] };
+    };
     step("label", "running");
     try {
       const include = MCAT_SKILLS.label && prep.mcat ? MCAT_SKILLS.label : [];
-      const maxTokens = Math.min(2500, 400 + prep.modelTerms.length * 10);
+      const maxTokens = Math.min(2500, 400 + prep.modelTerms.length * 10 + prep.units.length * 25);
       let attempt = await ask(
         "label",
         "1 · Label keyword terms",
@@ -1255,13 +1337,13 @@ export async function runPipeline(
         !fresh("label"),
         include,
       );
-      let labels = parseLabels(attempt.data, known);
+      let got = labelsOf(attempt.data);
       let stepUsage = attempt.usage;
       let calls = attempt.cached ? 0 : 1;
       let retried = false;
       // An empty answer for a list this long is a failure, not a verdict: never keep it for reuse,
       // and ask once more with a firmer instruction.
-      if (!labels.length && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS) {
+      if (!got.labels.length && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS) {
         stageCache.delete(cacheKey(settings, attempt.messages));
         retried = true;
         attempt = await ask(
@@ -1275,15 +1357,16 @@ export async function runPipeline(
         );
         stepUsage = addUsage(stepUsage, attempt.usage);
         calls += 1;
-        labels = parseLabels(attempt.data, known);
-        if (!labels.length) stageCache.delete(cacheKey(settings, attempt.messages));
+        got = labelsOf(attempt.data);
+        if (!got.labels.length) stageCache.delete(cacheKey(settings, attempt.messages));
       }
       const { data, compact } = attempt;
+      const { labels, words, units } = got;
       const cached = attempt.cached && !retried;
       const none = labels.length === 0 && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS;
       if (none)
         warnings.push(
-          `Term labelling: the model labelled none of the ${prep.modelTerms.length} keyword terms${retried ? ", even when asked a second time" : ""}, so only code-labelled terms (price, place, size) were grouped and the keyword evidence is thin. Open "See the working" on that step to read its reply.`,
+          `Term labelling: the model labelled none of the ${prep.modelTerms.length} keyword terms${retried ? ", even when asked a second time" : ""}, so no keyword demand could be grouped and the keyword evidence is missing. Open "See the working" on that step to read its reply.`,
         );
       else if (retried)
         warnings.push("Term labelling: the first answer labelled nothing; the second try worked.");
@@ -1293,43 +1376,44 @@ export async function runPipeline(
         calls,
         cached,
         usage: stepUsage,
-        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${none ? " · the model labelled none, used code labels only" : ""}${retried && !none ? " · second try" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+        detail: `${words.length} of ${prep.modelTerms.length} terms labelled · ${units.size} of ${prep.units.length} unit words${none ? " · the model labelled none" : ""}${retried && !none ? " · second try" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
         stats: [
           { label: "terms sent", value: prep.modelTerms.length },
-          { label: "labelled", value: labels.length },
-          { label: "left unlabelled", value: prep.modelTerms.length - labels.length },
-          { label: "labelled share", value: pctOf(labels.length, prep.modelTerms.length) },
+          { label: "labelled", value: words.length },
+          { label: "left unlabelled", value: prep.modelTerms.length - words.length },
+          { label: "labelled share", value: pctOf(words.length, prep.modelTerms.length) },
+          { label: "unit words sent", value: prep.units.length },
+          { label: "unit words labelled", value: units.size },
           { label: "dimensions used", value: dims.size },
-          { label: "labelled by code", value: auto.length },
           ...(typeof category === "string" && category
             ? [{ label: "category", value: category }]
             : []),
         ],
-        split: labelSplit(prep.mining, labels),
+        split: labelSplit(mining, labels),
         output: [
           JSON.stringify(data, null, 2),
-          unlabelledReport(prep.mining, prep.modelTerms, labels),
+          unlabelledReport(mining, prep.modelTerms, prep.units, labels),
         ]
           .filter(Boolean)
           .join("\n\n"),
       });
       return {
-        labels: [...auto, ...labels],
+        labels,
         category: typeof category === "string" ? category : null,
       };
     } catch (err) {
       if ((err as Error).name === "AbortError") throw err;
       warnings.push(
-        `Term labelling failed (${(err as Error).message}); only code-labelled terms (price, location, size) were grouped.`,
+        `Term labelling failed (${(err as Error).message}); no keyword terms were labelled, so the keyword evidence is missing.`,
       );
       step("label", "error", {
-        detail: "used code labels only",
-        split: labelSplit(prep.mining, []),
-        output: [(err as Error).message, unlabelledReport(prep.mining, prep.modelTerms, [])]
+        detail: "no terms labelled",
+        split: labelSplit(mining, []),
+        output: [(err as Error).message, unlabelledReport(mining, prep.modelTerms, prep.units, [])]
           .filter(Boolean)
           .join("\n\n"),
       });
-      return { labels: auto, category: null };
+      return { labels: [], category: null };
     }
   };
 

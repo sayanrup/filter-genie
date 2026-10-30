@@ -10,6 +10,19 @@ import * as XLSX from "xlsx";
 export type Row = Record<string, unknown>;
 
 export const MAX_ROWS = 5000;
+/** Listings read per MCAT for fill rates, common values and price. */
+export const LISTING_SAMPLE = 500;
+/** Fewer listings than this and an MCAT's fill rates and common values are too rough to judge by. */
+export const THIN_LISTINGS = 10;
+
+/**
+ * At most `n` rows, taken evenly across the whole list when there are more (every k-th, the same ones each run),
+ * so the sample isn't just the sellers an export happens to list first.
+ */
+export function sampleRows<T>(rows: T[], n = LISTING_SAMPLE): T[] {
+  if (rows.length <= n) return rows;
+  return Array.from({ length: n }, (_, i) => rows[Math.floor((i * rows.length) / n)]!);
+}
 
 // ───────────────────────────── parsing ─────────────────────────────
 
@@ -206,13 +219,16 @@ function detectDelimiter(firstLine: string): string | null {
 const HEADER_HINT =
   /quer|keyword|search|term|\bkw\b|click|impression|position|ctr|page ?view|enquir|inquir|lead|call|convers|volume|name|title|price|spec|material|size/i;
 
-/** Parse pasted text: JSON, CSV, TSV, semicolon/pipe separated, or a plain list of keywords. */
-export function textToRows(text: string): Row[] {
+/**
+ * Parse pasted text: JSON, CSV, TSV, semicolon/pipe separated, or a plain list of keywords. `limit` caps the rows
+ * (per MCAT in a file of several); keyword files pass Infinity, since their table keeps every keyword.
+ */
+export function textToRows(text: string, limit = MAX_ROWS): Row[] {
   const t = text.trim();
   if (!t) return [];
   if (t.startsWith("[") || t.startsWith("{")) {
     try {
-      return capRows(jsonToRows(t));
+      return capRows(jsonToRows(t), limit);
     } catch {
       /* fall through to delimited parsing */
     }
@@ -236,7 +252,7 @@ export function textToRows(text: string): Row[] {
     : Array.from({ length: width }, (_, i) => (i === 0 ? "query" : `col${i + 1}`));
   const body = looksLikeHeader ? table.slice(1) : table;
 
-  return body.slice(0, MAX_ROWS).map((cells) => {
+  return body.slice(0, limit).map((cells) => {
     const r: Row = {};
     headers.forEach((h, i) => {
       r[h] = cells[i]?.trim() ?? "";
@@ -248,8 +264,7 @@ export function textToRows(text: string): Row[] {
 export async function fileToRows(file: File, limit = MAX_ROWS): Promise<Row[]> {
   const ext = file.name.split(".").pop()?.toLowerCase();
   if (ext === "json") return capRows(jsonToRows(await file.text()), limit);
-  if (ext === "txt" || ext === "tsv" || ext === "md")
-    return textToRows(await file.text()).slice(0, limit);
+  if (ext === "txt" || ext === "tsv" || ext === "md") return textToRows(await file.text(), limit);
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
   const sheetName = wb.SheetNames[0];
@@ -347,7 +362,10 @@ const STOPWORDS = new Set(
   ),
 );
 
-/** Lower-case, normalise units/dimensions/currency so size and price signals become single tokens. */
+/**
+ * Lower-case, with sizes ("10 x 12" → "10x12"), square units ("sq ft" → "sqft"), ₹ and "near me" written one way.
+ * A number and the word after it stay two tokens here; term mining joins them ("150 cc" → "150cc").
+ */
 export function normalizeQuery(q: string): string {
   let s = ` ${q.toLowerCase()} `;
   s = s.replace(/₹/g, " rs ");
@@ -357,10 +375,6 @@ export function normalizeQuery(q: string): string {
   s = s.replace(
     /(\d+(?:\.\d+)?)\s*(?:x|\*|×|by)\s*(\d+(?:\.\d+)?)(?:\s*(?:x|\*|×|by)\s*(\d+(?:\.\d+)?))?/g,
     (_m, a, b, c) => (c ? `${a}x${b}x${c}` : `${a}x${b}`),
-  );
-  s = s.replace(
-    /(\d+(?:\.\d+)?)\s*(sqft|sqm|ft|feet|foot|mm|cm|inch|inches|mtr|meter|metre|m|kg|kgs|ton|tons|tonne|ltr|litre|liter|l|kl|kw|kva|hp|seater|seat|bhk|gsm|micron|watt|w|v|volt|amp|a|mah|gb|tb|rpm|bar|psi)\b/g,
-    "$1$2",
   );
   s = s.replace(/[^a-z0-9.\-\s]/g, " ").replace(/(?<!\d)\.|\.(?!\d)/g, " ");
   return s.replace(/\s+/g, " ").trim();
@@ -467,29 +481,22 @@ export function describeKeywordTable(t: KeywordTable | null): string {
 
 // ───────────────────────────── term mining ─────────────────────────────
 
-const SIZE_UNITS =
-  "sqft|sqm|ft|feet|foot|mm|cm|inch|inches|mtr|meter|metre|m|kg|kgs|ton|tons|tonne|ltr|litre|liter|l|kl|kw|kva|hp|seater|seat|bhk|gsm|micron|watt|w|v|volt|amp|a|mah|gb|tb|rpm|bar|psi";
-/** A dimension ("10x10", "20x8x8" with optional unit) or a number with a unit ("20ft", "1000l"). */
-const SIZE_TOKEN = new RegExp(
-  `^\\d+(\\.\\d+)?((x\\d+(\\.\\d+)?){1,2}(${SIZE_UNITS})?|(${SIZE_UNITS}))$`,
-);
-const PRICE_TOKEN =
-  /^(price|prices|pricing|cost|costs|costing|rate|rates|cheap|cheapest|budget|rs|inr|lowest|affordable|quotation|quote|economical|low-cost|mrp)$/;
+/** A bare number or size: "150", "2.5", "10x12". */
+const BARE_NUMBER = /^\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?){0,2}$/;
+const NUMBER_TERM = /^(\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?){0,2})([a-z]*)$/;
 
-// Major Indian cities, states and regions (the marketplace context uses ₹ and ISQs).
-const PLACES = new Set(
-  (
-    "delhi new-delhi ncr noida gurgaon gurugram faridabad ghaziabad mumbai navi-mumbai thane pune nagpur nashik aurangabad " +
-    "bangalore bengaluru mysore mysuru hyderabad secunderabad chennai coimbatore madurai trichy salem kolkata howrah " +
-    "ahmedabad surat vadodara baroda rajkot gandhinagar jaipur jodhpur udaipur kota ajmer lucknow kanpur agra varanasi " +
-    "meerut allahabad prayagraj bhopal indore gwalior jabalpur raipur bilaspur patna ranchi jamshedpur dhanbad bhubaneswar " +
-    "cuttack guwahati chandigarh mohali ludhiana amritsar jalandhar panipat sonipat karnal ambala dehradun haridwar " +
-    "jammu srinagar shimla kochi cochin ernakulam trivandrum thiruvananthapuram kozhikode calicut visakhapatnam vizag " +
-    "vijayawada guntur nellore tirupati warangal goa panaji mangalore mangaluru hubli belgaum siliguri durgapur asansol " +
-    "maharashtra gujarat rajasthan punjab haryana karnataka kerala tamilnadu tamil-nadu telangana andhra bihar " +
-    "jharkhand odisha orissa assam bengal uttarakhand himachal kashmir india near-me nearby local"
-  ).split(" "),
-);
+/** The unit key of sizes typed without a word after them ("10x12"), as the labelling prompt lists it. */
+export const NO_UNIT = "(none)";
+
+/**
+ * A number with the word typed after it ("150cc" → 150 and "cc"), or a size with none ("10x12"). There is no
+ * list of units: whether "cc" is a unit, and what its numbers measure, is the labelling model's call (step 2).
+ */
+export function numberTerm(term: string): { amount: string; unit: string } | null {
+  const m = term.match(NUMBER_TERM);
+  if (!m || (!m[2] && !m[1]!.includes("x"))) return null;
+  return { amount: m[1]!, unit: m[2]! };
+}
 
 export interface TermSourceStat {
   keywords: number;
@@ -499,9 +506,8 @@ export interface TermSourceStat {
 
 export interface TermStat {
   term: string;
-  hint: "" | "size?" | "price?" | "location?";
-  /** Set when code can label the term itself (price words, places, sizes) — it then skips the model. */
-  auto: TermLabel | "skip" | null;
+  /** A number term ("150cc"): labelled through its unit word, with the others of that unit, not on its own. */
+  number: { amount: string; unit: string } | null;
   example: string;
   bySource: Partial<Record<KeywordSource, TermSourceStat>>;
   score: number;
@@ -513,108 +519,51 @@ export interface TermMining {
   totalKeywords: number;
 }
 
-const PLACE_ALIASES: Record<string, string> = {
-  bangalore: "Bengaluru",
-  gurgaon: "Gurugram",
-  "new-delhi": "Delhi",
-  ncr: "Delhi NCR",
-  "navi-mumbai": "Navi Mumbai",
-  mysore: "Mysuru",
-  mangalore: "Mangaluru",
-  baroda: "Vadodara",
-  allahabad: "Prayagraj",
-  cochin: "Kochi",
-  ernakulam: "Kochi",
-  trivandrum: "Thiruvananthapuram",
-  calicut: "Kozhikode",
-  vizag: "Visakhapatnam",
-  orissa: "Odisha",
-  tamilnadu: "Tamil Nadu",
-  "tamil-nadu": "Tamil Nadu",
-  andhra: "Andhra Pradesh",
-  bengal: "West Bengal",
-  himachal: "Himachal Pradesh",
-  "near-me": "Near me",
-  nearby: "Near me",
-  local: "Near me",
-};
-
-const UNIT_LABEL: Record<string, string> = {
-  sqft: "sq ft",
-  sqm: "sq m",
-  ft: "ft",
-  feet: "ft",
-  foot: "ft",
-  mm: "mm",
-  cm: "cm",
-  inch: "inch",
-  inches: "inch",
-  mtr: "m",
-  meter: "m",
-  metre: "m",
-  m: "m",
-  kg: "kg",
-  kgs: "kg",
-  ton: "ton",
-  tons: "ton",
-  tonne: "tonne",
-  ltr: "L",
-  litre: "L",
-  liter: "L",
-  l: "L",
-  kl: "KL",
-  kw: "kW",
-  kva: "kVA",
-  hp: "HP",
-  seater: "seater",
-  seat: "seater",
-  bhk: "BHK",
-  gsm: "GSM",
-  micron: "micron",
-  watt: "W",
-  w: "W",
-  v: "V",
-  volt: "V",
-  amp: "A",
-  a: "A",
-  mah: "mAh",
-  gb: "GB",
-  tb: "TB",
-  rpm: "RPM",
-  bar: "bar",
-  psi: "psi",
-};
-
-const titleCase = (s: string) => s.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-
-/** "20x10ft" → "20 x 10 ft", "1000l" → "1000 L". */
-export function formatSize(token: string): string {
-  const m = token.match(/^([\d.x]+?)([a-z]*)$/);
-  if (!m) return token;
-  const dims = m[1]!.split("x").join(" x ");
-  const unit = m[2] ? (UNIT_LABEL[m[2]] ?? m[2]) : "";
-  return unit ? `${dims} ${unit}` : dims;
+/** The number terms of one unit word: the labelling model says once what that unit's numbers measure. */
+export interface UnitGroup {
+  /** The word typed after the numbers ("cc"); "" for sizes typed without one ("10x12"). */
+  unit: string;
+  /** Their numbers, highest demand first. */
+  amounts: string[];
+  example: string;
+  score: number;
 }
 
-/** Deterministic labels for single-token price words, places and sizes. */
-function autoLabel(term: string): TermLabel | "skip" | null {
-  if (term.includes(" ")) {
-    // Phrases built on an auto-labelled word add nothing: the single word is counted on its own.
-    return term.split(" ").some((t) => autoLabel(t) !== null) ? "skip" : null;
+/** Number terms grouped by their unit word, highest demand first: one line each in the labelling prompt. */
+export function unitGroups(mining: TermMining, cap = 40): UnitGroup[] {
+  const groups = new Map<string, UnitGroup>();
+  for (const t of mining.terms) {
+    if (!t.number) continue;
+    const g = groups.get(t.number.unit);
+    if (g) {
+      g.amounts.push(t.number.amount);
+      g.score += t.score;
+    } else
+      groups.set(t.number.unit, {
+        unit: t.number.unit,
+        amounts: [t.number.amount],
+        example: t.example,
+        score: t.score,
+      });
   }
-  if (PRICE_TOKEN.test(term)) return { term, dimension: "Price", value: "Price intent" };
-  if (term === "india") return "skip";
-  if (PLACES.has(term))
-    return { term, dimension: "Location", value: PLACE_ALIASES[term] ?? titleCase(term) };
-  if (SIZE_TOKEN.test(term)) return { term, dimension: "Size / Capacity", value: formatSize(term) };
-  return null;
+  return [...groups.values()].sort((a, b) => b.score - a.score).slice(0, cap);
 }
 
-function hintFor(term: string): TermStat["hint"] {
-  if (term.split(" ").some((t) => SIZE_TOKEN.test(t))) return "size?";
-  if (term.split(" ").some((t) => PRICE_TOKEN.test(t))) return "price?";
-  if (term.split(" ").some((t) => PLACES.has(t))) return "location?";
-  return "";
+/** "10x12" and "ft" → "10 x 12 ft". */
+const amountText = (amount: string, unit: string) =>
+  [amount.split("x").join(" x "), unit].filter(Boolean).join(" ");
+
+/** A label for every number term whose unit the model named: "150cc" → Engine Displacement = "150 cc". */
+export function numberLabels(
+  mining: TermMining,
+  units: Map<string, { dimension: string; unit: string }>,
+): TermLabel[] {
+  return mining.terms.flatMap((t) => {
+    const u = t.number ? units.get(t.number.unit) : undefined;
+    return u && t.number
+      ? [{ term: t.term, dimension: u.dimension, value: amountText(t.number.amount, u.unit) }]
+      : [];
+  });
 }
 
 /** Merge simple plurals onto their singular when both forms occur (cabins → cabin, boxes → box). */
@@ -640,18 +589,54 @@ function isContent(tok: string) {
   return !STOPWORDS.has(tok) && !/^\d+(\.\d+)?$/.test(tok) && tok.length > 1;
 }
 
-/** Candidate terms of one keyword: content unigrams plus bigrams of two adjacent non-core content words. */
+/**
+ * Candidate terms of one keyword: content unigrams, bigrams of two adjacent non-core content words, and a number
+ * joined to the word after it ("150 cc" → "150cc", "10x12 ft" → "10x12ft") unless that word is a core word ("304
+ * pipe" stays apart when "pipe" is the category). A word joined to its number is not a term of its own.
+ */
 function termsOf(tokens: string[], core: Set<string>) {
   const out = new Set<string>();
+  const joined = new Set<number>();
   tokens.forEach((t, i) => {
+    const n = tokens[i + 1];
+    // One letter counts after a number ("60 v", "5 w"), though not as a term of its own.
+    const unitWord = n && !STOPWORDS.has(n) && /^[a-z][a-z.-]*$/.test(n);
+    if (BARE_NUMBER.test(t) && unitWord && !core.has(n)) {
+      out.add(`${t}${n}`);
+      joined.add(i).add(i + 1);
+    }
+  });
+  tokens.forEach((t, i) => {
+    if (joined.has(i)) return;
+    if (numberTerm(t)) {
+      out.add(t);
+      return;
+    }
     if (isContent(t) && !core.has(t)) out.add(t);
     const n = tokens[i + 1];
-    if (n && isContent(t) && isContent(n) && !core.has(t) && !core.has(n)) out.add(`${t} ${n}`);
+    if (
+      n &&
+      !joined.has(i + 1) &&
+      !numberTerm(n) &&
+      isContent(t) &&
+      isContent(n) &&
+      !core.has(t) &&
+      !core.has(n)
+    )
+      out.add(`${t} ${n}`);
   });
   return out;
 }
 
-export function mineTerms(tables: KeywordTable[], maxTerms = 400): TermMining {
+/**
+ * `names`: the words of the category's own name (its MCAT and PMCAT), when known. Then only those can be core
+ * words, so a frequent "price" or city stays a term for the model to label.
+ */
+export function mineTerms(
+  tables: KeywordTable[],
+  maxTerms = 400,
+  names: string[] = [],
+): TermMining {
   const plurals = pluralMap(tables);
   const totalKeywords = tables.reduce((s, t) => s + t.rows.length, 0);
 
@@ -662,8 +647,11 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 400): TermMining {
       for (const tok of new Set(canonicalTokens(r, plurals)))
         if (isContent(tok)) df.set(tok, (df.get(tok) ?? 0) + 1);
   const ranked = [...df.entries()].sort((a, b) => b[1] - a[1]);
-  // Words code labels itself (price, places, sizes) are qualifiers even when very frequent.
-  const coreCandidates = ranked.filter(([t]) => autoLabel(t) === null);
+  const nameWords = new Set(names);
+  const isName = (t: string) =>
+    nameWords.has(t) || nameWords.has(t.replace(/es$/, "")) || nameWords.has(t.replace(/s$/, ""));
+  // A number is never the category; with the name known, nothing but its words is.
+  const coreCandidates = ranked.filter(([t]) => !numberTerm(t) && (!nameWords.size || isName(t)));
   let core = coreCandidates
     .filter(([, n]) => n / Math.max(totalKeywords, 1) >= 0.4)
     .map(([t]) => t);
@@ -680,8 +668,7 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 400): TermMining {
         if (!st) {
           st = {
             term,
-            hint: hintFor(term),
-            auto: autoLabel(term),
+            number: numberTerm(term),
             example: r.query,
             bySource: {},
             score: 0,
@@ -704,8 +691,7 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 400): TermMining {
 
   const terms = [...stats.values()]
     .filter((st) => {
-      if (st.auto === "skip") return false;
-      if (st.auto) return true; // free: labelled by code
+      if (st.number) return true; // labelled with the other numbers of its unit, one prompt line in all
       const kws = Object.values(st.bySource).reduce((s, x) => s + (x?.keywords ?? 0), 0);
       // Phrases must recur; single words may pass on demand alone.
       return st.term.includes(" ") ? kws >= 2 : kws >= 2 || st.score >= 0.005;
@@ -716,13 +702,9 @@ export function mineTerms(tables: KeywordTable[], maxTerms = 400): TermMining {
   return { coreTerms: core, terms, totalKeywords };
 }
 
-/** Terms the model still has to label, highest demand first, capped to keep the call cheap. */
+/** The terms the model labels one by one (number terms go by unit), highest demand first, capped. */
 export function termsForModel(mining: TermMining, cap = 150): TermStat[] {
-  return mining.terms.filter((t) => !t.auto).slice(0, cap);
-}
-
-export function autoLabels(mining: TermMining): TermLabel[] {
-  return mining.terms.map((t) => t.auto).filter((l): l is TermLabel => !!l && l !== "skip");
+  return mining.terms.filter((t) => !t.number).slice(0, cap);
 }
 
 // ───────────────────────────── aggregation ─────────────────────────────
@@ -807,9 +789,11 @@ export function aggregate(tables: KeywordTable[], labels: TermLabel[]): Aggregat
         if (!hits.has(l.dimension)) hits.set(l.dimension, new Set());
         hits.get(l.dimension)!.add(l.value);
       };
-      // Longest match first: bigrams consume their tokens so "mild steel" isn't also counted as "steel".
+      // Longest match first: bigrams consume their tokens so "mild steel" isn't also counted as "steel". A
+      // number and its word are one term written together ("150 cc" is "150cc").
       for (let i = 0; i < toks.length - 1; i++) {
-        const l = map.get(`${toks[i]} ${toks[i + 1]}`);
+        const glue = BARE_NUMBER.test(toks[i]!) ? "" : " ";
+        const l = map.get(`${toks[i]}${glue}${toks[i + 1]}`);
         if (l && !used[i] && !used[i + 1]) {
           hit(l);
           used[i] = used[i + 1] = true;
@@ -1268,18 +1252,4 @@ export function dimensionCandidates(
       .slice(0, 25)
       .map((f) => ({ name: f.key, fillPct: f.fillPct, values: f.top.slice(0, 5).map(([v]) => v) })),
   };
-}
-
-/** Point code-labelled sizes/places at the category's own dimension names when it has them. */
-export function alignAutoLabels(labels: TermLabel[], c: DimensionCandidates): TermLabel[] {
-  const names = [...c.listing.map((l) => l.name), ...c.ranking];
-  const sizeName = names.find((n) => /\b(size|dimension)/i.test(n));
-  const placeName = names.find((n) => /\b(city|location)\b/i.test(n));
-  return labels.map((l) =>
-    l.dimension === "Size / Capacity" && sizeName
-      ? { ...l, dimension: sizeName }
-      : l.dimension === "Location" && placeName
-        ? { ...l, dimension: placeName }
-        : l,
-  );
 }
