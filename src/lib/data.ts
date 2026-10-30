@@ -1037,6 +1037,8 @@ const CATEGORY_KEY = /(^|[._\s])(category|mcat|mcat_?name|subcategory|group|cat)
 const UNIT_KEY = /(^|[._\s])(unit|uom|price_?unit|moq_?unit)$/i;
 // Whole field name only: "city", "specs.city" — not "glusr_distance_city".
 const CITY_KEY = /^(.*\.)?(city|city_?orig|seller_?city|location)$/i;
+/** The seller's city: kept by code as Location evidence, never sent to the spec-name merge. */
+export const SELLER_CITY = "Seller City";
 
 /** "specs.isq_material_type" → "Material Type"; "isq.Material" → "Material". */
 export function canonicalSpecName(key: string): string {
@@ -1087,7 +1089,7 @@ export function heuristicFieldMap(flat: Record<string, string>[]): Map<string, s
     const avgLen = l.total / Math.max(l.n, 1);
     let role: string;
     if (key.startsWith(SPEC_PREFIX)) role = canonicalSpecName(key);
-    else if (CITY_KEY.test(key)) role = "Seller City";
+    else if (CITY_KEY.test(key)) role = SELLER_CITY;
     else if (IGNORE_KEY.test(key)) role = "@ignore";
     else if (NAME_KEY.test(key)) role = "@name";
     else if (CATEGORY_KEY.test(key)) role = "@category";
@@ -1217,8 +1219,9 @@ export function profileListings(
 }
 
 /**
- * Canonical spec names (after the code-only mapping) with fill rate, source fields and sample values —
- * all the field-mapping model call needs to merge synonyms. Ignored/name/price fields are not sent.
+ * Canonical spec names (after the code-only mapping) with fill rate, source fields and their most common
+ * values with counts — all the field-mapping model call needs to merge synonyms, and to tell two specs
+ * apart by the kind of value they hold ("100 kg/hr" vs "500 L"). Ignored/name/price fields are not sent.
  */
 export function specSummary(
   flat: Record<string, string>[],
@@ -1226,7 +1229,10 @@ export function specSummary(
   maxSpecs = 60,
   minFillPct = 2,
 ) {
-  const stats = new Map<string, { rows: number; samples: string[]; sources: Set<string> }>();
+  const stats = new Map<
+    string,
+    { rows: number; values: Map<string, { label: string; n: number }>; sources: Set<string> }
+  >();
   for (const rec of flat) {
     const seen = new Set<string>();
     for (const [k, v] of Object.entries(rec)) {
@@ -1234,7 +1240,7 @@ export function specSummary(
       if (role.startsWith("@")) continue;
       let s = stats.get(role);
       if (!s) {
-        s = { rows: 0, samples: [], sources: new Set() };
+        s = { rows: 0, values: new Map(), sources: new Set() };
         stats.set(role, s);
       }
       s.sources.add(k);
@@ -1243,7 +1249,10 @@ export function specSummary(
         s.rows++;
       }
       const short = v.slice(0, 30);
-      if (s.samples.length < 3 && !s.samples.includes(short)) s.samples.push(short);
+      const key = short.toLowerCase().replace(/\s+/g, " ");
+      const value = s.values.get(key);
+      if (value) value.n++;
+      else s.values.set(key, { label: short, n: 1 });
     }
   }
   return (
@@ -1252,12 +1261,16 @@ export function specSummary(
       // The long tail of one-off spec names isn't worth merging (and costs tokens).
       .filter(([, s]) => pct(s.rows, flat.length) >= minFillPct)
       .slice(0, maxSpecs)
-      .map(([spec, s]) => ({
-        spec,
-        fillPct: pct(s.rows, flat.length),
-        samples: s.samples,
-        sources: [...s.sources],
-      }))
+      .map(([spec, s]) => {
+        const top = [...s.values.values()].sort((a, b) => b.n - a.n).slice(0, 4);
+        return {
+          spec,
+          fillPct: pct(s.rows, flat.length),
+          samples: top.map((x) => x.label),
+          top: top.map((x) => [x.label, x.n] as [string, number]),
+          sources: [...s.sources],
+        };
+      })
   );
 }
 

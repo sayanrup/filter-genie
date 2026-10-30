@@ -15,4 +15,4 @@ research) and the category manager's spec importance ranking.
 
 EVIDENCE B · CATEGORY CONTEXT: research notes (possibly an excerpt). Qualitative; the best source for WHY buyers choose. Look for attributes buyers decide on or ask about first, ones they ignore, and specs reported missing or badly filled.
 
-EVIDENCE C · SPEC IMPORTANCE RANKING: the category manager's ranked specs or colour tiers (Green = top, Yellow = middle, Purple = low). Top tier / top 3 = strong backing, middle = moderate, bottom = negative (lean display-only). Cite the rank ("CM ranks Material #2").
+EVIDENCE C · SPEC RANKING: ranked specs or colour tiers (Green = top, Yellow = middle, Purple = low). Top tier / top 3 = strong backing, middle = moderate, bottom = negative (lean display-only). C's heading says whose ranking it is; cite it in exactly those words, with the rank (e.g. "Material is live ISQ #2" when the heading is LIVE ISQ ORDER). Ranks inside B (an audit's own ranks) are B's: cite them as the audit's ("the spec audit ranks it #1").

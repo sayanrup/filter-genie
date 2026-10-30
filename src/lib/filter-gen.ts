@@ -12,6 +12,7 @@ import {
   profileListings,
   sampleRows,
   THIN_LISTINGS,
+  SELLER_CITY,
   SOURCE_LABEL,
   specSummary,
   termsForModel,
@@ -55,6 +56,7 @@ import {
 } from "./prompts";
 import type { DimensionSpec, ValueRange } from "./ranges";
 import {
+  docContextText,
   docEntryFor,
   docFromAuditMarkdown,
   measurementPairs,
@@ -187,6 +189,8 @@ export interface PipelineInputs {
   separateMcats?: boolean;
   /** Set on the inputs of one MCAT's run (by splitByMcat): which MCAT it is and what its evidence is. */
   mcat?: McatScope;
+  /** Set when `specs` is the MCAT's live ISQs in their seller-form order, not a category manager's ranking. */
+  rankingFrom?: "live-isqs";
 }
 
 export type { StageId };
@@ -567,7 +571,10 @@ function withCategoryDoc(inputs: PipelineInputs): {
     inContext && specsJson && !ranked?.isqs.length
       ? `Ranking: input 4 lists ${specsJson.length} MCAT(s) but no ISQs for ${label}, so this run has no ranking.`
       : null;
-  const specs = inContext && specsJson ? { specs: ranked ? rankingText(ranked) : "" } : {};
+  const specs =
+    inContext && specsJson
+      ? { specs: ranked ? rankingText(ranked) : "", rankingFrom: "live-isqs" as const }
+      : {};
   if (!list)
     return { inputs, doc: docFromAuditMarkdown(inputs.context, who), live: null, note: null };
   const doc = docEntryFor(list, who);
@@ -575,7 +582,11 @@ function withCategoryDoc(inputs: PipelineInputs): {
     ? null
     : `Category document: input ${inContext ? 3 : 4} lists ${list.length} MCAT(s) but not ${label}, so its thin ISQs and measurements were not checked against it.`;
   return {
-    inputs: { ...inputs, ...(inContext ? { context: "", ...specs } : { specs: "" }) },
+    // The document's notes on this MCAT (why buyers choose its specs) are the context the design step reads.
+    inputs: {
+      ...inputs,
+      ...(inContext ? { context: docContextText(inputs.context, who), ...specs } : { specs: "" }),
+    },
     doc,
     live: ranked?.isqs.length ? ranked : null,
     note: [docNote, rankingNote].filter(Boolean).join(" ") || null,
@@ -635,6 +646,8 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
           aggregation: null,
           context: inputs.context,
           specs: inputs.specs,
+          ...(inputs.rankingFrom ? { rankingFrom: inputs.rankingFrom } : {}),
+          ...(inputs.rankingFrom ? { rankingFrom: inputs.rankingFrom } : {}),
           listing: prep.flatListings.length
             ? profileListings(prep.flatListings, prep.fieldMap)
             : null,
@@ -804,29 +817,101 @@ const sameUnit = (a: string, b: string) => {
   return d <= (Math.min(a.length, b.length) <= 3 ? 1 : 2) || (a.at(-1) === b.at(-1) && d <= 2);
 };
 
-/** Apply {"merge": {...}, "drop": [...]} from the model on top of the code-only field map. */
+/**
+ * Apply {"merge": {...}, "drop": [...]} from the model on top of the code-only field map. Two names a listing
+ * fills with different values are two attributes, not one written two ways ("Material: MS" and "Insulation
+ * Material: PUF" on one cabin): such a name is left out of the merge. The seller's city is the code's own.
+ */
 export function applySpecMerges(
   fieldMap: Map<string, string>,
   data: any,
+  flat: Record<string, string>[] = [],
 ): { map: Map<string, string>; changes: number } {
+  // Per spec name (lower case), each listing's value.
+  const values = new Map<string, Map<number, string>>();
+  flat.forEach((rec, i) => {
+    for (const [k, v] of Object.entries(rec)) {
+      const role = fieldMap.get(k)?.toLowerCase();
+      if (!role || role.startsWith("@")) continue;
+      let byListing = values.get(role);
+      if (!byListing) values.set(role, (byListing = new Map()));
+      if (!byListing.has(i)) byListing.set(i, v.trim().toLowerCase());
+    }
+  });
+  // One value written two ways is still one value: "220V" / "220 V", "Horizontal" / "Horizontally Cylindrical".
+  const sameValue = (x: string, y: string) => {
+    const [a, b] = [x, y].map((s) => s.replace(/[^\p{L}\p{N}]/gu, ""));
+    const short = a!.length < b!.length ? a! : b!;
+    return a === b || (short.length >= 3 && (a!.includes(b!) || b!.includes(a!)));
+  };
+  const apart = (a: string, b: string) => {
+    const va = values.get(a);
+    const vb = values.get(b);
+    if (!va || !vb) return false;
+    let differ = 0;
+    for (const [i, v] of va) if (vb.has(i) && !sameValue(vb.get(i)!, v)) differ++;
+    return differ > 0 && differ * 10 >= Math.min(va.size, vb.size);
+  };
+
+  // The listings' own spec names, as written: a merge keeps one of them (sellers' ISQ names, which later
+  // steps match to the category document and live ISQs by name), never a new name.
+  const written = new Map<string, string>();
+  for (const role of fieldMap.values())
+    if (!role.startsWith("@")) written.set(role.toLowerCase(), role);
   const rename = new Map<string, string>();
   let changes = 0;
   const merge = data?.merge && typeof data.merge === "object" ? data.merge : {};
   for (const [target, sources] of Object.entries(merge as Record<string, unknown>)) {
-    if (!target.trim()) continue;
-    for (const src of Array.isArray(sources) ? sources : [])
-      if (typeof src === "string") rename.set(src.toLowerCase(), target.trim());
+    if (!target.trim() || !Array.isArray(sources)) continue;
+    // Most-filled name first; each next one joins only if no name already in the group is apart from it.
+    const names = sources
+      .filter((s): s is string => typeof s === "string" && written.has(s.toLowerCase()))
+      .map((s) => s.toLowerCase())
+      .sort((a, b) => (values.get(b)?.size ?? 0) - (values.get(a)?.size ?? 0));
+    const group: string[] = [];
+    for (const name of names) if (!group.some((g) => apart(g, name))) group.push(name);
+    // The model's name when it is one of the listings' names, else the group's most-filled name.
+    const keep = written.get(target.trim().toLowerCase()) ?? written.get(group[0] ?? "");
+    if (keep) for (const name of group) rename.set(name, keep);
   }
   for (const d of Array.isArray(data?.drop) ? data.drop : [])
     if (typeof d === "string") rename.set(d.toLowerCase(), "@ignore");
 
   const map = new Map<string, string>();
   for (const [key, role] of fieldMap) {
-    const next = role.startsWith("@") ? role : (rename.get(role.toLowerCase()) ?? role);
+    const next =
+      role.startsWith("@") || role === SELLER_CITY
+        ? role
+        : (rename.get(role.toLowerCase()) ?? role);
     if (next !== role) changes++;
     map.set(key, next);
   }
   return { map, changes };
+}
+
+/**
+ * Spec names the merge renamed, old (lower case) → new: only names whose every source field went to one other
+ * spec name ("Scooter Brand" → "Brand"); a dropped or split name keeps its own.
+ */
+export function specRenames(
+  before: Map<string, string>,
+  after: Map<string, string>,
+): Map<string, string> {
+  const to = new Map<string, Set<string>>();
+  for (const [key, role] of before) {
+    if (role.startsWith("@")) continue;
+    const next = after.get(key) ?? role;
+    let set = to.get(role.toLowerCase());
+    if (!set) to.set(role.toLowerCase(), (set = new Set()));
+    set.add(next);
+  }
+  const out = new Map<string, string>();
+  for (const [role, set] of to) {
+    const [next] = set;
+    if (set.size === 1 && !next!.startsWith("@") && next!.toLowerCase() !== role)
+      out.set(role, next!);
+  }
+  return out;
 }
 
 // ───────────────────────────── normalise, link evidence, fix ─────────────────────────────
@@ -837,6 +922,53 @@ interface RawLinks {
   dimension: string | null;
   listing_spec: string | null;
   backing: string[];
+}
+
+/**
+ * The design prompt's own rules (skills 08, 10, 12), checked on the model's answer before code fixes anything:
+ * across thousands of MCATs, a panel that broke one says so in its warnings instead of waiting to be read.
+ */
+export function designChecks(
+  result: FilterResult,
+  links: RawLinks[],
+  mcat: { name: string; siblings: string[] } | null,
+): string[] {
+  const out: string[] = [];
+  const f = result.filters;
+  if (f.length > 6) out.push(`${f.length} filters returned; the limit is 6.`);
+  const t1 = f.filter((x) => x.tier === "Tier 1").length;
+  if (t1 < 3 || t1 > 4) out.push(`Tier 1 has ${t1} filter(s); it should have 3–4.`);
+  for (const x of f.filter((x) => isExcludedIsq(x.name)))
+    out.push(`"${x.name}" is a price or location filter, which the panel never has.`);
+  const others = new Set((mcat?.siblings ?? []).map(norm));
+  for (const x of f.filter((x) => others.has(norm(x.name))))
+    out.push(`"${x.name}" is the name of another MCAT, not a filter of this one.`);
+  // One attribute, one filter (skill 08 step 2).
+  for (const key of ["dimension", "listing_spec"] as const) {
+    const seen = new Map<string, string>();
+    links.forEach((l, i) => {
+      const v = l[key] ? norm(l[key]!) : "";
+      if (!v || !f[i]) return;
+      const first = seen.get(v);
+      if (first) out.push(`"${first}" and "${f[i]!.name}" both stand for "${l[key]}".`);
+      else seen.set(v, f[i]!.name);
+    });
+  }
+  links.forEach((l, i) => {
+    if (f[i] && !l.dimension && !l.listing_spec && !l.backing.length)
+      out.push(
+        `"${f[i]!.name}" is linked to no evidence (no dimension, listing spec, context or ranking).`,
+      );
+  });
+  const named = (text: string) => f.some((x) => text.toLowerCase().includes(x.name.toLowerCase()));
+  for (const r of (result.interaction_rules ?? []).filter((r) => !named(r)))
+    out.push(`Interaction rule names no filter of this panel: "${r.slice(0, 80)}".`);
+  const blockers = result.blockers ?? [];
+  for (const x of f.filter(
+    (x) => x.needs_new_isq && !blockers.some((b) => b.toLowerCase().includes(x.name.toLowerCase())),
+  ))
+    out.push(`"${x.name}" needs a new ISQ but no blocker names it.`);
+  return out;
 }
 
 function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } {
@@ -1353,7 +1485,13 @@ export async function runPipeline(
         const key = cacheKey(settings, messages);
         const hit = reuse ? stageCache.get(key) : undefined;
         if (hit !== undefined) return { data: hit, cached: true, usage: {} as Usage, messages };
-        const res = await chatJson<unknown>(settings, messages, opts(maxTokens, reasoning));
+        // Labelling and merging sort what is given rather than write anything new: the same input should
+        // give the same answer, so they run cold.
+        const temperature = id === "label" || id === "fields" ? { temperature: 0 } : {};
+        const res = await chatJson<unknown>(settings, messages, {
+          ...opts(maxTokens, reasoning),
+          ...temperature,
+        });
         usage = addUsage(usage, res.usage);
         calls++;
         remember(key, res.data);
@@ -1506,6 +1644,8 @@ export async function runPipeline(
       )
       .join("\n")}`;
 
+  // The listing spec names after the merge (step 3); the keyword labels (step 2) are renamed the same way.
+  let specMap = prep.fieldMap;
   const fieldTask = async (): Promise<ListingProfile | null> => {
     if (prep.flatListings.length === 0) {
       step("fields", "skipped", { calls: 0, detail: "no listings" });
@@ -1536,7 +1676,8 @@ export async function runPipeline(
         "off",
         !fresh("fields"),
       );
-      const { map, changes } = applySpecMerges(prep.fieldMap, data);
+      const { map, changes } = applySpecMerges(prep.fieldMap, data, prep.flatListings);
+      specMap = map;
       const profile = profileListings(prep.flatListings, map);
       step("fields", "done", {
         calls: cached ? 0 : 1,
@@ -1561,7 +1702,17 @@ export async function runPipeline(
     }
   };
 
-  const [{ labels, category }, listing] = await Promise.all([labelTask(), fieldTask()]);
+  const [labelled, listing] = await Promise.all([labelTask(), fieldTask()]);
+  const { category } = labelled;
+  // Step 2 named its dimensions after the listing specs as they were before step 3 merged them: a dimension
+  // whose spec was renamed ("Scooter Brand" → "Brand") takes the new name, so demand and fill rate stay joined.
+  const renames = specRenames(prep.fieldMap, specMap);
+  const labels = renames.size
+    ? labelled.labels.map((l) => ({
+        ...l,
+        dimension: renames.get(l.dimension.toLowerCase()) ?? l.dimension,
+      }))
+    : labelled.labels;
   const aggregation = labels.length ? aggregate(prep.tables, labels) : null;
   const evidence: Evidence = {
     category,
@@ -1621,13 +1772,16 @@ export async function runPipeline(
     throw new Error("The model returned no filters. Try again or pick another model.");
   }
   const tierN = (t: Tier) => result.filters.filter((f) => f.tier === t).length;
+  const breaks = designChecks(result, links, prep.mcat);
+  warnings.push(...breaks.map((b) => `Design check: ${b}`));
   step("design", "done", {
     calls: designCached ? 0 : 1,
     cached: designCached,
     usage: designUsage,
-    detail: `${result.filters.length} filters proposed${designCached ? " · reused (no cost)" : ""}${compactTag(designCompact)}`,
+    detail: `${result.filters.length} filters proposed${breaks.length ? ` · ${breaks.length} rule break(s)` : ""}${designCached ? " · reused (no cost)" : ""}${compactTag(designCompact)}`,
     stats: [
       { label: "filters", value: result.filters.length },
+      { label: "rule breaks", value: breaks.length },
       { label: "Tier 1", value: tierN("Tier 1") },
       { label: "Tier 2", value: tierN("Tier 2") },
       { label: "Tier 3", value: tierN("Tier 3") },

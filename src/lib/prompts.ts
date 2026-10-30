@@ -1,5 +1,6 @@
 import {
   NO_UNIT,
+  SELLER_CITY,
   SOURCE_LABEL,
   THIN_LISTINGS,
   type Aggregation,
@@ -352,11 +353,12 @@ export function buildFieldMapUser(
   budget: PromptBudget = BUDGETS.normal,
 ) {
   const lines = summary
+    .filter((f) => f.spec !== SELLER_CITY)
     .slice(0, budget.fieldSpecs)
-    .map((f) => `${f.spec} | ${f.fillPct}% | ${f.samples.join(" / ")}`);
+    .map((f) => `${f.spec} | ${f.fillPct}% | ${f.top.map(([v, n]) => `${v} (${n})`).join(" / ")}`);
   return [
     `${listingCount} listings.`,
-    block("SPECS", `spec name | filled | samples\n${lines.join("\n")}`),
+    block("SPECS", `spec name | filled | most common values (listings)\n${lines.join("\n")}`),
   ].join("\n");
 }
 
@@ -467,6 +469,8 @@ export interface DesignEvidence {
   budget?: PromptBudget;
   /** Set when this run covers one MCAT of several; its keywords were picked from the common files. */
   mcat?: McatScope | null;
+  /** C is the MCAT's live ISQs in seller-form order, not a category manager's ranking. */
+  rankingFrom?: "live-isqs";
 }
 
 /** The MCAT_SCOPE block: which MCAT this is, what the keyword numbers really describe, how thin the evidence is. */
@@ -714,8 +718,19 @@ export function buildDesignUser(ev: DesignEvidence) {
   if (ev.specs.trim())
     parts.push(
       "",
-      "## C. SPEC IMPORTANCE RANKING (category manager)",
-      block("RANKING", clip(ev.specs, budget.rankingChars)),
+      ev.rankingFrom === "live-isqs"
+        ? "## C. LIVE ISQ ORDER (this MCAT's ISQs as today's seller form lists them, first = top)"
+        : "## C. SPEC IMPORTANCE RANKING (category manager)",
+      block(
+        "RANKING",
+        clip(
+          // Each line says what it is, so a rationale quotes it as the live ISQ order it is.
+          ev.rankingFrom === "live-isqs"
+            ? ev.specs.replace(/^(\d+)-/gm, "live ISQ #$1: ")
+            : ev.specs,
+          budget.rankingChars,
+        ),
+      ),
     );
   if (ev.listing)
     parts.push(

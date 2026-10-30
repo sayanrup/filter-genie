@@ -5,14 +5,15 @@ import { measureKind, parseQuantity } from "./quantity";
 
 /*
  * The category document (skill 15): per MCAT, the "Buyer Attracting Seller Specs" of its Seller & Buyer Spec
- * Audit — the seller spec questions and the options under each. It is used for two things only: to add to an
- * ISQ that is thin (one High value or none), and to say what unit and shape a measurement ISQ's values have
- * (and to supply them when the data's own are poor). It never decides which ISQs exist or their tier.
+ * Audit — the seller spec questions and the options under each. In the select step it is used for two things
+ * only: to add to an ISQ that is thin (one High value or none), and to say what unit and shape a measurement
+ * ISQ's values have (and to supply them when the data's own are poor).
  *
  * It arrives through input 3, as either
  *   - the JSON saved by scripts/fetch-mcat-context.ts (`[{mcat_id, mcat_name, buyer_attracting_seller_specs:
- *     [{attribute, values}]}, …]`), which is then kept out of the model's context, or
- *   - the audit's own markdown (what "Load spec audit" puts there), which the model still reads as before.
+ *     [{attribute, values}]}, …]`), whose notes for the run's MCAT (docContextText) are then the design step's
+ *     context (evidence B), or
+ *   - the audit's own markdown (what "Load spec audit" puts there), which the model reads as the context.
  *
  * Input 4 can be JSON of the same kind, such as the live ISQs saved by scripts/fetch-isq.ts (`isqs: [{name,
  * values}]`, or `options: [{value}]` as the API gives them). When input 3 is the document, input 4 is read as the
@@ -147,6 +148,58 @@ export function parseCategoryDoc(text: string): DocMcat[] | null {
   }
   lastParse = { text, list };
   return list;
+}
+
+/** Parts of a document entry that say nothing about how buyers choose: pictures, units, who made it. */
+const NOT_CHOICE = /thumbnail|image|quantity|unit|generated/i;
+const pick = (o: Record<string, any>, keys: RegExp) => {
+  const k = Object.keys(o).find((x) => keys.test(x));
+  return k === undefined ? undefined : o[k];
+};
+
+/**
+ * This MCAT's entry of the document (input 3 as JSON) as plain notes for the design step's context (evidence
+ * B), as the audit's markdown would give them: every list of specs in the entry, each spec with its rank, values
+ * and the reason the audit gives. "" when the entry isn't in the document.
+ */
+export function docContextText(
+  text: string,
+  who: { id?: string | undefined; name?: string | undefined } | null,
+): string {
+  let items: any[] = [];
+  try {
+    const data = JSON.parse(text.trim());
+    items = Array.isArray(data) ? data : Array.isArray(data?.mcats) ? data.mcats : [data];
+  } catch {
+    return "";
+  }
+  const entry =
+    items.find((m) => who?.id && String(m?.mcat_id ?? "").trim() === who.id) ??
+    items.find((m) => who?.name && nameKey(String(m?.mcat_name ?? "")) === nameKey(who.name)) ??
+    (items.length === 1 ? items[0] : null);
+  if (!entry || typeof entry !== "object") return "";
+  const lines: string[] = [
+    `${clean(String(entry.mcat_name ?? who?.name ?? ""))} — spec audit notes`,
+  ];
+  for (const [key, rows] of Object.entries(entry as Record<string, unknown>)) {
+    if (NOT_CHOICE.test(key) || !Array.isArray(rows)) continue;
+    const specs = rows.filter((r): r is Record<string, any> => Boolean(r) && typeof r === "object");
+    if (!specs.length) continue;
+    lines.push("", `${key.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())}:`);
+    for (const s of specs) {
+      const name = pick(s, /^(spec|attribute|name)$/i);
+      if (!name) continue;
+      const rank = pick(s, /rank/i);
+      const values = pick(s, /^(values|options|example_values)$/i);
+      const reason = pick(s, /reason|why/i);
+      lines.push(
+        `- ${clean(String(name))}${rank != null && rank !== "" ? ` (rank ${rank})` : ""}${
+          Array.isArray(values) && values.length ? `: ${values.slice(0, 6).join(", ")}` : ""
+        }${reason ? ` — ${clean(String(reason))}` : ""}`,
+      );
+    }
+  }
+  return lines.length > 1 ? lines.join("\n") : "";
 }
 
 /**
