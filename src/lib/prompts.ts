@@ -12,7 +12,7 @@ import {
   type specSummary,
 } from "./data";
 import { composeSystemPrompt, MCAT_SKILLS } from "@/skills";
-import { describeKeywordSelection, type McatScope } from "./mcats";
+import { describeKeywordSelection, nameTokens, type McatScope } from "./mcats";
 import type { FilterRow } from "./filter-gen";
 import type { DocMcat } from "./category-doc";
 
@@ -156,8 +156,112 @@ export function excerpt(text: string, max: number, keywords: string[]) {
 // ───────────────────────────── 1 · term labelling ─────────────────────────────
 
 export const TERM_LABEL_SYSTEM = composeSystemPrompt("label");
+/** Sibling MCATs listed in a labelling prompt at most (the ones its terms name; see buildTermLabelUser). */
+const MAX_SIBLINGS = 40;
 /** Multi-MCAT runs: the keywords are common to all MCATs, so the labeller is told whose qualifiers to label. */
 export const TERM_LABEL_SYSTEM_MCAT = composeSystemPrompt("label", [], MCAT_SKILLS.label);
+
+/** `short`'s letters appear in `long` in order: "dx" in "directexpansion". */
+const inOrder = (short: string, long: string) => {
+  let i = 0;
+  for (const c of long) if (c === short[i]) i++;
+  return i === short.length;
+};
+
+/** A short form and the full form a value writes it with: "Direct Expansion (DX)", "MS (Mild Steel)". */
+function shortForm(value: string): string | null {
+  const a = value.match(/^(.+?)\s*\(\s*([A-Za-z]{2,6})\s*\)$/);
+  const b = value.match(/^([A-Z]{2,6})\s*\(\s*(.+?)\s*\)$/);
+  const [short, full] = a ? [a[2]!, a[1]!] : b ? [b[1]!, b[2]!] : ["", ""];
+  if (!short || short !== short.toUpperCase()) return null;
+  const letters = full.toLowerCase().replace(/[^a-z]/g, "");
+  const s = short.toLowerCase();
+  return letters[0] === s[0] && inOrder(s, letters) ? s : null;
+}
+
+/**
+ * Worked examples for the labelling prompt, taken from this MCAT's own data so they fit its category (no fixed
+ * examples from another one): a term that is one of its listing values, a short form its listings write out, a
+ * unit word its listings use, and a term that names a sibling MCAT. Each is true of the data by construction.
+ */
+function labelExamples(
+  terms: TermStat[],
+  dims: DimensionCandidates,
+  units: UnitGroup[],
+  mcat: McatScope | null,
+  siblings: string[],
+): string[] {
+  const sent = new Set(terms.map((t) => t.term));
+  const specs = dims.listing.filter((d) => !/\b(city|location)\b/i.test(d.name));
+  const out: string[] = [];
+
+  const valueOf: string[] = [];
+  for (const d of specs) {
+    if (valueOf.length >= 2) break;
+    // An option written all in lower case is usually a seller's free text in the wrong field ("puf" as a Brand).
+    const v = d.values.find(
+      (x) =>
+        /^[A-Za-z][A-Za-z-]{2,14}$/.test(x) && x !== x.toLowerCase() && sent.has(x.toLowerCase()),
+    );
+    if (v) valueOf.push(`"${v.toLowerCase()}" → ${d.name} = ${v}`);
+  }
+  if (valueOf.length)
+    out.push("A term that is a listing value → that spec:", ...valueOf.map((l) => `  ${l}`));
+
+  const forms = specs.flatMap((d) =>
+    d.values.flatMap((v) => {
+      const s = shortForm(v);
+      return s ? [{ s, line: `"${s}" → ${d.name} = ${v}`, typed: sent.has(s) }] : [];
+    }),
+  );
+  const shown = forms.sort((a, b) => Number(b.typed) - Number(a.typed)).slice(0, 2);
+  if (shown.length)
+    out.push(
+      "A short form this category's listings write out → the value as written:",
+      ...shown.map((f) => `  ${f.line}`),
+    );
+
+  for (const u of units) {
+    if (!u.unit) continue;
+    const at = new RegExp(
+      `^\\d+(?:\\.\\d+)?\\s*${u.unit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+      "i",
+    );
+    const d = specs.find((x) => x.values.some((v) => at.test(v.trim())));
+    if (!d) continue;
+    const written = d.values.find((v) => at.test(v.trim()))!.replace(/^[\d.\s]+/, "");
+    out.push(
+      "A unit word → the dimension its numbers measure, unit as the listings write it:",
+      `  "${u.unit}" (${u.amounts.slice(0, 3).join(", ")}) → ${d.name}, unit "${written}"`,
+    );
+    break;
+  }
+
+  if (mcat) {
+    // Only where the term's example keyword holds the sibling's whole name ("ms porta cabin price"): a word that
+    // merely shares a sibling's name ("machine", "milk") is often a real qualifier of this MCAT.
+    const own = new Set(nameTokens(mcat.name));
+    for (const t of terms) {
+      const words = nameTokens(t.term);
+      const said = new Set(nameTokens(t.example));
+      const sib = words.length
+        ? siblings.find((s) => {
+            const sw = nameTokens(s);
+            return (
+              sw.every((w) => said.has(w)) && words.every((w) => sw.includes(w) && !own.has(w))
+            );
+          })
+        : undefined;
+      if (!sib) continue;
+      out.push(
+        "A term that names a sibling MCAT, not a qualifier of this one → skip:",
+        `  "${t.term}" names ${sib}`,
+      );
+      break;
+    }
+  }
+  return out;
+}
 
 export function buildTermLabelUser(
   terms: TermStat[],
@@ -183,16 +287,35 @@ export function buildTermLabelUser(
         .map((d) => `${d.name} — ${d.values.slice(0, budget.specValues + 1).join(", ")}`),
     );
   const parts: string[] = [];
-  if (mcat)
+  let siblings: string[] = [];
+  if (mcat) {
+    // Only the siblings a term could name ("office" for Office Cabin), those of the highest-demand terms first and
+    // at most MAX_SIBLINGS: the rest can't matter to this list, and a subcategory of hundreds of MCATs would
+    // otherwise cost hundreds of tokens per call.
+    const siblingWords = mcat.siblings.map((s) => [s, nameTokens(s)] as const);
+    const named: string[] = [];
+    for (const t of [
+      ...terms.slice(0, budget.labelTerms).map((x) => x.term),
+      ...units.map((u) => u.unit),
+    ]) {
+      const words = nameTokens(t);
+      for (const [s, sw] of siblingWords)
+        if (!named.includes(s) && sw.some((w) => words.includes(w))) named.push(s);
+      if (named.length >= MAX_SIBLINGS) break;
+    }
+    siblings = named.slice(0, MAX_SIBLINGS);
     parts.push(
       block(
         "MCAT",
         [
           `MCAT: ${mcat.name}`,
-          `Sibling MCATs (the other MCATs in this run, each labelled in its own call): ${mcat.siblings.join(", ")}`,
+          siblings.length
+            ? `Sibling MCATs a term may name (each labelled in its own call): ${siblings.join(", ")}`
+            : `Sibling MCATs: none of the ${mcat.siblings.length} others shares a word with these terms.`,
         ].join("\n"),
       ),
     );
+  }
   parts.push(
     `Category words (not qualifiers): ${mining.coreTerms.join(", ") || "(none detected)"}`,
   );
@@ -203,6 +326,8 @@ export function buildTermLabelUser(
     ...dims.listing.map((d) => d.name),
   ]);
   if (ctx) parts.push(block("CATEGORY_CONTEXT_EXCERPT", ctx));
+  const examples = labelExamples(terms.slice(0, budget.labelTerms), dims, units, mcat, siblings);
+  if (examples.length) parts.push(block("EXAMPLES", examples.join("\n")));
   if (lines.length) parts.push(block("TERMS", `term | example keyword\n${lines.join("\n")}`));
   // Numbers typed with a word after them, one line per word: the model says once what that word's numbers measure.
   if (units.length)

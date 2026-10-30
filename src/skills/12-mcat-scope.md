@@ -20,33 +20,44 @@ added to the master prompt only in those runs.
 2. **Listings** are cut per MCAT: fill rates, common values and the price range in evidence D are that
    MCAT's own.
 3. **Keywords: the files are common to all MCATs, but each MCAT works on its own keywords.** Before any model
-   call, code picks them (`selectMcatKeywords()`), with no model involved:
-   - **One word index for the whole run** (`buildMatchers()`): every word maps to the MCATs that own it — a word
-     of the MCAT's name (worth 3), of its primary PMCAT's name (2), or of its listings' own vocabulary (1;
-     `distinctiveVocab()`: spec words on ≥ 5% of its listings and on no other MCAT's). A word several MCATs
-     share has its weight split between them, so "oven" (in a dozen MCAT names) can't decide alone.
-   - **A keyword is broken into words** and each word is looked up; "500lph" gives "lph", and a run-together
-     word like "bulkmilkcooler" is cut into the index's words by a memoised word-break DP (fewest pieces).
-   - **Word clusters** (`variantMap()`): the keyword file's own words are put in buckets by string similarity
-     (SymSpell-style one-letter-deletion buckets plus a shared-prefix bucket) and compared only within a bucket.
-     A word that is a variant of an MCAT's word — a typo or another ending ("pasteuriser", "homogeniser",
-     "bakary", "machinery") — joins that word's cluster and counts as it. Clusters form only around MCAT words,
-     so look-alike words can't chain into each other.
-   - **Coverage, not a score.** A keyword's coverage of an MCAT is the share of the MCAT's name weight it holds
-     ("bakery oven" holds all of Bakery Oven and a sliver of Combi Oven; "oven" alone a fifth of Bakery Oven).
-     The keyword is the MCAT's when coverage ≥ 0.5 and ≥ 0.75 × the best coverage any MCAT gets from it, so
-     a loose match can't take a keyword that clearly belongs to another MCAT. A word in most of the file's
-     keywords ("car", "machine") can't pick an MCAT on its own, but counts beside one of the MCAT's rarer name
-     words ("honda car").
-   - **A whole name wins.** A keyword that holds some MCAT's whole name (keyword words split at hyphens, as
-     names are) goes to the MCATs whose whole name it holds, however common their words are, and to no other:
-     "diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not Honda Motorcycle's.
-   - **The narrower name wins.** Of those, one whose narrower sibling's whole name is in the keyword too doesn't
-     get it: "electric scooter 60 v" is Electric Scooter's, not Scooter's; "honda car price" is Honda Car's, not
-     Cars'. Coverage only decides keywords that hold no MCAT's whole name.
-   - **Listing words must be confirmed.** A word only the MCAT's listings use ("genset") counts only if the
-     keywords holding it that are already assigned by name go mostly (≥ 60%, from ≥ 2) to that MCAT. "Sale" or
-     "small" are spread over every MCAT and never count.
+   call, code picks them, with no model involved:
+   - **By the file's MCAT column first** (`rowsTaggedFor()`): a file that tags each keyword with its MCAT — the
+     SERP export's `MCAT ID` (or an `MCAT` name) column — is cut by that column, so no word matching is needed.
+     Rows of MCATs not in this run are left out.
+   - **Otherwise by words** (`selectMcatKeywords()`), for files without such a column (internal search):
+     - **One word index for the whole run** (`buildMatchers()`): every word maps to the MCATs that own it — a word
+       of the MCAT's name (worth 3), of its primary PMCAT's name (2), or of its listings' own vocabulary (1;
+       `distinctiveVocab()`: spec words on ≥ 5% of its listings and on no other MCAT's). A word several MCATs
+       share has its weight split between them, so "oven" (in a dozen MCAT names) can't decide alone.
+     - **A keyword is broken into words** and each word is looked up; "500lph" gives "lph", and a run-together
+       word like "bulkmilkcooler" is cut into the index's words by a memoised word-break DP (fewest pieces).
+     - **Word clusters** (`variantMap()`): the keyword file's own words are put in buckets by string similarity
+       (SymSpell-style one-letter-deletion buckets plus a shared-prefix bucket) and compared only within a bucket.
+       A word that is a variant of an MCAT's word — a typo or another ending ("pasteuriser", "homogeniser",
+       "bakary", "machinery") — joins that word's cluster and counts as it. Clusters form only around MCAT words,
+       so look-alike words can't chain into each other.
+     - **Coverage, not a score.** A keyword's coverage of an MCAT is the share of the MCAT's name weight it holds
+       ("bakery oven" holds all of Bakery Oven and a sliver of Combi Oven; "oven" alone a fifth of Bakery Oven).
+       The keyword is the MCAT's when coverage ≥ 0.5 and ≥ 0.75 × the best coverage any MCAT gets from it, so
+       a loose match can't take a keyword that clearly belongs to another MCAT. A word in most of the file's
+       keywords ("car", "machine") can't pick an MCAT on its own, but counts beside one of the MCAT's rarer name
+       words ("honda car").
+     - **A whole name wins.** A keyword that holds some MCAT's whole name (keyword words split at hyphens, as
+       names are) goes to the MCATs whose whole name it holds, however common their words are, and to no other:
+       "diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not Honda Motorcycle's.
+     - **The narrower name wins.** Of those, one whose narrower sibling's whole name is in the keyword too doesn't
+       get it: "electric scooter 60 v" is Electric Scooter's, not Scooter's; "honda car price" is Honda Car's, not
+       Cars'. Coverage only decides keywords that hold no MCAT's whole name.
+     - **Listing words must be confirmed.** A word only the MCAT's listings use ("genset") counts only if the
+       keywords holding it that are already assigned by name go mostly (≥ 60%, from ≥ 2) to that MCAT. "Sale" or
+       "small" are spread over every MCAT and never count.
+     - **Words the tagged file ties to an MCAT count too** (`taggedVocab()`): a word in ≥ 5 of the SERP file's
+       queries, ≥ 60% of them one MCAT's (and at least twice that MCAT's own share of the file), counts for it
+       as a confirmed listing word does. Model and brand names no MCAT name holds ("splendor" → Hero Bike,
+       "access 125" → Suzuki Scooter) reach the internal search keywords this way.
+     - **The best explanation wins** (`owners()`): of the MCATs a keyword fits by coverage, the ones explaining
+       fewer of its words (a name word 1, a listing or tagged word ½) lose it: "honda dio motor" is Honda Dio
+       Scooter's, not Motor Cars' or Honda Car's.
    Terms are mined, labelled and totalled from those keywords alone, so coverage and share in evidence A are
    of this MCAT's keywords. A keyword file with fewer than 10 such keywords is left out for the MCAT; with
    none left, evidence A is absent and the panel rests on D, B and C. A keyword that shares no word with the

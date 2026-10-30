@@ -55,6 +55,8 @@ export interface KeywordSelection {
   demandPct: number;
   /** False when too few keywords were about this MCAT: the file is then left out for it. */
   used: boolean;
+  /** Picked by the file's own MCAT ID (or MCAT) column, as SERP exports have, rather than by words. */
+  byColumn?: boolean;
 }
 
 export interface McatSlice {
@@ -221,15 +223,20 @@ function splitUncached(inputs: PipelineInputs): McatSlice[] {
     .map(({ name, rows }) => [name, rows] as const);
   const names = ordered.map(([n]) => n);
   const vocabs = distinctiveVocab(ordered.map(([, rows]) => rows));
+  const ids = new Map(
+    ordered.map(([name, rows]) => [name, idKey ? String(rows[0]?.[idKey] ?? "").trim() : ""]),
+  );
+  const tagged = taggedVocab(
+    [inputs.serpRows, inputs.internalRows],
+    ordered.map(([name]) => ({ name, id: ids.get(name) ?? "" })),
+  );
   const matchers = buildMatchers(
     ordered.map(([name, rows], i) => ({
       name,
       pmcat: String(rows[0]?.["_pmcat"] ?? "").trim(),
       vocab: vocabs[i] ?? [],
+      tagged: tagged[i] ?? [],
     })),
-  );
-  const ids = new Map(
-    ordered.map(([name, rows]) => [name, idKey ? String(rows[0]?.[idKey] ?? "").trim() : ""]),
   );
   // The category document as JSON isn't cut into sections: each run picks its own MCAT from it (skill 15).
   const context = parseCategoryDoc(inputs.context) ? null : splitDoc(inputs.context, names, ids);
@@ -434,6 +441,12 @@ const VOCAB_COVER = 0.5;
  */
 const VOCAB_MIN_SHARE_OF_HITS = 0.6;
 const VOCAB_MIN_HITS = 2;
+/**
+ * A word a tagged keyword file ties to an MCAT is in at least this many of its keywords, and its share of them
+ * is at least TAGGED_LIFT × the MCAT's share of the file (see taggedVocab()).
+ */
+const TAGGED_MIN_HITS = 5;
+const TAGGED_LIFT = 2;
 /** Pieces of a run-together word ("bulkmilkcooler") are at least this long; only words up to MAX_JOINED are tried. */
 const MIN_PART = 3;
 const MAX_JOINED = 40;
@@ -480,6 +493,54 @@ function distinctiveVocab(groups: Row[][]): string[][] {
   );
 }
 
+/**
+ * For each MCAT, the words that a keyword file tagging each keyword with its MCAT (SERP exports have an MCAT
+ * ID column) ties to it: "splendor" is in 1,416 SERP queries, 74% of them Hero Bike's. Model and brand names
+ * that no MCAT name holds, so the files without such a column (internal search) are matched by them too.
+ */
+function taggedVocab(files: Row[][], mcats: { name: string; id: string }[]): string[][] {
+  const byId = new Map(mcats.map((m, i) => [m.id, i]));
+  const byName = new Map(mcats.map((m, i) => [nameTokens(m.name).join(" "), i]));
+  const hits = mcats.map(() => new Map<string, number>());
+  const total = new Map<string, number>();
+  const rowsOf = mcats.map(() => 0);
+  let allRows = 0;
+  for (const rows of files) {
+    const keys = [...new Set(rows.slice(0, 50).flatMap((r) => Object.keys(r)))];
+    const idCol = keys.find((k) => MCAT_ID_COLUMN.test(k));
+    const nameCol = idCol ? undefined : keys.find((k) => MCAT_COLUMN.test(k));
+    const queryCol = keys.find((k) => !MCAT_COLUMN.test(k) && /quer|keyword|search|term/i.test(k));
+    if (!queryCol || (!idCol && !nameCol)) continue;
+    for (const r of rows) {
+      const i = idCol
+        ? byId.get(String(r[idCol] ?? "").trim())
+        : byName.get(nameTokens(String(r[nameCol!] ?? "")).join(" "));
+      allRows++;
+      if (i !== undefined) rowsOf[i]!++;
+      // Rows of MCATs without listings count too: they are where the word goes instead.
+      for (const w of new Set(wordsOf(String(r[queryCol] ?? "")))) {
+        if (w.length < 3 || STOP.has(w)) continue;
+        total.set(w, (total.get(w) ?? 0) + 1);
+        if (i !== undefined) hits[i]!.set(w, (hits[i]!.get(w) ?? 0) + 1);
+      }
+    }
+  }
+  // An MCAT with a third of the file's keywords holds a third of every common word ("engine", "price") too:
+  // its words must be well above its own share.
+  return hits.map((mine, i) =>
+    [...mine]
+      .filter(
+        ([w, n]) =>
+          n >= TAGGED_MIN_HITS &&
+          n / total.get(w)! >=
+            Math.max(VOCAB_MIN_SHARE_OF_HITS, (TAGGED_LIFT * rowsOf[i]!) / Math.max(allRows, 1)),
+      )
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, VOCAB_MAX)
+      .map(([w]) => w),
+  );
+}
+
 /** Scores a keyword against every MCAT of the run at once; `index` is this MCAT's place in the answer. */
 export interface McatMatcher {
   index: number;
@@ -505,6 +566,16 @@ export interface McatMatcher {
     rarity?: (word: string) => number,
     vocabOk?: (word: string, mcat: number) => boolean,
   ) => number[];
+  /**
+   * How many of a keyword's words each MCAT explains (a name or PMCAT word 1, a listing or tagged word ½;
+   * words in most keywords don't count). Among the MCATs a keyword fits, the ones explaining fewer of its
+   * words than the best lose it: "honda dio motor" is Honda Dio Scooter's, not Motor Cars'.
+   */
+  strength: (
+    have: Set<string>,
+    rarity: (word: string) => number,
+    vocabOk: (word: string, mcat: number) => boolean,
+  ) => number[];
 }
 
 /**
@@ -513,7 +584,9 @@ export interface McatMatcher {
  * by a memoised word-break DP), each word is looked up, and the weights are added per MCAT. A word several
  * MCATs share has its weight split between them, so it can't decide on its own which MCAT a keyword is for.
  */
-function buildMatchers(mcats: { name: string; pmcat: string; vocab: string[] }[]): McatMatcher[] {
+function buildMatchers(
+  mcats: { name: string; pmcat: string; vocab: string[]; tagged: string[] }[],
+): McatMatcher[] {
   const owners = new Map<string, Map<number, number>>();
   const give = (word: string, mcat: number, w: number) => {
     let byMcat = owners.get(word);
@@ -524,6 +597,12 @@ function buildMatchers(mcats: { name: string; pmcat: string; vocab: string[] }[]
     for (const t of nameTokens(m.name)) give(t, i, W_NAME);
     if (m.pmcat) for (const t of nameTokens(m.pmcat)) give(t, i, W_PMCAT);
     for (const t of m.vocab) give(t, i, W_VOCAB);
+  });
+  // Tagged words stay out of the index: they would split the name words' weight ("bullet" is Bullet Proof Car's
+  // name word and Royal Enfield's tagged word). They count as a confirmed listing word does.
+  const taggedBy = new Map<string, number[]>();
+  mcats.forEach((m, i) => {
+    for (const t of m.tagged) taggedBy.set(t, [...(taggedBy.get(t) ?? []), i]);
   });
   // word -> [MCAT, weight shared out between the MCATs that own the word, what the word is to that MCAT (W_NAME / W_PMCAT / W_VOCAB)]
   const weight = new Map<string, [number, number, number][]>();
@@ -606,6 +685,7 @@ function buildMatchers(mcats: { name: string; pmcat: string; vocab: string[] }[]
         if (base > W_VOCAB) (common ? heldCommon : held)[i]! += x;
         else if (!common && vocabOk(w, i)) confirmed[i] = true;
       }
+      if (!common) for (const i of taggedBy.get(w) ?? []) confirmed[i] = true;
     }
     held.forEach((h, i) => {
       if (h > 0) held[i] = h + heldCommon[i]!;
@@ -613,6 +693,22 @@ function buildMatchers(mcats: { name: string; pmcat: string; vocab: string[] }[]
     return held.map((h, i) =>
       Math.min(1, (identity[i]! > 0 ? h / identity[i]! : 0) + (confirmed[i] ? VOCAB_COVER : 0)),
     );
+  };
+  const strength = (
+    have: Set<string>,
+    rarity: (word: string) => number,
+    vocabOk: (word: string, mcat: number) => boolean,
+  ) => {
+    const out = new Array<number>(mcats.length).fill(0);
+    for (const w of have) {
+      if (rarity(w) < MIN_RARITY) continue;
+      const worth = new Map<number, number>();
+      for (const [i, , base] of weight.get(w) ?? [])
+        if (base > W_VOCAB || vocabOk(w, i)) worth.set(i, base);
+      for (const i of taggedBy.get(w) ?? []) worth.set(i, Math.max(worth.get(i) ?? 0, W_VOCAB));
+      for (const [i, base] of worth) out[i]! += base > W_VOCAB ? 1 : 0.5;
+    }
+    return out;
   };
   const vocabOwners = new Map<string, number[]>();
   for (const [word, entries] of weight) {
@@ -628,6 +724,7 @@ function buildMatchers(mcats: { name: string; pmcat: string; vocab: string[] }[]
     names,
     words: wordsOfKeyword,
     score,
+    strength,
   }));
 }
 
@@ -704,8 +801,8 @@ interface TableAnalysis {
   rarity: (word: string) => number;
   /** Whether a listing-only word counts for an MCAT: the keywords it appears in must mostly belong to that MCAT. */
   vocabOk: (word: string, mcat: number) => boolean;
-  /** Per keyword, the MCATs whose every name word it holds ("honda car price" → Honda Car, Cars). */
-  whole: number[][];
+  /** Per keyword, the MCATs it goes to (see owners()). */
+  owners: number[][];
 }
 
 // One analysis per keyword table and word index, shared by every MCAT of the run (the table is the same).
@@ -759,13 +856,12 @@ function analyse(t: KeywordTable, matcher: McatMatcher): TableAnalysis {
       set.add(mcat);
     }
   }
+  const vocabOk = (w: string, mcat: number) => accepted.get(w)?.has(mcat) ?? false;
   const analysis: TableAnalysis = {
     sets,
     rarity,
-    vocabOk: (w, mcat) => accepted.get(w)?.has(mcat) ?? false,
-    whole: sets.map((set) =>
-      matcher.names.flatMap((n, j) => (n.length && n.every((w) => set.has(w)) ? [j] : [])),
-    ),
+    vocabOk,
+    owners: sets.map((set) => owners(set, matcher, rarity, vocabOk)),
   };
   byIndex.set(matcher.words, analysis);
   return analysis;
@@ -808,29 +904,42 @@ function pickFromTable(t: KeywordTable, m: McatScope): TablePick {
   return pick;
 }
 
+/** The MCATs one keyword (its words, with spelling variants) goes to. */
+function owners(
+  set: Set<string>,
+  matcher: McatMatcher,
+  rarity: (word: string) => number,
+  vocabOk: (word: string, mcat: number) => boolean,
+): number[] {
+  // A keyword that holds some MCAT's whole name goes to the MCATs whose whole name it holds, however common
+  // their words are ("diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not
+  // Honda Motorcycle's), except to one whose narrower sibling it names too: "electric scooter 60 v" is
+  // Electric Scooter's, not Scooter's as well.
+  const whole = matcher.names.flatMap((n, j) =>
+    n.length && n.every((w) => set.has(w)) ? [j] : [],
+  );
+  if (whole.length)
+    return whole.filter(
+      (j) => !matcher.narrower[j]!.some((words) => words.every((w) => set.has(w))),
+    );
+  const sc = matcher.score(set, rarity, vocabOk);
+  const best = Math.max(...sc);
+  const mine = sc.flatMap((x, j) => (x >= MIN_COVER && x >= COMPETE * best ? [j] : []));
+  if (mine.length < 2) return mine;
+  // Of the MCATs it fits, the ones that explain fewer of its words than the best lose it.
+  const st = matcher.strength(set, rarity, vocabOk);
+  const top = Math.max(...mine.map((j) => st[j]!));
+  return mine.filter((j) => st[j]! >= top);
+}
+
 function computePick(t: KeywordTable, m: McatScope): TablePick {
   const matcher = m.matcher;
   let rows: KeywordTable["rows"] = [];
   if (matcher) {
     // Words are clustered around the MCATs' words (spelling variants count as the MCAT word) and scaled
     // by how rare they are in this file; see analyse().
-    const { sets, rarity, vocabOk, whole } = analyse(t, matcher);
-    const narrower = matcher.narrower[matcher.index] ?? [];
-    rows = t.rows.filter((_, i) => {
-      // A keyword that holds some MCAT's whole name goes to the MCATs whose whole name it holds, however common
-      // their words are ("diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not
-      // Honda Motorcycle's), except to one whose narrower sibling it names too: "electric scooter 60 v" is
-      // Electric Scooter's, not Scooter's as well.
-      const named = whole[i]!;
-      if (named.length)
-        return (
-          named.includes(matcher.index) &&
-          !narrower.some((words) => words.every((w) => sets[i]!.has(w)))
-        );
-      const sc = matcher.score(sets[i]!, rarity, vocabOk);
-      const mine = sc[matcher.index] ?? 0;
-      return mine >= MIN_COVER && mine >= COMPETE * Math.max(...sc);
-    });
+    const { owners } = analyse(t, matcher);
+    rows = t.rows.filter((_, i) => owners[i]!.includes(matcher.index));
   }
   const demand = rows.reduce((s, r) => s + r.demand, 0);
   const used = rows.length >= MIN_MCAT_KEYWORDS;
@@ -858,10 +967,36 @@ function computePick(t: KeywordTable, m: McatScope): TablePick {
 /** "Internal search: 210 of 4,000 keywords (31.2% of demand) · Google SERP: left out, only 6 about it". */
 export function describeKeywordSelection(selection: KeywordSelection[]): string {
   return selection
-    .map((s) =>
-      s.used
-        ? `${SOURCE_LABEL[s.source]}: ${s.selected.toLocaleString()} of ${s.total.toLocaleString()} keywords (${s.demandPct}% of demand)`
-        : `${SOURCE_LABEL[s.source]}: left out, only ${s.selected} of ${s.total.toLocaleString()} keywords are about it`,
+    .map(
+      (s) =>
+        (s.used
+          ? `${SOURCE_LABEL[s.source]}: ${s.selected.toLocaleString()} of ${s.total.toLocaleString()} keywords (${s.demandPct}% of demand)`
+          : `${SOURCE_LABEL[s.source]}: left out, only ${s.selected} of ${s.total.toLocaleString()} keywords are about it`) +
+        (s.byColumn ? ", by the file's MCAT column" : ""),
     )
     .join(" · ");
+}
+
+/**
+ * A keyword file's rows for one MCAT by the file's own MCAT ID column (or MCAT name column), as SERP exports have:
+ * no word matching needed. null when the file has no such column. In a single-MCAT run, also null when none of
+ * the rows is this MCAT's (the whole file is then read as before).
+ */
+export function rowsTaggedFor(
+  rows: Row[],
+  who: { id?: string | undefined; name?: string | undefined } | null,
+  severalMcats: boolean,
+): Row[] | null {
+  if (!rows.length || !who) return null;
+  const keys = [...new Set(rows.slice(0, 50).flatMap((r) => Object.keys(r)))];
+  const idCol = keys.find((k) => MCAT_ID_COLUMN.test(k));
+  const nameCol = keys.find((k) => MCAT_COLUMN.test(k));
+  const nameKey = (s: string) => nameTokens(s).join(" ");
+  let mine: Row[] | null = null;
+  if (idCol && who.id) mine = rows.filter((r) => String(r[idCol] ?? "").trim() === who.id);
+  else if (nameCol && who.name) {
+    const k = nameKey(who.name);
+    mine = rows.filter((r) => nameKey(String(r[nameCol] ?? "")) === k);
+  }
+  return mine && (mine.length || severalMcats) ? mine : null;
 }

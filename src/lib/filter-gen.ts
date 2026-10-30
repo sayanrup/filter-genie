@@ -7,6 +7,7 @@ import {
   mineTerms,
   LISTING_SAMPLE,
   NO_UNIT,
+  normalizeQuery,
   numberLabels,
   profileListings,
   sampleRows,
@@ -69,9 +70,11 @@ import {
   describeKeywordSelection,
   mcatIdentity,
   nameTokens,
+  rowsTaggedFor,
   selectMcatKeywords,
   splitByMcat,
   withMcatIdentity,
+  type KeywordSelection,
   type McatScope,
 } from "./mcats";
 import { valueConfidence, type ValueConfidence } from "./value-confidence";
@@ -408,16 +411,44 @@ export interface Prepared {
 }
 
 export function prepare(inputs: PipelineInputs): Prepared {
-  const allTables = [
-    toKeywordTable(inputs.internalRows, "internal"),
-    toKeywordTable(inputs.serpRows, "serp"),
-  ].filter((t): t is KeywordTable => t !== null && t.rows.length > 0);
-  // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, picked
-  // here in code, so the terms, labels, coverage and shares below are all that MCAT's own.
-  const picked = inputs.mcat ? selectMcatKeywords(allTables, inputs.mcat) : null;
-  const tables = picked ? picked.tables : allTables;
-  // The category's own name words: only these can be core words, so "price" or a city never is.
   const who = inputs.mcat ?? mcatIdentity(inputs.listingRows, inputs.context);
+  // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, so the terms,
+  // labels, coverage and shares below are all that MCAT's own. A file that tags each keyword with its MCAT
+  // (SERP exports have an MCAT ID column) is cut by that column; the others by words (selectMcatKeywords).
+  const tables: KeywordTable[] = [];
+  const untagged: KeywordTable[] = [];
+  const selection: KeywordSelection[] = [];
+  for (const [source, rows] of [
+    ["internal", inputs.internalRows],
+    ["serp", inputs.serpRows],
+  ] as const) {
+    const all = toKeywordTable(rows, source);
+    if (!all?.rows.length) continue;
+    const tagged = rowsTaggedFor(rows, who, Boolean(inputs.mcat));
+    if (!tagged) {
+      untagged.push(all);
+      continue;
+    }
+    const mine = toKeywordTable(tagged, source);
+    const n = mine?.rows.length ?? 0;
+    const used = inputs.mcat ? n >= MIN_MCAT_KEYWORDS : n > 0;
+    if (mine && used) tables.push(mine);
+    selection.push({
+      source,
+      selected: n,
+      total: all.rows.length,
+      demandPct: Math.round(((mine?.totalDemand ?? 0) / Math.max(all.totalDemand, 1)) * 1000) / 10,
+      used,
+      byColumn: true,
+    });
+  }
+  const picked = inputs.mcat ? selectMcatKeywords(untagged, inputs.mcat) : null;
+  tables.push(...(picked ? picked.tables : untagged));
+  selection.push(...(picked?.selection ?? []));
+  // Keep the sources in one order (internal search, then SERP) however they were picked.
+  tables.sort((a, b) => Number(a.source === "serp") - Number(b.source === "serp"));
+  selection.sort((a, b) => Number(a.source === "serp") - Number(b.source === "serp"));
+  // The category's own name words: only these can be core words, so "price" or a city never is.
   const names = [who?.name, who?.pmcat?.name].flatMap((n) => (n ? nameTokens(n) : []));
   const mining = tables.length ? mineTerms(tables, undefined, names) : null;
   const flatListings = sampleRows(inputs.listingRows).map((r) => flattenListing(r));
@@ -435,7 +466,7 @@ export function prepare(inputs: PipelineInputs): Prepared {
       flatListings.length ? profileListings(flatListings, fieldMap) : null,
     ),
     context: inputs.context,
-    mcat: inputs.mcat && picked ? { ...inputs.mcat, keywordSelection: picked.selection } : null,
+    mcat: inputs.mcat ? { ...inputs.mcat, keywordSelection: selection } : null,
   };
 }
 
@@ -654,14 +685,19 @@ function remember(key: string, value: unknown) {
 
 // ───────────────────────────── parsing model answers ─────────────────────────────
 
-/** {"dimensions": {"Material": {"PUF": ["puf","puff"]}}} → labels (older [[term, dim, value]] also accepted). */
+/**
+ * {"dimensions": {"Material": {"PUF": ["puf","puff"]}}} → labels (older [[term, dim, value]] also accepted). The
+ * model's term is written the way the sent terms were ("Near me" → "near-me", "10 x 12" → "10x12") before it is
+ * matched, so a label isn't lost over spacing or case.
+ */
 export function parseLabels(data: any, known: Set<string>): TermLabel[] {
   const out: TermLabel[] = [];
   const push = (term: unknown, dimension: unknown, value: unknown) => {
     if (typeof term !== "string" || typeof dimension !== "string" || typeof value !== "string")
       return;
-    const t = term.toLowerCase().trim();
-    if (known.has(t) && dimension.trim() && value.trim())
+    const t = normalizeQuery(term);
+    // One term, one label (rule 4): a term listed twice ("near" under two cities) keeps its first.
+    if (known.has(t) && dimension.trim() && value.trim() && !out.some((l) => l.term === t))
       out.push({ term: t, dimension: dimension.trim(), value: value.trim() });
   };
   const dims = data?.dimensions;
@@ -690,20 +726,33 @@ const inOrder = (short: string, long: string) => {
 };
 
 /** At most one letter changed, added or dropped. */
-function withinOneEdit(a: string, b: string): boolean {
-  if (Math.abs(a.length - b.length) > 1) return false;
-  let i = 0;
-  while (i < a.length && a[i] === b[i]) i++;
-  return (
-    a.slice(i + 1) === b.slice(i + 1) ||
-    a.slice(i) === b.slice(i + 1) ||
-    a.slice(i + 1) === b.slice(i)
-  );
+/** Letters changed, added or dropped to turn `a` into `b`. */
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++)
+      cur[j] = Math.min(
+        prev[j]! + 1,
+        cur[j - 1]! + 1,
+        prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    prev = cur;
+  }
+  return prev[b.length]!;
 }
 
 /**
+ * The model's unit is the typed word in its standard spelling, not another unit: one inside the other ("ltr" /
+ * "L", "v" / "volt"), or the same first letter and at most two letters off ("dack" / "Deck", "litter" / "Litre").
+ * "cc" / "kg" is neither.
+ */
+const respelled = (a: string, b: string) =>
+  inOrder(a, b) || inOrder(b, a) || (a[0] === b[0] && editDistance(a, b) <= 2);
+
+/**
  * {"units": {"cc": {"dimension": "Engine Displacement", "unit": "cc"}}} → what each unit word's numbers measure.
- * Only units that were sent count. The unit may be respelled ("v" → "V", "ltr" → "L", "seaters" → "Seater") or
+ * Only units that were sent count. The unit may be respelled ("v" → "V", "ltr" → "L", "dack" → "Deck") or
  * left out when the word isn't one ("2024 model" → "2024"), but not swapped for another ("cc" → "kg" falls back to
  * "cc"); sizes typed without a unit get none.
  */
@@ -715,25 +764,45 @@ export function parseUnits(
   const sent = new Set(groups.map((g) => g.unit));
   const units = data?.units;
   if (!units || typeof units !== "object" || Array.isArray(units)) return out;
-  const letters = (s: string) => s.toLowerCase().replace(/[^a-z]/g, "");
+  const letters = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{M}]/gu, "");
   for (const [key, v] of Object.entries(units as Record<string, any>)) {
     const typed = key.trim() === NO_UNIT ? "" : key.trim().toLowerCase();
     const dimension = typeof v?.dimension === "string" ? v.dimension.trim() : "";
     if (!sent.has(typed) || out.has(typed) || !dimension) continue;
     const written = typeof v?.unit === "string" ? v.unit.trim() : null;
     const a = letters(written ?? "");
-    const unit =
-      written === null
-        ? typed
-        : !a
-          ? ""
-          : inOrder(a, typed) || inOrder(typed, a) || withinOneEdit(a, typed)
-            ? written
-            : typed;
+    // Another unit than the word typed is never taken, and the answer is dropped: "160 white" → "cc" or
+    // "150 cc" → "kg" would write the numbers in a unit nobody typed, or under the wrong word. A word typed in
+    // another script is taken in its Latin spelling ("केवी" → "kV").
+    if (written !== null && a && /[a-z]/.test(typed) && !respelled(a, typed)) continue;
+    const unit = written === null ? typed : !a ? "" : written;
     out.set(typed, { dimension, unit: typed ? unit : "" });
+  }
+  // Typos of one unit under one dimension ("deck", "dack", "dec") are written the way the highest-demand one is,
+  // whether or not the model fixed each: one unit, one spelling. Groups come highest demand first.
+  const first = new Map<string, string>();
+  for (const g of groups) {
+    const u = out.get(g.unit);
+    if (!u?.unit) continue;
+    const dim = u.dimension.toLowerCase();
+    const main = first.get(dim);
+    if (main === undefined) first.set(dim, u.unit);
+    else if (sameUnit(letters(u.unit), letters(main)) || sameUnit(g.unit, letters(main)))
+      u.unit = main;
   }
   return out;
 }
+
+/**
+ * Two spellings of one unit, strictly: the same first letter and one letter off ("dec" / "deck", "try" / "tray",
+ * "fit" / "ft"), two for longer words ("litter" / "litre") or when the last letter is the same too ("ft" / "feet" /
+ * "foot"). One-letter units and pairs like "kw" / "kva", "sqft" / "ft", "mm" / "m" stay apart.
+ */
+const sameUnit = (a: string, b: string) => {
+  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;
+  const d = editDistance(a, b);
+  return d <= (Math.min(a.length, b.length) <= 3 ? 1 : 2) || (a.at(-1) === b.at(-1) && d <= 2);
+};
 
 /** Apply {"merge": {...}, "drop": [...]} from the model on top of the code-only field map. */
 export function applySpecMerges(

@@ -364,20 +364,58 @@ const STOPWORDS = new Set(
 
 /**
  * Lower-case, with sizes ("10 x 12" → "10x12"), square units ("sq ft" → "sqft"), ₹ and "near me" written one way.
+ * Words of every script are kept ("12 केवी जनरेटर"), URL-encoded text is decoded, and the symbols buyers type for
+ * a unit or a grade become the words they stand for: `9"` → "9 inch", `20'` → "20 ft", "99%" → "99 percent",
+ * "550°c" → "550 degree c", "iv+" → "iv plus"; "1/2" stays one number. What a word means is the model's call.
  * A number and the word after it stay two tokens here; term mining joins them ("150 cc" → "150cc").
  */
 export function normalizeQuery(q: string): string {
-  let s = ` ${q.toLowerCase()} `;
+  let s = ` ${asciiDigits(decodeEscapes(q)).toLowerCase()} `;
   s = s.replace(/₹/g, " rs ");
   s = s.replace(/\bnear\s+(by\s+)?me\b/g, " near-me ");
   s = s.replace(/\bsq(uare)?\.?\s*(ft|feet|foot)\b/g, "sqft");
   s = s.replace(/\bsq(uare)?\.?\s*(m|mtr|meter|metre)s?\b/g, "sqm");
+  // A foot or inch mark inside a size goes ("20'x10'" is 20x10 ft); after a number it is the unit.
+  s = s.replace(/(\d)\s*["'’′”″]+\s*(?=(?:x|\*|×|by)\s*\d)/g, "$1 ");
+  s = s.replace(/(\d)\s*(?:''|["”″])/g, "$1 inch ");
+  s = s.replace(/(\d)\s*['’′](?![\p{L}\d])/gu, "$1 ft ");
+  s = s.replace(/(\d)\s*%/g, "$1 percent ");
+  s = s.replace(/°/g, " degree ");
+  s = s.replace(/([\p{L}\d])\+(?![\p{L}\d])/gu, "$1 plus ");
   s = s.replace(
     /(\d+(?:\.\d+)?)\s*(?:x|\*|×|by)\s*(\d+(?:\.\d+)?)(?:\s*(?:x|\*|×|by)\s*(\d+(?:\.\d+)?))?/g,
     (_m, a, b, c) => (c ? `${a}x${b}x${c}` : `${a}x${b}`),
   );
-  s = s.replace(/[^a-z0-9.\-\s]/g, " ").replace(/(?<!\d)\.|\.(?!\d)/g, " ");
+  s = s.replace(/(\d)\s*\/\s*(\d)/g, "$1/$2");
+  s = s
+    .replace(/[^\p{L}\p{M}0-9./\-\s]/gu, " ")
+    .replace(/(?<!\d)\.|\.(?!\d)/g, " ")
+    .replace(/(?<!\d)\/|\/(?!\d)/g, " ");
   return s.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Digits of any script as 0-9: "१२ केवी" → "12 केवी", "৫ কিলো" → "5 কিলো". Unicode puts each script's digits in
+ * a run of ten from zero, so a digit's value is its distance from the start of its run.
+ */
+function asciiDigits(q: string): string {
+  return q.replace(/[^\P{Nd}0-9]/gu, (d) => {
+    let start = d.codePointAt(0)!;
+    while (/\p{Nd}/u.test(String.fromCodePoint(start - 1))) start--;
+    return String((d.codePointAt(0)! - start) % 10);
+  });
+}
+
+/** "%e0%a4%9c%e0%a4%a8" → "जन": exports keep some keywords URL-encoded. A run that isn't valid UTF-8 stays. */
+function decodeEscapes(q: string): string {
+  if (!q.includes("%")) return q;
+  return q.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+  });
 }
 
 // The same rows are turned into a table many times (the page, the preview of every MCAT, every run), and a
@@ -455,7 +493,8 @@ function buildKeywordTable(rows: Row[], source: KeywordSource): KeywordTable | n
 
   const kwRows = [...merged.values()]
     .map(({ rateWeights: _rw, ...rest }) => rest)
-    .sort((a, b) => b.demand - a.demand);
+    .sort((a, b) => b.demand - a.demand)
+    .filter((r, _, all) => !isTotalRow(r, all));
   return {
     source,
     queryColumn: queryCol,
@@ -466,6 +505,17 @@ function buildKeywordTable(rows: Row[], source: KeywordSource): KeywordTable | n
     totalDemand: kwRows.reduce((s, r) => s + r.demand, 0),
     totalAction: kwRows.reduce((s, r) => s + r.action, 0),
   };
+}
+
+/**
+ * An export's totals line ("Total", 86,315 pageviews) is not a keyword: named as one, or holding about the
+ * demand of all the other rows together.
+ */
+function isTotalRow(r: KeywordRow, all: KeywordRow[]): boolean {
+  if (/^(grand )?totals?$/.test(r.tokens.join(" "))) return true;
+  if (all.length < 20 || r !== all[0]) return false;
+  const rest = all.reduce((s, x) => s + x.demand, 0) - r.demand;
+  return rest > 0 && Math.abs(r.demand - rest) <= rest * 0.01;
 }
 
 export function describeKeywordTable(t: KeywordTable | null): string {
@@ -481,9 +531,9 @@ export function describeKeywordTable(t: KeywordTable | null): string {
 
 // ───────────────────────────── term mining ─────────────────────────────
 
-/** A bare number or size: "150", "2.5", "10x12". */
-const BARE_NUMBER = /^\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?){0,2}$/;
-const NUMBER_TERM = /^(\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?){0,2})([a-z]*)$/;
+/** A bare number, fraction or size: "150", "2.5", "1/2", "10x12". */
+const BARE_NUMBER = /^\d+(?:\.\d+)?(?:\/\d+|(?:x\d+(?:\.\d+)?){0,2})$/;
+const NUMBER_TERM = /^(\d+(?:\.\d+)?(?:\/\d+|(?:x\d+(?:\.\d+)?){0,2}))([\p{L}\p{M}]*)$/u;
 
 /** The unit key of sizes typed without a word after them ("10x12"), as the labelling prompt lists it. */
 export const NO_UNIT = "(none)";
@@ -586,7 +636,7 @@ function canonicalTokens(row: KeywordRow, plurals: Map<string, string>) {
 }
 
 function isContent(tok: string) {
-  return !STOPWORDS.has(tok) && !/^\d+(\.\d+)?$/.test(tok) && tok.length > 1;
+  return !STOPWORDS.has(tok) && !BARE_NUMBER.test(tok) && tok.length > 1;
 }
 
 /**
@@ -600,7 +650,7 @@ function termsOf(tokens: string[], core: Set<string>) {
   tokens.forEach((t, i) => {
     const n = tokens[i + 1];
     // One letter counts after a number ("60 v", "5 w"), though not as a term of its own.
-    const unitWord = n && !STOPWORDS.has(n) && /^[a-z][a-z.-]*$/.test(n);
+    const unitWord = n && !STOPWORDS.has(n) && /^\p{L}[\p{L}\p{M}.-]*$/u.test(n);
     if (BARE_NUMBER.test(t) && unitWord && !core.has(n)) {
       out.add(`${t}${n}`);
       joined.add(i).add(i + 1);
