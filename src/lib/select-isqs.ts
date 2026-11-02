@@ -20,7 +20,7 @@ import {
   type Quantity,
   type QuantityShape,
 } from "./quantity";
-import { HIGH_AT, MEDIUM_AT, type ValueConfidence, type ValueLevel } from "./value-confidence";
+import { levelFor, type ValueConfidence, type ValueLevel } from "./value-confidence";
 
 /*
  * Skill 15 · which ISQs and which of their values are finally shown. Runs after the check step, all in code
@@ -57,8 +57,9 @@ export const MIN_GOOD_MEASURES = 3;
 /** An ISQ needs this many values to be shown at all. */
 export const MIN_VALUES = 2;
 
-const PRICE_NAME = /\b(price|budget|cost)\b/i;
-const PLACE_NAME = /\b(city|location|near ?me)\b/i;
+// Whole words only: "Capacity" and "Electricity" are not places.
+export const PRICE_NAME = /\b(price|budget|cost)\b/i;
+export const PLACE_NAME = /\b(city|location|near ?me)\b/i;
 /** Price and seller location are never ISQs here. */
 export const isExcludedIsq = (name: string) => PRICE_NAME.test(name) || PLACE_NAME.test(name);
 
@@ -73,8 +74,6 @@ const isJunk = (v: string) =>
   isOther(v) || JUNK.test(v.trim().replace(/\s+/g, " ")) || VAGUE.test(v.trim());
 const round1 = (n: number) => Math.round(n * 10) / 10;
 const LEVEL_RANK: Record<ValueLevel, number> = { High: 0, Medium: 1, Low: 2 };
-const levelOf = (share: number): ValueLevel =>
-  share >= HIGH_AT ? "High" : share >= MEDIUM_AT ? "Medium" : "Low";
 const lift = (l: ValueLevel): ValueLevel => (l === "Low" ? "Medium" : "High");
 
 // ───────────────────────────── text values: one key per meaning ─────────────────────────────
@@ -274,7 +273,7 @@ function score(g: Group | undefined, src: Sources): Scored {
       source: "data",
     };
   return {
-    level: levelOf(Math.max(demandPct ?? 0, fillPct ?? 0)),
+    level: levelFor(demandPct, fillPct, g?.listings ?? 0),
     why: parts.join(" · "),
     fill_pct: fillPct,
     listings: g?.listings ?? 0,
@@ -607,7 +606,7 @@ function absorb(w: Work, keep: Item, drop: Item) {
     keep.vc.demand_pct == null && drop.vc.demand_pct == null
       ? null
       : Math.min(100, round1((keep.vc.demand_pct ?? 0) + (drop.vc.demand_pct ?? 0)));
-  const level = [levelOf(Math.max(fill ?? 0, demand ?? 0)), keep.vc.level, drop.vc.level].sort(
+  const level = [levelFor(demand, fill, listings), keep.vc.level, drop.vc.level].sort(
     (a, b) => LEVEL_RANK[a] - LEVEL_RANK[b],
   )[0]!;
   keep.vc = {

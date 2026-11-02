@@ -57,9 +57,17 @@ export const HIGH_AT = 20;
 /** …and at least this share is a real but smaller option; below it, or unseen, is Low. */
 export const MEDIUM_AT = 5;
 
-export const VALUE_CONFIDENCE_RULE = `Value confidence: High = the value holds ≥ ${HIGH_AT}% of the keyword demand or of the listings that fill this spec · Medium = ≥ ${MEDIUM_AT}% · Low = less than that, or not seen in your data (suggested by the model).`;
+/**
+ * Listings a value must be on for its listing share to make it High: on an MCAT with 3 listings, a value one
+ * seller typed is 33% of them, which is one seller's wording, not a leader. Below this it is at most Medium,
+ * still a real option. Keyword demand counts as before.
+ */
+export const HIGH_MIN_LISTINGS = 3;
 
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+export const VALUE_CONFIDENCE_RULE = `Value confidence: High = the value holds ≥ ${HIGH_AT}% of the keyword demand, or of the listings that fill this spec (on at least ${HIGH_MIN_LISTINGS} listings) · Medium = ≥ ${MEDIUM_AT}% · Low = less than that, or not seen in your data (suggested by the model).`;
+
+// Letters and digits of any script.
+const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 const stem = (s: string) => norm(s).replace(/s$/, "");
 
 /**
@@ -73,6 +81,21 @@ function matches<T>(items: T[], name: (t: T) => string, value: string): T[] {
 
 const level = (share: number): ValueLevel =>
   share >= HIGH_AT ? "High" : share >= MEDIUM_AT ? "Medium" : "Low";
+
+/**
+ * The level a value's numbers give it (VALUE_CONFIDENCE_RULE): its share of the keyword demand as it is, its
+ * share of the listings only when it is on enough of them. Every step that levels a value uses this.
+ */
+export function levelFor(
+  demandPct: number | null,
+  fillPct: number | null,
+  listings: number,
+): ValueLevel {
+  const byFill = level(fillPct ?? 0);
+  const fromListings = byFill === "High" && listings < HIGH_MIN_LISTINGS ? "Medium" : byFill;
+  const fromDemand = level(demandPct ?? 0);
+  return LEVEL_RANK[fromDemand] <= LEVEL_RANK[fromListings] ? fromDemand : fromListings;
+}
 
 /**
  * A High / Medium / Low tag for each value of a filter, from how much of the keyword demand and of
@@ -123,6 +146,10 @@ export function scoreValue(
 ): ValueConfidence & { share: number } {
   const parts: string[] = [];
   let best = 0;
+  let top: ValueLevel = "Low";
+  const raise = (l: ValueLevel) => {
+    if (LEVEL_RANK[l] < LEVEL_RANK[top]) top = l;
+  };
   let demandPct: number | null = null;
   let fillPct: number | null = null;
   let listings = 0;
@@ -134,6 +161,7 @@ export function scoreValue(
       ...dvs.flatMap((d) => Object.values(d.bySource).map((b) => b?.share ?? 0)),
     );
     best = Math.max(best, share);
+    raise(level(share));
     demandPct = share;
     parts.push(`${share}% of the keyword demand for ${dim.name}`);
   }
@@ -144,6 +172,7 @@ export function scoreValue(
     const count = lv.reduce((s, [, n]) => s + n, 0);
     const share = spec.filled ? Math.round((count / spec.filled) * 1000) / 10 : 0;
     best = Math.max(best, share);
+    raise(levelFor(null, share, count));
     if (fillPct === null || share > fillPct) {
       fillPct = share;
       listings = count;
@@ -160,7 +189,7 @@ export function scoreValue(
       share: 0,
       ...data,
     };
-  return { value, level: level(best), why: parts.join(" · "), share: best, ...data };
+  return { value, level: top, why: parts.join(" · "), share: best, ...data };
 }
 
 /** A scored value as stored on a filter: its confidence and the numbers behind it, without the ranking share. */

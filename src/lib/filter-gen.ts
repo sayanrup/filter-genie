@@ -65,7 +65,7 @@ import {
   rankingText,
   type DocMcat,
 } from "./category-doc";
-import { isExcludedIsq, isqsNeedingDoc, selectIsqs } from "./select-isqs";
+import { isExcludedIsq, isqsNeedingDoc, PLACE_NAME, PRICE_NAME, selectIsqs } from "./select-isqs";
 import type { ContextComparison } from "./compare";
 import {
   MIN_MCAT_KEYWORDS,
@@ -1010,7 +1010,8 @@ function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } 
   return { result, links };
 }
 
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+// Letters and digits of any script: a spec or value written in Hindi has a name too.
+const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 
 const OTHER_FLOOR_PCT = 3; // values below this share of a dimension fold into "Other" (never for Location)
 const MAX_DEFAULT_OPTIONS = 8;
@@ -1060,24 +1061,40 @@ function deriveOptions(
     };
   }
 
-  let values: string[];
-  if (dim && dim.values.length) {
-    const total = dim.values.reduce(
-      (s, v) => s + Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0),
-      0,
-    );
-    const kept: string[] = [];
-    let folded = false;
-    for (const v of dim.values) {
-      const demand = Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0);
-      const share = total > 0 ? (demand / total) * 100 : 0;
-      if (kept.length < MAX_DEFAULT_OPTIONS && share >= OTHER_FLOOR_PCT) kept.push(v.value);
-      else folded = true;
-    }
-    values = folded ? [...kept, "Other"] : kept;
-  } else {
-    values = (spec?.top ?? []).slice(0, MAX_DEFAULT_OPTIONS).map(([v]) => v);
+  // Options from both sides: what buyers typed (the keyword dimension's values, by share of its demand) and
+  // what sellers list (the spec's values, by share of the listings that fill it). A value only the keywords
+  // name may have no listing to show; one only listings use is still a real choice. One option written two
+  // ways keeps the keyword's label and the larger share; the biggest MAX_DEFAULT_OPTIONS stay, the rest
+  // fold into "Other".
+  const options = new Map<string, { label: string; share: number }>();
+  const offer = (label: string, share: number) => {
+    const k = norm(label).replace(/s$/, "");
+    if (!k) return;
+    // A seller's typo of an option already there is that option ("Gaurd Room" / "Guard Room"); options whose
+    // numbers differ never are ("Model A1" / "Model A2").
+    const same =
+      options.get(k) ??
+      [...options].find(
+        ([o]) =>
+          k.length >= 6 &&
+          o[0] === k[0] &&
+          o.replace(/\D/g, "") === k.replace(/\D/g, "") &&
+          editDistance(o, k) <= (Math.min(o.length, k.length) >= 8 ? 2 : 1),
+      )?.[1];
+    if (same) same.share = Math.max(same.share, share);
+    else options.set(k, { label, share });
+  };
+  if (dim?.values.length) {
+    const demandOf = (v: (typeof dim.values)[number]) =>
+      Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0);
+    const total = dim.values.reduce((s, v) => s + demandOf(v), 0);
+    for (const v of dim.values) offer(v.value, total > 0 ? (demandOf(v) / total) * 100 : 0);
   }
+  if (spec?.filled) for (const [v, n] of spec.all ?? spec.top) offer(v, (n / spec.filled) * 100);
+  const ranked = [...options.values()].sort((a, b) => b.share - a.share);
+  const kept = ranked.filter((o) => o.share >= OTHER_FLOOR_PCT).slice(0, MAX_DEFAULT_OPTIONS);
+  let values = kept.map((o) => o.label);
+  if (kept.length < ranked.length) values = [...values, "Other"];
   const numeric = values.length > 0 && values.every((v) => /^\d+(\.\d+)?\s*[a-z%]*$/i.test(v));
   const ui_pattern =
     values.length <= 1
@@ -1120,11 +1137,11 @@ export function attachEvidence(
       );
     spec ??= specs.get(norm(f.name));
     // Location filters are served by the seller-city field, whatever the filter is called.
-    const isPlace = /city|location|near ?me/i.test(`${f.name} ${link.dimension ?? ""}`);
+    const isPlace = PLACE_NAME.test(`${f.name} ${link.dimension ?? ""}`);
     if (!spec && isPlace)
       spec = (listing?.fields ?? []).find((x) => /\b(city|location)\b/i.test(x.key));
     // Price comes from the listings' price field, not from a spec.
-    const isPrice = /price|budget|cost/i.test(`${f.name} ${link.dimension ?? ""}`);
+    const isPrice = PRICE_NAME.test(`${f.name} ${link.dimension ?? ""}`);
 
     // "values"/"ui_pattern" are no longer asked of the model (fewer output tokens, faster runs):
     // code derives them from the same evidence the model linked to. A model that still sends its
@@ -1170,6 +1187,8 @@ export function attachEvidence(
 const MAX_OPTIONS = 12;
 /** Filters shown in a panel, across all tiers: more than this is noise for a buyer (and for a reviewer). */
 export const MAX_FILTERS = 6;
+/** Always-visible filters: the 3–4 buyers shortlist with (skill 08). */
+const MAX_TIER1 = 4;
 /** AI-suggested ISQ values shown beside a filter's real values (see `FilterRow.ai_values`). */
 const MAX_AI_VALUES = 6;
 
@@ -1240,13 +1259,13 @@ export function fixResult(
       warnings.push(`The rationale for "${f.name}" cites no evidence.`);
   }
 
-  // Tier 1 size: 3–5.
+  // Tier 1 size: 3–4, as the design prompt asks (skill 08).
   const t1 = byTier("Tier 1");
-  if (t1.length > 5) {
-    for (const f of t1.slice(5)) f.tier = "Tier 2";
+  if (t1.length > MAX_TIER1) {
+    for (const f of t1.slice(MAX_TIER1)) f.tier = "Tier 2";
     fixes.push(
       `Tier 1 had ${t1.length} filters; moved ${t1
-        .slice(5)
+        .slice(MAX_TIER1)
         .map((f) => `"${f.name}"`)
         .join(", ")} to Tier 2.`,
     );
