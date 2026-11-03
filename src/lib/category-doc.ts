@@ -305,9 +305,29 @@ const words = (name: string) =>
  * to be paired. The document ISQ must really hold quantities. Area and Size stand in for each other when the
  * document has only one of them. With several candidates, the one sharing the most name words; a tie is null.
  */
-function measurementPair(f: FilterRow, doc: DocMcat, used: Set<DocIsq>): DocIsq | null {
+function measurementPair(
+  f: FilterRow,
+  doc: DocMcat,
+  used: Set<DocIsq>,
+  unit: string | null,
+): DocIsq | null {
   const mine = measureWords(f.name);
-  if (!mine.length) return null;
+  // A figure in a unit outside the table ("Engine Displacement" in cc) has no measurement word: it pairs with the
+  // one document ISQ whose values are mostly in that same unit ("Engine Capacity Class": 100cc, 125cc …).
+  if (!mine.length) {
+    if (!unit) return null;
+    const inUnit = (q: DocIsq) =>
+      q.values.filter((v) => {
+        const x = parseQuantity(v);
+        return x?.kind === "figure" && x.unit === unit;
+      }).length;
+    const scored = doc.isqs
+      .filter((q) => !used.has(q))
+      .map((q) => ({ q, n: inUnit(q) }))
+      .filter((x) => x.n >= Math.max(2, x.q.values.length / 2))
+      .sort((a, b) => b.n - a.n);
+    return scored[0] && scored[0].n !== scored[1]?.n ? scored[0].q : null;
+  }
   const holdsQuantities = (q: DocIsq) =>
     q.values.filter((v) => parseQuantity(v)).length >= Math.max(2, q.values.length / 2);
   const pool = doc.isqs.filter((q) => !used.has(q) && holdsQuantities(q));
@@ -323,11 +343,16 @@ function measurementPair(f: FilterRow, doc: DocMcat, used: Set<DocIsq>): DocIsq 
 }
 
 /** The ISQs code pairs with the document itself, as measurements: these need no model call. */
-export function measurementPairs(filters: FilterRow[], doc: DocMcat): Map<FilterRow, DocIsq> {
+export function measurementPairs(
+  filters: FilterRow[],
+  doc: DocMcat,
+  /** A filter's figure unit, when it is a figure outside the unit table (select-isqs figureUnitOf). */
+  unitOf: (f: FilterRow) => string | null = () => null,
+): Map<FilterRow, DocIsq> {
   const used = new Set<DocIsq>();
   const out = new Map<FilterRow, DocIsq>();
   for (const f of filters) {
-    const isq = measurementPair(f, doc, used);
+    const isq = measurementPair(f, doc, used, unitOf(f));
     if (!isq) continue;
     used.add(isq);
     out.set(f, isq);
@@ -342,7 +367,12 @@ export function measurementPairs(filters: FilterRow[], doc: DocMcat): Map<Filter
  * its name, or its listing spec's name, is the document ISQ's name ignoring case and punctuation, else with the
  * one unused document ISQ that shares the most values with it written the same (a tie pairs nothing).
  */
-export function parseDocPairs(data: any, filters: FilterRow[], doc: DocMcat): DocPair[] {
+export function parseDocPairs(
+  data: any,
+  filters: FilterRow[],
+  doc: DocMcat,
+  unitOf: (f: FilterRow) => string | null = () => null,
+): DocPair[] {
   const byFilter = new Map(filters.map((f) => [norm(f.name), f]));
   const byIsq = new Map(doc.isqs.map((q) => [norm(q.name), q]));
   const used = new Set<DocIsq>();
@@ -362,7 +392,7 @@ export function parseDocPairs(data: any, filters: FilterRow[], doc: DocMcat): Do
     return pairs;
   };
 
-  for (const [f, isq] of measurementPairs(filters, doc)) {
+  for (const [f, isq] of measurementPairs(filters, doc, unitOf)) {
     used.add(isq);
     out.set(f, { filter: f, isq, values: valuePairs(f, isq, {}) });
   }

@@ -251,7 +251,7 @@ export function FilterTable({
               const vc = confidenceOf(f, evidence);
               const levelOf = new Map((vc ?? []).map((v) => [v.value, v]));
               const rangeOf = new Map((f.ranges ?? []).map((r) => [r.value, r]));
-              // Values the select step left out (Low, or Medium beside 4+ High) are shown muted.
+              // Values the select step left out (Low, or Medium beside 3+ High) are shown muted.
               const leftOut = new Set(
                 f.selected_values ? f.values.filter((v) => !f.selected_values!.includes(v)) : [],
               );

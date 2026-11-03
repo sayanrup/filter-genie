@@ -10,7 +10,7 @@
  */
 
 export type QuantityKind =
-  "length" | "area" | "dims" | "weight" | "volume" | "power" | "rate" | "bare";
+  "length" | "area" | "dims" | "weight" | "volume" | "power" | "rate" | "figure" | "bare";
 export type QuantityRange = "" | "upto" | "above" | "between";
 
 /** The kind a unit gives a single number. */
@@ -39,7 +39,13 @@ const COUNT_UNIT = String.raw`pcs|pieces?|nos`;
 const TIME_UNIT = String.raw`min(?:ute)?s?|h|hrs?|hours?|shifts?|days?`;
 /** "kg/hr", "L per day", "pcs/min", and the short forms LPH, LPD, TPH, TPD. */
 const RATE_UNIT = String.raw`(?:${WEIGHT_UNIT}|${VOLUME_UNIT}|${COUNT_UNIT})\s*(?:\/|per)\s*(?:${TIME_UNIT})|lph|lpd|tph|tpd`;
-const UNIT = `(?:${RATE_UNIT}|${AREA_UNIT}|${LENGTH_UNIT}|${WEIGHT_UNIT}|${VOLUME_UNIT}|${POWER_UNIT})`;
+/**
+ * Any other unit a seller or buyer writes after a number: "cc", "kVA", "GSM", "mAh", "V", "Tray". There is no
+ * list of these: which of them measure something is the labelling model's call (step 2), and step 6 reads that
+ * from the keyword dimension the ISQ is linked to. A word in any script counts.
+ */
+const OTHER_UNIT = String.raw`\p{L}[\p{L}\p{M}.]{0,11}(?:\s?\/\s?\p{L}{1,6})?`;
+const UNIT = `(?:${RATE_UNIT}|${AREA_UNIT}|${LENGTH_UNIT}|${WEIGHT_UNIT}|${VOLUME_UNIT}|${POWER_UNIT}|${OTHER_UNIT})`;
 
 const UNIT_LABELS: [RegExp, string, UnitKind][] = [
   [/^(sq\.?\s*(ft|feet|foot|fts)\.?|sqft|sft|square\s*(feet|foot|ft))$/, "sq ft", "area"],
@@ -93,7 +99,8 @@ function rateOf(u: string): string | null {
   return base && time ? `${base[1]}/${time[1]}` : null;
 }
 
-function unitOf(raw: string | undefined): { unit: string; kind: UnitKind } | null | "" {
+/** A unit of the table above (with its one spelling and kind), "" for none, null for anything else. */
+function tableUnit(raw: string | undefined): { unit: string; kind: UnitKind } | null | "" {
   const u = (raw ?? "").trim().replace(/\s+/g, " ");
   if (!u) return "";
   const rate = rateOf(u);
@@ -104,20 +111,51 @@ function unitOf(raw: string | undefined): { unit: string; kind: UnitKind } | nul
   return null;
 }
 
+/** Words that sit after a number but are no unit: range and size words. */
+const NOT_UNIT = /^(x|to|or|and|per|up|upto|above|below|under|over|only|min|max|plus|nos?)$/;
+
+/** Another unit's one key: lower case, no dots, no plural "s" ("Trays" → "tray", "KVA" → "kva", "c.c." → "cc"). */
+export const unitKey = (raw: string): string => {
+  const u = raw.toLowerCase().replace(/[.\s]/g, "");
+  // A rate's time is written one way: "km/h", "Km/Hr" and "km/hour" are "km/hr".
+  const slash = u.indexOf("/");
+  if (slash > 0) {
+    const time = u.slice(slash + 1);
+    const t = TIME_LABELS.find(([re]) => re.test(time))?.[1] ?? time;
+    return `${unitKey(u.slice(0, slash))}/${t}`;
+  }
+  return u.length >= 4 && u.endsWith("s") && !u.endsWith("ss") ? u.slice(0, -1) : u;
+};
+
+function unitOf(raw: string | undefined): { unit: string; kind: UnitKind } | null | "" {
+  const known = tableUnit(raw);
+  if (known !== null) return known;
+  const u = (raw ?? "").trim();
+  return new RegExp(`^${OTHER_UNIT}$`, "u").test(u) &&
+    !NOT_UNIT.test(u.toLowerCase().split("/")[0]!)
+    ? { unit: unitKey(u), kind: "figure" }
+    : null;
+}
+
 const UPTO = String.raw`(?:up\s*to|upto|under|below|less\s*than|within|max(?:imum)?\.?|<=?|≤)`;
 const ABOVE = String.raw`(?:above|over|more\s*than|greater\s*than|min(?:imum)?\.?|>=?|≥)`;
 const AND_UP = String.raw`(?:\+|and\s*above|&\s*above|or\s*more|onwards)`;
 
-const RE_UPTO = new RegExp(`^${UPTO}\\s*(${NUM})\\s*(${UNIT})?$`);
-const RE_ABOVE = new RegExp(`^${ABOVE}\\s*(${NUM})\\s*(${UNIT})?$`);
-const RE_AND_UP = new RegExp(`^(${NUM})\\s*(${UNIT})?\\s*${AND_UP}$`);
+// "u": a unit can be a word in any script.
+const RE_UPTO = new RegExp(`^${UPTO}\\s*(${NUM})\\s*(${UNIT})?$`, "u");
+const RE_ABOVE = new RegExp(`^${ABOVE}\\s*(${NUM})\\s*(${UNIT})?$`, "u");
+const RE_AND_UP = new RegExp(`^(${NUM})\\s*(${UNIT})?\\s*${AND_UP}$`, "u");
 /** "2500+ sq ft": the plus before the unit. */
-const RE_PLUS = new RegExp(`^(${NUM})\\s*\\+\\s*(${UNIT})?$`);
-const RE_BETWEEN = new RegExp(`^(${NUM})\\s*(${UNIT})?\\s*(?:-|–|—|to)\\s*(${NUM})\\s*(${UNIT})?$`);
+const RE_PLUS = new RegExp(`^(${NUM})\\s*\\+\\s*(${UNIT})?$`, "u");
+const RE_BETWEEN = new RegExp(
+  `^(${NUM})\\s*(${UNIT})?\\s*(?:-|–|—|to)\\s*(${NUM})\\s*(${UNIT})?$`,
+  "u",
+);
 const RE_DIMS = new RegExp(
   `^(${NUM})\\s*(${UNIT})?\\s*x\\s*(${NUM})\\s*(${UNIT})?(?:\\s*x\\s*(${NUM})\\s*(${UNIT})?)?$`,
+  "u",
 );
-const RE_SINGLE = new RegExp(`^(${NUM})\\s*(${UNIT})?$`);
+const RE_SINGLE = new RegExp(`^(${NUM})\\s*(${UNIT})?$`, "u");
 
 /** One unit for a quantity written with several ("10 ft x 12 ft"): they must agree; blanks take the others'. */
 function oneUnit(raw: (string | undefined)[]): { unit: string; kind: UnitKind | "" } | null {
@@ -193,9 +231,13 @@ export function parseQuantity(text: string): Quantity | null {
 
 const fmt = (n: number) => String(Math.round(n * 100) / 100);
 
-/** The one spelling of a quantity: "10 x 12 ft", "20 ft", "Up to 500 sq ft", "500 - 1000 sq ft", "Above 1000 sq ft". */
-export function formatQuantity(q: Quantity): string {
-  const unit = q.unit ? ` ${q.unit}` : "";
+/**
+ * The one spelling of a quantity: "10 x 12 ft", "20 ft", "Up to 500 sq ft", "500 - 1000 sq ft", "Above 1000 sq ft".
+ * `spell` writes a unit outside the table the way its ISQ writes it ("kva" → "kVA").
+ */
+export function formatQuantity(q: Quantity, spell?: (unit: string) => string): string {
+  const written = q.kind === "figure" && spell ? spell(q.unit) : q.unit;
+  const unit = written ? ` ${written}` : "";
   if (q.range === "upto") return `Up to ${fmt(q.nums[0]!)}${unit}`;
   if (q.range === "above") return `Above ${fmt(q.nums[0]!)}${unit}`;
   if (q.range === "between") return `${fmt(q.nums[0]!)} - ${fmt(q.nums[1]!)}${unit}`;
@@ -210,7 +252,16 @@ export const quantityKey = (q: Quantity) =>
  * What a measurement ISQ holds, from its name: an area, one length, or a size (which can be either, or axes);
  * or a machine figure — a capacity (a rate, a volume or a weight), a weight, a volume or a power rating.
  */
-export type MeasureKind = "area" | "length" | "size" | "capacity" | "weight" | "volume" | "power";
+export type MeasureKind =
+  | "area"
+  | "length"
+  | "size"
+  | "capacity"
+  | "weight"
+  | "volume"
+  | "power"
+  /** A number in one unit outside the table ("125 cc", "10 kVA"), found from the data, not the name. */
+  | "figure";
 
 const AREA_NAME = /\barea\b/i;
 const LENGTH_NAME = /\b(length|width|breadth|height|thickness|diameter|depth|span)\b/i;
@@ -232,7 +283,7 @@ export function countedInBrackets(name: string): string | null {
   if (!inner || !/^[a-z ]+$/i.test(inner)) return null;
   const words = inner.toLowerCase().split(/\s+/);
   const unitish = (w: string) =>
-    Boolean(unitOf(w)) || /^(per|or|min|minutes?|hrs?|hours?|shifts?|days?)$/.test(w);
+    Boolean(tableUnit(w)) || /^(per|or|min|minutes?|hrs?|hours?|shifts?|days?)$/.test(w);
   return words.some(unitish) ? null : inner;
 }
 
@@ -275,6 +326,7 @@ const KIND_NAME: Record<Exclude<QuantityKind, "bare">, string> = {
   volume: "a volume",
   power: "a power rating",
   rate: "a rate",
+  figure: "a figure",
 };
 
 /** "a length", "an area", "a rate"…: what a value of this kind is, for notes. */
@@ -289,6 +341,7 @@ export const KIND_PLURAL: Record<Exclude<QuantityKind, "bare">, string> = {
   volume: "volumes",
   power: "power ratings",
   rate: "rates",
+  figure: "figures",
 };
 
 /**
@@ -301,7 +354,8 @@ export function figuresIn(text: string): Quantity[] {
     // Longest first: "100 kg/hr" before "100 kg".
     const words = m[0];
     const q = parseQuantity(words) ?? parseQuantity(words.replace(/\s*(?:\/|per)\s*[a-z]+$/i, ""));
-    if (q && q.kind !== "bare") out.push(q);
+    // A number with another word ("3 Phase", "4 Trays") is a count or a code here, not a figure.
+    if (q && q.kind !== "bare" && q.kind !== "figure") out.push(q);
   }
   return out;
 }
@@ -315,6 +369,7 @@ export const MEASURE_PLURAL: Record<MeasureKind, string> = {
   weight: "weights",
   volume: "volumes",
   power: "power ratings",
+  figure: "figures",
 };
 
 /**
@@ -330,6 +385,7 @@ const ALLOWED: Record<MeasureKind, QuantityKind[]> = {
   weight: ["weight"],
   volume: ["volume"],
   power: ["power"],
+  figure: ["figure"],
 };
 
 /**

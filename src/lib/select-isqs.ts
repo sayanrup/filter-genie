@@ -37,7 +37,7 @@ import { levelFor, type ValueConfidence, type ValueLevel } from "./value-confide
  *            3. thin ISQ (one High value or none): listing values the keywords missed, then the category
  *               document: a Medium / Low value of ours that it lists goes up a level, and up to 3 of its own
  *               values are added (at the level the data gives them, Medium at the least)
- *            4. only High and Medium values are shown; with 4 or more High, only the High ones. Numeric values
+ *            4. only High and Medium values are shown; with 3 or more High, only the High ones. Numeric values
  *               are listed smallest first, the rest best first
  *   ISQs     5. Tier 1 at any confidence, Tier 2 only when High; never Tier 3, Price or Location
  *            6. the tier is the only test (not how many values); two ISQs for one attribute are both shown
@@ -51,11 +51,13 @@ export const THIN_HIGH = 1;
 export const THIN_TARGET = 4;
 export const MAX_ADDED = 3;
 /** With this many High values, the Medium ones are not shown. */
-export const HIGH_ONLY_AT = 4;
+export const HIGH_ONLY_AT = 3;
 /** A measurement ISQ with fewer good values than this takes the category document's instead. */
 export const MIN_GOOD_MEASURES = 3;
 /** An ISQ needs this many values to be shown at all. */
 export const MIN_VALUES = 2;
+/** Values taken from a category document that lists more than this are cut to it (fewest). */
+export const MAX_DOC_VALUES = 12;
 
 // Whole words only: "Capacity" and "Electricity" are not places.
 export const PRICE_NAME = /\b(price|budget|cost)\b/i;
@@ -86,7 +88,6 @@ const SPELLING: [RegExp, string][] = [
   [/\bgrey\b/g, "gray"],
   [/\bmoulded\b/g, "molded"],
   [/\bpre[\s-]*fab(ricated)?\b/g, "prefabricated"],
-  [/\bpuff\b/g, "puf"],
   [/\bwooden\b/g, "wood"],
   [/\brectangle\b/g, "rectangular"],
   [/\bflavour/g, "flavor"],
@@ -100,23 +101,31 @@ const standardSpelling = (label: string) => {
   return SPELLING.every(([re, to]) => l.replace(re, to) === l);
 };
 /** Short forms and what they stand for, so "MS", "Mild Steel" and "MS (Mild Steel)" are one value. */
-const SHORT_FORMS: Record<string, string[]> = {
-  ms: ["mild", "steel"],
-  gi: ["galvanized", "iron"],
-  ss: ["stainless", "steel"],
-  frp: ["fibre", "reinforced", "plastic"],
-  puf: ["polyurethane", "foam"],
-  acp: ["aluminium", "composite", "panel"],
-  eps: ["expanded", "polystyrene"],
-  hdpe: ["high", "density", "polyethylene"],
-  peb: ["pre", "engineered", "building"],
-  lgsf: ["light", "gauge", "steel", "frame"],
-};
 const stem = (t: string) =>
   t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t;
+/** Number words as numbers: "Three Phase" is "3 Phase", "Single Door" is "1 Door". */
+const NUMBER_WORD: Record<string, string> = {
+  one: "1",
+  single: "1",
+  two: "2",
+  double: "2",
+  dual: "2",
+  twin: "2",
+  three: "3",
+  triple: "3",
+  four: "4",
+  five: "5",
+  six: "6",
+};
 
-/** The words of a value with spellings unified, short forms written out, plurals dropped and repeats removed. */
-export function valueTokens(value: string): string[] {
+/** Short forms → their words ("ms" → mild steel), found in an ISQ's own values (shortForms). */
+export type ShortForms = Record<string, string[]>;
+
+/**
+ * The words of a value with spellings unified, number words as numbers, short forms written out (those the ISQ's
+ * own values spell out, see shortForms), plurals dropped and repeats removed.
+ */
+export function valueTokens(value: string, shorts: ShortForms = {}): string[] {
   // "SS304" is "SS 304": a short form or word run into its number.
   let s = value
     .toLowerCase()
@@ -125,7 +134,34 @@ export function valueTokens(value: string): string[] {
   for (const [re, to] of SPELLING) s = s.replace(re, to);
   const out: string[] = [];
   for (const raw of s.split(/[^a-z0-9.]+/).filter((t) => t && t !== "etc"))
-    for (const t of SHORT_FORMS[raw] ?? [stem(raw)]) if (!out.includes(t)) out.push(t);
+    for (const t of shorts[raw] ?? [NUMBER_WORD[raw] ?? stem(raw)])
+      if (!out.includes(t)) out.push(t);
+  return out;
+}
+
+/**
+ * The short forms an ISQ's own values spell out, so "MS" and "Mild Steel (MS)" are one value. No list: a short
+ * form counts when the data writes it beside its words ("Mild Steel (MS)"), or as a value of its own whose
+ * letters are another value's initials ("MS" beside "Mild Steel", "BLDC" beside "Brushless DC").
+ */
+export function shortForms(labels: string[]): ShortForms {
+  const out: ShortForms = {};
+  const initials = (t: string[]) => t.map((w) => w[0]).join("");
+  const fulls = labels
+    .map((l) => valueTokens(l.replace(/\([^)]*\)/g, " ")))
+    .filter((t) => t.length >= 2 && t.every((w) => /^[a-z]/.test(w)));
+  for (const label of labels) {
+    const own = label.trim();
+    const candidates = [
+      ...[...own.matchAll(/\(([A-Za-z]{2,6})\)/g)].map((m) => m[1]!),
+      ...(/^[A-Z]{2,6}$/.test(own) ? [own] : []),
+    ];
+    for (const c of candidates) {
+      const short = c.toLowerCase();
+      const full = fulls.find((t) => initials(t) === short);
+      if (full && !out[short]) out[short] = full;
+    }
+  }
   return out;
 }
 
@@ -158,7 +194,8 @@ function tidy(label: string): string {
 }
 
 /** Two text values with the same key are the same value ("Green House" = "Greenhouse", "Steels" = "Steel"). */
-export const valueKey = (value: string) => valueTokens(value).join("");
+export const valueKey = (value: string, shorts: ShortForms = {}) =>
+  valueTokens(value, shorts).join("");
 
 const JOINERS = new Set(["with", "and", "cum", "plus", "or"]);
 
@@ -315,6 +352,8 @@ interface Work {
   fromLive: string | null;
   /** A count ISQ ("Number of Trays"): its values are compared by number, so "10", "10 Tray", "10 trays" are one. */
   count: Count | null;
+  /** A figure's unit as its ISQ writes it ("cc", "kVA"): how its values and its unit are shown. */
+  unitShown: string | null;
   notes: string[];
   warnings: string[];
 }
@@ -342,6 +381,59 @@ const sorted = (items: Item[]) =>
       (b.vc.demand_pct ?? -1) - (a.vc.demand_pct ?? -1),
   );
 
+/**
+ * The unit outside the table an ISQ's numbers are in, and how to write it. First from the keyword dimension the ISQ
+ * is linked to: its values are the labelling model's (step 2), which said once per unit word what its numbers
+ * measure, so "125 cc", "150 cc" under Engine Displacement are its call that cc measures it, in its spelling.
+ * Without such a dimension, from the ISQ's own values. Either way most of them must be numbers in that one unit.
+ */
+function figureUnit(src: Sources, base: string[]): { unit: string; spelled: string } | null {
+  const unitOf = (labels: string[]) => {
+    const n = new Map<string, number>();
+    for (const label of labels) {
+      const q = parseQuantity(label);
+      if (q?.kind === "figure") n.set(q.unit, (n.get(q.unit) ?? 0) + 1);
+    }
+    const [unit, count] = [...n].sort((a, b) => b[1] - a[1])[0] ?? [];
+    return unit && count && count >= Math.max(2, labels.length * 0.6) ? unit : null;
+  };
+  const dimension = src.raws.filter((r) => Object.keys(r.demand).length).map((r) => r.label);
+  const unit = (dimension.length ? unitOf(dimension) : null) ?? unitOf(base);
+  if (!unit) return null;
+  // Its spelling from everything written in it: the model's and the sellers' ("v" and "V" → "V").
+  const written = new Map<string, number>();
+  for (const label of [...dimension, ...base, ...src.raws.map((r) => r.label)]) {
+    if (parseQuantity(label)?.unit !== unit) continue;
+    const w = label.match(/(\p{L}[\p{L}\p{M}.]*(?:\s?\/\s?\p{L}+)?)\s*$/u)?.[1];
+    if (w) written.set(w, (written.get(w) ?? 0) + 1);
+  }
+  const spelled =
+    [...written].sort((a, b) => spellingRank(a[0]) - spellingRank(b[0]) || b[1] - a[1])[0]?.[0] ??
+    unit;
+  return { unit, spelled };
+}
+
+/**
+ * Which of a unit's spellings to show: one with capitals inside it says the most ("kVA", "mAh"), then all
+ * capitals ("V", "GSM"), then lower case ("cc"); a capital first letter only is a sentence's habit ("Cc").
+ */
+function spellingRank(unit: string): number {
+  const letters = unit.replace(/[^\p{L}]/gu, "");
+  if (/\p{Lu}/u.test(letters.slice(1)) && /\p{Ll}/u.test(letters)) return 0;
+  if (letters === letters.toUpperCase() && letters !== letters.toLowerCase()) return 1;
+  if (letters === letters.toLowerCase()) return 2;
+  return 3;
+}
+
+/** A figure ISQ's unit ("cc"): what its category document ISQ is paired by, whatever the names. */
+export function figureUnitOf(
+  f: FilterRow,
+  ev: Pick<Evidence, "aggregation" | "listing">,
+): string | null {
+  const w = buildWork(f, ev, null);
+  return w.measure === "figure" ? (w.shape?.unit ?? null) : null;
+}
+
 function buildWork(
   f: FilterRow,
   ev: Pick<Evidence, "aggregation" | "listing">,
@@ -349,6 +441,8 @@ function buildWork(
 ): Work {
   const src = sourcesOf(f, ev);
   const base = f.values.map((v) => v.trim()).filter((v) => v && !isJunk(v));
+  // "MS" and "Mild Steel (MS)" are one value when this ISQ's own values say so.
+  const shorts = shortForms([...base, ...src.raws.map((r) => r.label)]);
   const w: Work = {
     f,
     eligible: isEligible(f),
@@ -357,7 +451,7 @@ function buildWork(
     docShaped: false,
     src,
     groups: new Map(),
-    keyOf: (label) => valueKey(label) || null,
+    keyOf: (label) => valueKey(label, shorts) || null,
     labelOf: tidy,
     fit: null,
     items: [],
@@ -367,25 +461,38 @@ function buildWork(
     fromDoc: false,
     fromLive: null,
     count: null,
+    unitShown: null,
     notes: [],
     warnings: [],
   };
 
-  // 1 · a measurement ISQ: its name says so, and enough of its values really are quantities.
-  const measure = measureKind(f.name);
+  // 1 · a measurement ISQ: its name says so, and enough of its values really are quantities. Or its numbers are
+  // in one unit outside the table ("125 cc", "10 kVA"): what the labelling model wrote for its keyword dimension,
+  // or most of its own values. A count ISQ ("Number of Trays", "4 Trays") stays a count.
+  let measure = measureKind(f.name);
   const parsed = base.map((v) => parseQuantity(v));
+  const fig = figureUnit(src, base);
+  if (fig) {
+    const fits = parsed.filter((q) => q && countsFor(q, measure ?? "size")).length;
+    const counting = !measure && countOf(f.name, [...base, ...src.raws.map((r) => r.label)]);
+    if (!counting && (!measure || (!isSpatial(measure) && fits < base.length * 0.3)))
+      measure = "figure";
+  }
+  w.unitShown = fig?.spelled ?? null;
   const quantities = (labels: string[], weight: (label: string) => number) =>
     labels.flatMap((label) => {
       const q = parseQuantity(label);
       return q ? [{ q, weight: weight(label) }] : [];
     });
-  const docShape =
+  let docShape =
     measure && pair
       ? dominantShape(
           quantities(pair.isq.values, () => 1),
           measure,
         )
       : null;
+  // A figure takes the document's values only in its own unit: a document in another unit says nothing of it.
+  if (measure === "figure" && docShape && docShape.unit !== fig?.unit) docShape = null;
   const counted = parsed.filter((q) => q && countsFor(q, measure ?? "size")).length;
   // The category document's ISQ makes an area, length or size a measurement whatever our own values look like.
   // A machine figure needs at least one number of its own too, so "Output" holding "Single", "Dual" stays text.
@@ -428,9 +535,10 @@ function buildWork(
         const q = fit(label);
         return typeof q === "string" ? null : quantityKey(q);
       };
+      const spell = (unit: string) => (unit === fig?.unit ? fig.spelled : unit);
       w.labelOf = (label) => {
         const q = fit(label);
-        return typeof q === "string" ? label : formatQuantity(q);
+        return typeof q === "string" ? label : formatQuantity(q, spell);
       };
       const dropped = base.flatMap((v) => {
         const q = fit(v);
@@ -539,10 +647,11 @@ function buildWork(
     }
     if (fromDoc.length >= MIN_VALUES) {
       const ours = w.items.map((it) => it.vc.value);
+      const kept = fewest(fromDoc);
       w.notes.push(
-        `"${f.name}": values taken from the category document's "${w.pair.isq.name}" (${fromDoc.map((it) => it.vc.value).join(", ")})${ours.length ? `; the data had ${ours.join(", ")}` : ""}.`,
+        `"${f.name}": values taken from the category document's "${w.pair.isq.name}" (${kept.map((it) => it.vc.value).join(", ")})${kept.length < fromDoc.length ? `, ${kept.length} of its ${fromDoc.length}: those the data holds, then spread over the rest` : ""}${ours.length ? `; the data had ${ours.join(", ")}` : ""}.`,
       );
-      w.items = fromDoc;
+      w.items = kept;
       w.usedDoc = true;
       w.fromDoc = true;
     }
@@ -554,6 +663,21 @@ function buildWork(
 
   dropGenerics(w);
   return w;
+}
+
+/**
+ * A document that lists every exact size (34 engine capacities, 30 kVA ratings) is cut to MAX_DOC_VALUES: the
+ * values the data holds (by their share), then the others evenly spread over the list, in the document's order.
+ */
+function fewest(items: Item[]): Item[] {
+  if (items.length <= MAX_DOC_VALUES) return items;
+  const share = (it: Item) => Math.max(it.vc.fill_pct ?? 0, it.vc.demand_pct ?? 0);
+  const held = items.filter((it) => share(it) > 0).sort((a, b) => share(b) - share(a));
+  const keep = new Set(held.slice(0, MAX_DOC_VALUES));
+  const rest = items.filter((it) => !keep.has(it));
+  const room = MAX_DOC_VALUES - keep.size;
+  for (let i = 0; i < room; i++) keep.add(rest[Math.floor((i * rest.length) / room)]!);
+  return items.filter((it) => keep.has(it));
 }
 
 /**
@@ -693,6 +817,18 @@ function boost(w: Work) {
         lifted: true,
       };
       w.usedDoc = true;
+    }
+    // Two of our spellings the document writes one way ("3 Phase" and "Three Phase" → "Three Phase") are one value.
+    const byLabel = new Map<string, Item>();
+    for (const it of [...w.items]) {
+      const k = valueKey(it.vc.value);
+      const keep = byLabel.get(k);
+      if (!keep) {
+        byLabel.set(k, it);
+        continue;
+      }
+      absorb(w, keep, it);
+      w.items = w.items.filter((x) => x !== it);
     }
   }
 
@@ -1153,7 +1289,9 @@ export function isqsNeedingDoc(
 ): FilterRow[] {
   // Every Tier 1 ISQ and every Tier 2 High one can be shown, so each of them may need the document.
   const works = filters.filter(isEligible).map((f) => buildWork(f, ev, null));
-  return works.filter((w) => Boolean(measureKind(w.f.name)) || isThin(w)).map((w) => w.f);
+  return works
+    .filter((w) => Boolean(measureKind(w.f.name)) || Boolean(w.measure) || isThin(w))
+    .map((w) => w.f);
 }
 
 /**
@@ -1235,7 +1373,7 @@ export function selectIsqs(
     else delete f.select_note;
     if (w.usedDoc && w.pair) f.doc_isq = w.pair.isq.name;
     else delete f.doc_isq;
-    if (w.shape) f.unit = w.shape.unit;
+    if (w.shape) f.unit = w.measure === "figure" ? (w.unitShown ?? w.shape.unit) : w.shape.unit;
     // AI-suggested values are no longer used: what the data lacks comes from the category document.
     delete f.ai_values;
     notes.push(...w.notes);
@@ -1385,7 +1523,7 @@ export function checkSelection(filters: FilterRow[]): string[] {
 
     // Measurements: every value a quantity, all of one kind, one unit and the same count of numbers; a
     // Length, Width or Height is always one number.
-    if (measureKind(f.name) && f.unit) {
+    if (f.unit) {
       const shapes = new Set<string>();
       for (const v of values) {
         const q = parseQuantity(v);
@@ -1401,7 +1539,7 @@ export function checkSelection(filters: FilterRow[]): string[] {
     }
 
     // No duplicates: the same value twice, or (text) a generic beside its specific.
-    const measured = Boolean(measureKind(f.name) && f.unit);
+    const measured = Boolean(f.unit);
     const keys = values.map((v) => {
       const q = measured ? parseQuantity(v) : null;
       return q ? quantityKey(q) : valueKey(v);
@@ -1425,7 +1563,7 @@ export function checkSelection(filters: FilterRow[]): string[] {
   // No value under two text ISQs.
   const seen = new Map<string, string>();
   for (const f of picked) {
-    if (measureKind(f.name) && f.unit) continue;
+    if (f.unit) continue;
     for (const v of f.selected_values ?? []) {
       const k = valueKey(v);
       if (seen.has(k) && seen.get(k) !== f.name)

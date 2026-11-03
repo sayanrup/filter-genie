@@ -35,6 +35,13 @@ exist, their tier or their confidence.
      `ml`; power `kW`, `HP`, `W`; rates `kg/hr`, `L/day`, `ton/hr`, `pcs/min`… (`per hour`, `/h`, `LPH`, `TPH`
      read the same). A rate's time base is part of its unit: `6500 kg/day` under `kg/hr`, or `2 HP` under
      `kW`, is another unit and is left out, never converted. `200 kg/8 hr` is not a quantity.
+   - **Any other unit is a figure** (`125 cc`, `10 kVA`, `12 V`, `25 km/h`, `2000 mAh`): there is no list of these.
+     An ISQ is a figure measurement, whatever its name, when its keyword dimension (the labelling model's values
+     from step 2: it said `cc` numbers measure Engine Displacement) or else its own values are mostly numbers in
+     one such unit, and it isn't a count ISQ. Its unit is written as the data writes it, preferring `kVA` / `V`
+     to `Cc`. It pairs with the document ISQ whose values are in **the same unit**, whatever the names
+     (`Engine Displacement` ↔ `Engine Capacity Class`). A document that lists more than 12 exact values gives
+     the 12 the data holds first, then the rest spread over its list (`fewest()`).
    - One spelling: `20ft`, `20 Feet`, `20 FT.` → `20 ft`; `10*12 feet`, `10ft x 12ft` → `10 x 12 ft`;
      `1,000 Sq.Ft.` → `1000 sq ft`; `25 ft (7.5 m)` → `25 ft`; `100 Kg Per Hour` → `100 kg/hr`; ranges →
      `Up to 500 sq ft`, `500 - 1000 sq ft`, `Above 1000 sq ft`, `50 - 100 kg/hr`, `1000+ kg/hr` →
@@ -120,7 +127,7 @@ Processing Plant` under Milk Processing Plant and Machines, are left out;
    one (`Flavours` = `Flavors`); number words count (`Single Flavour` = `1 Flavor`; dual, double, twin = 2;
    triple = 3); a bare number counts when the name states the noun; a sum (`2+1 Flavour`) is kept as written.
 
-6. **Shown values:** only High and Medium. With **4 or more High** values, the Medium ones are not shown.
+6. **Shown values:** only High and Medium. With **3 or more High** values, the Medium ones are not shown.
    Values taken from a live ISQ keep the live order.
    **Numeric values are listed smallest first**: a measurement by its numbers (`4 x 4 ft`, `4 x 6 ft`,
    `10 x 10 ft`; a range by where it starts, `Up to …` first and `Above …` last), and text values that all
@@ -155,7 +162,7 @@ so a result saved under earlier rules reads the same way: every Tier 1 / Tier 2 
 and is left out; the range already counts it.
 
 **The check** (`checkSelection()`): every rule above is verified again on the finished result — tiers, price
-and location, High / Medium only, the 4-High rule, 2 values per ISQ, one unit and kind per measurement, no
+and location, High / Medium only, the 3-High rule, 2 values per ISQ, one unit and kind per measurement, no
 duplicate values inside an ISQ or across ISQs. Anything that doesn't hold is a run warning.
 
 ## What is stored
@@ -177,9 +184,9 @@ The user message has ISQS (each with its values) and DOCUMENT_ISQS (each ISQ of 
 
 RULES
 
-1. ISQ: pair an ISQ with the ONE document ISQ that holds the same attribute, even under another name ("Material" = "Wall Panel Material"; "Size" = "Cabin Size"; "Usage" = "Application"). Judge by the names AND the values. Two ISQs never pair with the same document ISQ. A name that only shares a word is not the same attribute ("Area" ≠ "Clear Span Width", "Wall Panel" ≠ "Wall Panel Thickness", "Height" ≠ "Width"). A measurement pairs only with the same measurement: an area with an area, a length with that same length. No document ISQ holds it → leave the ISQ out.
-2. VALUES: for each value of a paired ISQ, the document value that is the same thing in another spelling, abbreviation or with a generic word added ("PUF" = "PUF Panel", "MS" = "Mild Steel", "Thermocol" = "EPS (Thermocol)"). A different item, grade or number is not the same ("EPS" ≠ "PUF", "40 mm" ≠ "50 mm", "10 x 10 ft" ≠ "20 x 10 ft"), and neither is a value with a figure added ("Electric" ≠ "0.5 kW Electric"). Unsure → leave it out.
+1. ISQ: pair an ISQ with the ONE document ISQ that holds the same attribute, even under another name ("Material" = "Body Material"; "Size" = "Product Size"; "Usage" = "Application"). Judge by the names AND the values. Two ISQs never pair with the same document ISQ. A name that only shares a word is not the same attribute ("Material" ≠ "Material Thickness", "Height" ≠ "Width"). A measurement pairs only with the same measurement in the same unit: an area with an area, a length with that same length. No document ISQ holds it → leave the ISQ out.
+2. VALUES: for each value of a paired ISQ, the document value that is the same thing in another spelling, abbreviation or with a generic word added ("SS" = "Stainless Steel", "Auto" = "Automatic", "3 Phase" = "Three Phase"). A different item, grade or number is not the same ("SS 304" ≠ "SS 316", "40 mm" ≠ "50 mm"), and neither is a value with a figure added ("Electric" ≠ "0.5 kW Electric"). Unsure → leave it out.
 3. Copy every name and value exactly as written in the message.
 
 OUTPUT ("values" maps the ISQ's value → the document's value; {} when none pair):
-{"matches": [{"isq": "Material", "doc": "Wall Panel Material", "values": {"PUF": "PUF Panel"}}]}
+{"matches": [{"isq": "Material", "doc": "Body Material", "values": {"SS": "Stainless Steel"}}]}

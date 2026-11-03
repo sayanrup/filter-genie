@@ -65,7 +65,14 @@ import {
   rankingText,
   type DocMcat,
 } from "./category-doc";
-import { isExcludedIsq, isqsNeedingDoc, PLACE_NAME, PRICE_NAME, selectIsqs } from "./select-isqs";
+import {
+  figureUnitOf,
+  isExcludedIsq,
+  isqsNeedingDoc,
+  PLACE_NAME,
+  PRICE_NAME,
+  selectIsqs,
+} from "./select-isqs";
 import type { ContextComparison } from "./compare";
 import {
   MIN_MCAT_KEYWORDS,
@@ -1872,8 +1879,10 @@ export async function runPipeline(
   step("select", "running");
   {
     const need = doc?.isqs.length ? isqsNeedingDoc(result.filters, evidence) : [];
-    // Measurements are paired with the document by name, in code; only the rest (thin ISQs) need the model.
-    const sure = doc ? measurementPairs(need, doc) : new Map();
+    // Measurements are paired with the document in code: by name, or a figure by its unit ("cc"); only the rest
+    // (thin ISQs) need the model.
+    const unitOf = (f: FilterRow) => figureUnitOf(f, evidence);
+    const sure = doc ? measurementPairs(need, doc, unitOf) : new Map();
     const toAsk = need.filter((f) => !sure.has(f));
     let data: unknown = null;
     let stepCalls = 0;
@@ -1906,7 +1915,7 @@ export async function runPipeline(
         );
       }
     }
-    const pairs = doc ? parseDocPairs(data, need, doc) : [];
+    const pairs = doc ? parseDocPairs(data, need, doc, unitOf) : [];
     const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking, live, {
       mcat: prep.mcat?.name ?? doc?.name ?? result.category_name,
       doc,
