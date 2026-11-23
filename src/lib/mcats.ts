@@ -233,6 +233,7 @@ function splitUncached(inputs: PipelineInputs): McatSlice[] {
   const matchers = buildMatchers(
     ordered.map(([name, rows], i) => ({
       name,
+      id: ids.get(name) ?? "",
       pmcat: String(rows[0]?.["_pmcat"] ?? "").trim(),
       vocab: vocabs[i] ?? [],
       tagged: tagged[i] ?? [],
@@ -551,12 +552,21 @@ export interface McatMatcher {
   /** The MCATs a word belongs to by its listings only (not by name or PMCAT). */
   vocabOwners: Map<string, number[]>;
   /**
-   * Per MCAT, the name words of each sibling whose name holds all of its own and more: "electric scooter" for
-   * Scooter. A keyword with all of such a sibling's name words is that sibling's, not the broader MCAT's too.
+   * Per MCAT, the siblings that are a kind of it (see kindOf()): Maruti Car for Cars, Cummins Diesel Generator
+   * for Diesel Generator, FRP Portable Toilet for Portable Toilets. Their keywords that say the broader MCAT's
+   * whole name are its keywords too, also in a file tagged by MCAT ID (rowsTaggedFor()).
    */
-  narrower: string[][][];
+  kinds: number[][];
+  /**
+   * Whether a keyword is about this MCAT by name: it holds the MCAT's whole name, and not the whole name of a
+   * sibling that is named after it without being a kind of it ("diesel generator parts price" is about Diesel
+   * Generator Parts, not Diesel Generator; "electric car charger" not Electric Car).
+   */
+  says: (mcat: number, have: Set<string>) => boolean;
   /** Every MCAT's name words, by index. */
   names: string[][];
+  /** Every MCAT's id from the product file ("" when it has none), by index. */
+  ids: string[];
   /**
    * How well a keyword's words fit each MCAT. `rarity` scales a word down the more keywords hold it;
    * `vocabOk` says whether a listing-only word counts for an MCAT (default: yes).
@@ -579,13 +589,24 @@ export interface McatMatcher {
 }
 
 /**
+ * Whether an MCAT named `narrow` is a kind of the one named `broad` (stemmed name words, `narrow` holding all of
+ * `broad`'s): both end on the same word, the product word, so the extra words only qualify it. "Maruti Car" is a
+ * kind of "Cars", "Prefabricated Steel Buildings" of "Prefabricated Buildings"; "Diesel Generator Parts" is not a
+ * kind of "Diesel Generator", nor "Electric Car Charger" of "Electric Car". Names are English, so the product word
+ * comes last; a name that puts it first ("Scooter for Kids") is not counted as a kind, which only keeps it apart.
+ */
+function kindOf(narrow: string[], broad: string[]): boolean {
+  return narrow.length > 0 && broad.length > 0 && narrow.at(-1) === broad.at(-1);
+}
+
+/**
  * One shared word index for all MCATs of a run: word → the MCATs that own it and what it is worth to each.
  * A keyword is broken into words (a run-together word like "bulkmilkcooler" is cut into the index's words
  * by a memoised word-break DP), each word is looked up, and the weights are added per MCAT. A word several
  * MCATs share has its weight split between them, so it can't decide on its own which MCAT a keyword is for.
  */
 function buildMatchers(
-  mcats: { name: string; pmcat: string; vocab: string[]; tagged: string[] }[],
+  mcats: { name: string; id: string; pmcat: string; vocab: string[]; tagged: string[] }[],
 ): McatMatcher[] {
   const owners = new Map<string, Map<number, number>>();
   const give = (word: string, mcat: number, w: number) => {
@@ -664,11 +685,22 @@ function buildMatchers(
   for (const entries of weight.values())
     for (const [i, x, base] of entries) if (base >= W_NAME) identity[i]! += x;
   const names = mcats.map((m) => [...new Set(nameTokens(m.name))]);
-  const narrower = names.map((mine, i) =>
-    names.filter(
-      (other, j) => j !== i && other.length > mine.length && mine.every((w) => other.includes(w)),
+  // Siblings named after an MCAT: their names hold all of its name words and more. A kind of it ends on the same
+  // word, its product word; one that ends on another word is a different thing named after it (its parts, its
+  // charger, its construction services) and keeps keywords that say its own whole name.
+  const named = names.map((mine, i) =>
+    names.flatMap((other, j) =>
+      j !== i && mine.length && other.length > mine.length && mine.every((w) => other.includes(w))
+        ? [j]
+        : [],
     ),
   );
+  const kinds = named.map((js, i) => js.filter((j) => kindOf(names[j]!, names[i]!)));
+  const apart = named.map((js, i) => js.filter((j) => !kindOf(names[j]!, names[i]!)));
+  const holds = (j: number, have: Set<string>) => names[j]!.every((w) => have.has(w));
+  const says = (i: number, have: Set<string>) =>
+    names[i]!.length > 0 && holds(i, have) && !apart[i]!.some((j) => holds(j, have));
+  const ids = mcats.map((m) => m.id);
   const score = (
     have: Set<string>,
     rarity: (word: string) => number = () => 1,
@@ -720,8 +752,10 @@ function buildMatchers(
     index,
     owned,
     vocabOwners,
-    narrower,
+    kinds,
+    says,
     names,
+    ids,
     words: wordsOfKeyword,
     score,
     strength,
@@ -911,17 +945,13 @@ function owners(
   rarity: (word: string) => number,
   vocabOk: (word: string, mcat: number) => boolean,
 ): number[] {
-  // A keyword that holds some MCAT's whole name goes to the MCATs whose whole name it holds, however common
+  // A keyword that says some MCAT's whole name goes to every MCAT whose whole name it says, however common
   // their words are ("diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not
-  // Honda Motorcycle's), except to one whose narrower sibling it names too: "electric scooter 60 v" is
-  // Electric Scooter's, not Scooter's as well.
-  const whole = matcher.names.flatMap((n, j) =>
-    n.length && n.every((w) => set.has(w)) ? [j] : [],
-  );
-  if (whole.length)
-    return whole.filter(
-      (j) => !matcher.narrower[j]!.some((words) => words.every((w) => set.has(w))),
-    );
+  // Honda Motorcycle's), the broader ones too: "maruti car price" is Maruti Car's and Cars', "cummins diesel
+  // generator" Cummins Diesel Generator's and Diesel Generator's. Not to an MCAT whose name the keyword says only
+  // inside a different thing's name: "diesel generator parts" is Diesel Generator Parts', not Diesel Generator's.
+  const whole = matcher.names.flatMap((_, j) => (matcher.says(j, set) ? [j] : []));
+  if (whole.length) return whole;
   const sc = matcher.score(set, rarity, vocabOk);
   const best = Math.max(...sc);
   const mine = sc.flatMap((x, j) => (x >= MIN_COVER && x >= COMPETE * best ? [j] : []));
@@ -981,22 +1011,45 @@ export function describeKeywordSelection(selection: KeywordSelection[]): string 
  * A keyword file's rows for one MCAT by the file's own MCAT ID column (or MCAT name column), as SERP exports have:
  * no word matching needed. null when the file has no such column. In a single-MCAT run, also null when none of
  * the rows is this MCAT's (the whole file is then read as before).
+ *
+ * In a run of several MCATs (`matcher` given), a row tagged with a sibling that is a kind of this MCAT, whose query
+ * says this MCAT's whole name, is this MCAT's too: "maruti car price", tagged Maruti Car, is also Cars'. The
+ * word-matched files do the same (owners()), so a query goes to the broader MCAT whichever file it is in.
  */
 export function rowsTaggedFor(
   rows: Row[],
   who: { id?: string | undefined; name?: string | undefined } | null,
   severalMcats: boolean,
+  matcher?: McatMatcher,
 ): Row[] | null {
   if (!rows.length || !who) return null;
   const keys = [...new Set(rows.slice(0, 50).flatMap((r) => Object.keys(r)))];
   const idCol = keys.find((k) => MCAT_ID_COLUMN.test(k));
   const nameCol = keys.find((k) => MCAT_COLUMN.test(k));
   const nameKey = (s: string) => nameTokens(s).join(" ");
-  let mine: Row[] | null = null;
-  if (idCol && who.id) mine = rows.filter((r) => String(r[idCol] ?? "").trim() === who.id);
-  else if (nameCol && who.name) {
-    const k = nameKey(who.name);
-    mine = rows.filter((r) => nameKey(String(r[nameCol] ?? "")) === k);
-  }
-  return mine && (mine.length || severalMcats) ? mine : null;
+  const byId = Boolean(idCol && who.id);
+  if (!byId && !(nameCol && who.name)) return null;
+  const tagOf = byId
+    ? (r: Row) => String(r[idCol!] ?? "").trim()
+    : (r: Row) => nameKey(String(r[nameCol!] ?? ""));
+  const myTag = byId ? who.id! : nameKey(who.name!);
+  // The tags of the siblings that are a kind of this MCAT (Maruti Car for Cars): their rows are this MCAT's too
+  // when the query says its whole name.
+  const queryCol = keys.find(
+    (k) => k !== idCol && k !== nameCol && /quer|keyword|search|term|\bkw\b/i.test(k),
+  );
+  const kindTags = new Set(
+    matcher && queryCol
+      ? (matcher.kinds[matcher.index] ?? [])
+          .map((j) => (byId ? matcher.ids[j]! : matcher.names[j]!.join(" ")))
+          .filter(Boolean)
+      : [],
+  );
+  const mine = rows.filter((r) => {
+    const tag = tagOf(r);
+    if (tag === myTag) return true;
+    if (!kindTags.has(tag)) return false;
+    return matcher!.says(matcher!.index, matcher!.words([String(r[queryCol!] ?? "")]));
+  });
+  return mine.length || severalMcats ? mine : null;
 }

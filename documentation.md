@@ -205,6 +205,15 @@ and `src/lib/mcats.ts`.
    column. Otherwise `selectMcatKeywords()` matches words against every MCAT's name, PMCAT and own listing
    words, with a word-break step for run-together words and typo clusters. A file with fewer than 10
    keywords for an MCAT is left out for it, with a warning.
+   - **One query, several MCATs.** A query also counts for every broader MCAT it is a kind of, when it
+     says that MCAT's whole name. "Kind of" comes from the subcategory's own MCAT names, so it works for any
+     subcategory: the narrower name holds all of the broader name's words and ends on the same product word.
+     "maruti car price" counts for Maruti Car and Cars; "cummins diesel generator" for Cummins Diesel
+     Generator and Diesel Generator; "frp portable toilet" for FRP Portable Toilet and Portable Toilets.
+   - **A different thing keeps its queries.** A name that ends on another word (Diesel Generator Parts,
+     Electric Car Charger, Greenhouse Construction Services) is not a kind of the broader MCAT, so its
+     queries stay with it. SERP rows tagged with an MCAT go to the broader one by the same rule, and a query
+     that doesn't say the broader name ("maruti swift") stays where it was.
 4. **Term mining** (skill 02). Finds core words (in at least 40% of keywords and part of the MCAT/PMCAT
    name), single words and recurring two-word phrases. A number stays with the word after it (`150 cc` →
    `150cc`), and number terms are grouped by that unit word. The top 150 other terms go to step 2.

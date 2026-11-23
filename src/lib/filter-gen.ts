@@ -426,6 +426,8 @@ export function prepare(inputs: PipelineInputs): Prepared {
   // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, so the terms,
   // labels, coverage and shares below are all that MCAT's own. A file that tags each keyword with its MCAT
   // (SERP exports have an MCAT ID column) is cut by that column; the others by words (selectMcatKeywords).
+  // Either way a broader MCAT also gets the keywords of the siblings that are a kind of it when they say its
+  // whole name ("maruti car price" is Maruti Car's and Cars'), in any subcategory (see kindOf() in mcats.ts).
   const tables: KeywordTable[] = [];
   const untagged: KeywordTable[] = [];
   const selection: KeywordSelection[] = [];
@@ -435,7 +437,7 @@ export function prepare(inputs: PipelineInputs): Prepared {
   ] as const) {
     const all = toKeywordTable(rows, source);
     if (!all?.rows.length) continue;
-    const tagged = rowsTaggedFor(rows, who, Boolean(inputs.mcat));
+    const tagged = rowsTaggedFor(rows, who, Boolean(inputs.mcat), inputs.mcat?.matcher);
     if (!tagged) {
       untagged.push(all);
       continue;

@@ -23,7 +23,9 @@ added to the master prompt only in those runs.
    call, code picks them, with no model involved:
    - **By the file's MCAT column first** (`rowsTaggedFor()`): a file that tags each keyword with its MCAT — the
      SERP export's `MCAT ID` (or an `MCAT` name) column — is cut by that column, so no word matching is needed.
-     Rows of MCATs not in this run are left out.
+     Rows of MCATs not in this run are left out. A broader MCAT also takes the rows of the siblings that are a
+     **kind of it** (see "Broader names get it too" below) when the query says its whole name: "maruti car
+     price", tagged Maruti Car, is Cars' too; "maruti swift", which doesn't say "car", stays Maruti Car's only.
    - **Otherwise by words** (`selectMcatKeywords()`), for files without such a column (internal search):
      - **One word index for the whole run** (`buildMatchers()`): every word maps to the MCATs that own it — a word
        of the MCAT's name (worth 3), of its primary PMCAT's name (2), or of its listings' own vocabulary (1;
@@ -45,9 +47,26 @@ added to the master prompt only in those runs.
      - **A whole name wins.** A keyword that holds some MCAT's whole name (keyword words split at hyphens, as
        names are) goes to the MCATs whose whole name it holds, however common their words are, and to no other:
        "diesel generator price" is Diesel Generator's; "honda car price" is Honda Car's, not Honda Motorcycle's.
-     - **The narrower name wins.** Of those, one whose narrower sibling's whole name is in the keyword too doesn't
-       get it: "electric scooter 60 v" is Electric Scooter's, not Scooter's; "honda car price" is Honda Car's, not
-       Cars'. Coverage only decides keywords that hold no MCAT's whole name.
+     - **Broader names get it too.** Every MCAT whose whole name the keyword says gets it, the narrowest and the
+       broader ones alike, so one keyword can count for several MCATs. It works from the subcategory's own MCAT
+       names, with no list of products or words, so it holds for any subcategory (`kindOf()`, `says()` in
+       `buildMatchers()`). A sibling is a **kind of** an MCAT when its name holds all of the MCAT's name words and
+       ends on the same product word; the extra words only qualify it:
+
+       | Keyword | Its own MCAT | Also counts for (broader) |
+       | --- | --- | --- |
+       | "maruti car price" | Maruti Car | Cars |
+       | "cummins diesel generator" | Cummins Diesel Generator | Diesel Generator |
+       | "frp portable toilet" | FRP Portable Toilet | Portable Toilets |
+       | "prefabricated steel buildings" | Prefabricated Steel Buildings | Prefabricated Buildings, Steel Buildings |
+       | "electric rickshaw three wheeler" | Electric Rickshaw Three Wheeler | Electric Three Wheeler |
+
+     - **A different thing named after an MCAT keeps its keywords.** A sibling whose name holds the MCAT's name
+       but ends on another word is not a kind of it (its parts, its battery, its charger, a service): a keyword
+       that says that sibling's whole name is not the broader MCAT's. "diesel generator parts" is Diesel Generator
+       Parts' (and the broader Generator Parts'), not Diesel Generator's; "electric scooter batteries" is not Electric Scooter's; "electric car
+       charger" is not Electric Car's; "greenhouse construction services" is not Greenhouse's.
+       Coverage only decides keywords that say no MCAT's whole name.
      - **Listing words must be confirmed.** A word only the MCAT's listings use ("genset") counts only if the
        keywords holding it that are already assigned by name go mostly (≥ 60%, from ≥ 2) to that MCAT. "Sale" or
        "small" are spread over every MCAT and never count.
