@@ -290,9 +290,10 @@ function newestFirst(list: SavedRun[]): SavedRun[] {
   return [...list].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
 }
 
-function safeRows(text: string): Row[] {
+/** `limit`: rows kept (per MCAT for listings); keyword files keep every row (Infinity). */
+function safeRows(text: string, limit?: number): Row[] {
   try {
-    return textToRows(text);
+    return textToRows(text, limit);
   } catch {
     return [];
   }
@@ -370,8 +371,8 @@ function Index() {
   const [contextText, setContextText] = useState("");
   const [specsText, setSpecsText] = useState("");
   const [productsText, setProductsText] = useState("");
-  // Listings are a demo sample for now: keep low-fill filters and flag them.
-  const [demoListings, setDemoListings] = useState(true);
+  // Off: listings are real, so a low fill rate counts. Tick it for a demo sample (low-fill filters are kept and flagged).
+  const [demoListings, setDemoListings] = useState(false);
   const [uiDesign, setUiDesign] = useState(true);
 
   const [serpFile, setSerpFile] = useState<Row[] | null>(null);
@@ -471,8 +472,8 @@ function Index() {
 
   const inputs: PipelineInputs = useMemo(
     () => ({
-      serpRows: serpFile ?? safeRows(serpText),
-      internalRows: internalFile ?? safeRows(internalText),
+      serpRows: serpFile ?? safeRows(serpText, Infinity),
+      internalRows: internalFile ?? safeRows(internalText, Infinity),
       context: contextText,
       specs: specsText,
       listingRows: productsFile ?? safeRows(productsText),
@@ -648,14 +649,16 @@ function Index() {
     setTestStatus(null);
   }
 
+  /** `limit`: rows kept (per MCAT for listings); keyword files keep every row (Infinity). */
   async function loadFile(
     file: File,
     setRows: (r: Row[] | null) => void,
     setStatus: (s: Status) => void,
+    limit?: number,
   ) {
     setStatus({ kind: "busy", message: `Reading ${file.name}…` });
     try {
-      const rows = await fileToRows(file);
+      const rows = await fileToRows(file, limit);
       if (!rows.length) throw new Error("No rows found in this file.");
       setRows(rows);
       setStatus({
@@ -1668,14 +1671,14 @@ function Index() {
           title="Google SERP keywords"
           hint="Search Console queries with clicks, impressions and position."
           accept=".xlsx,.csv,.tsv,.txt"
-          placeholder={"query,clicks,impressions,position\nsecurity cabin price,120,5400,6.2\n…"}
+          placeholder={"query,clicks,impressions,position\n<search query>,120,5400,6.2\n…"}
           text={serpText}
           onTextChange={(v) => {
             setSerpText(v);
             setSerpFile(null);
             setSerpStatus(null);
           }}
-          onFile={(f) => loadFile(f, setSerpFile, setSerpStatus)}
+          onFile={(f) => loadFile(f, setSerpFile, setSerpStatus, Infinity)}
           status={serpStatus}
           detail={serpDetail}
         />
@@ -1684,14 +1687,14 @@ function Index() {
           title="Internal search keywords"
           hint="Search-bar queries with pageviews, CTR, conversion and enquiry metrics."
           accept=".xlsx,.csv,.tsv,.txt"
-          placeholder={"keyword,pageviews,enquiries\npuf security cabin,400,90\n…"}
+          placeholder={"keyword,pageviews,enquiries\n<search query>,400,90\n…"}
           text={internalText}
           onTextChange={(v) => {
             setInternalText(v);
             setInternalFile(null);
             setInternalStatus(null);
           }}
-          onFile={(f) => loadFile(f, setInternalFile, setInternalStatus)}
+          onFile={(f) => loadFile(f, setInternalFile, setInternalStatus, Infinity)}
           status={internalStatus}
           detail={internalDetail}
         />
@@ -1716,10 +1719,10 @@ function Index() {
         <InputPanel
           step={4}
           title="Spec importance ranking"
-          hint="The category manager's ranked spec list or tiers."
-          accept=".txt,.md,.csv"
+          hint="The category manager's ranked spec list or tiers. Or JSON with each MCAT's ISQs (saved-results/…isqforupload.json): with the category document in input 3, each MCAT's ISQs, in their order, are its ranking."
+          accept=".txt,.md,.csv,.json"
           placeholder={
-            "Green (top): 1-Size, 2-Material, 3-Application\nYellow (mid): 4-Built Type, 5-Insulation\nPurple (low): 6-Brand, 7-Roof Type"
+            "Green (top): 1-<spec>, 2-<spec>, 3-<spec>\nYellow (mid): 4-<spec>, 5-<spec>\nPurple (low): 6-<spec>, 7-<spec>"
           }
           text={specsText}
           onTextChange={setSpecsText}

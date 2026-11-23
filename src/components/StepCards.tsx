@@ -73,10 +73,12 @@ function WorkSplit({ split }: { split: NonNullable<Step["split"]> }) {
               <div className="bg-border" style={{ width: `${(row.none / total) * 100}%` }} />
             </div>
             <div className="mt-1 flex flex-wrap gap-x-3 font-mono text-[11px] text-muted-foreground">
-              <span>
-                <span className="text-success">■</span> code {row.code.toLocaleString()} (
-                {pct(row.code, total)}%)
-              </span>
+              {row.code ? (
+                <span>
+                  <span className="text-success">■</span> code {row.code.toLocaleString()} (
+                  {pct(row.code, total)}%)
+                </span>
+              ) : null}
               <span>
                 <span className="text-primary">■</span> prompt {row.model.toLocaleString()} (
                 {pct(row.model, total)}%)

@@ -1,34 +1,30 @@
 /**
  * Pulls a subcategory's MCATs from IndiaMART's context API and saves all their Seller & Buyer Spec
- * Audits into one JSON file. The API only answers on the IndiaMART network.
+ * Audits into one JSON file, plus a small one to upload to the app. The API only answers on the
+ * IndiaMART network.
  *
  *   npx tsx scripts/fetch-mcat-context.ts <ids.txt | 35589 135705 …> [--out saved-results/mcat-context.json]
- *                                         [--parallel 4] [--force]
+ *                                         [--upload <file>] [--parallel 4] [--force]
  *
- * The ids file has one MCAT id per line (or in the first column of a CSV), or is the MCAT list copied
- * from the app, which also gives each MCAT's listings and PMCAT:
- *   Prefabricated Buildings
- *   MCAT ID 35589
- *   32 listings
- *   PMCAT Prefabricated Buildings
+ * The MCATs come as ids, or as files read by mcat-list.ts: the MCAT list copied from the app (which
+ * also gives each MCAT's listings and PMCAT), a JSON with `mcats`, or one id per line.
  *
  * The file is an array with one entry per MCAT, in the order the ids were given: its name, ids,
  * PMCAT and listings, then the audit's tables (`buyer_attracting_seller_specs` is its ISQs and
  * their values).
  *
+ * The upload file (--upload; by default the --out name with "context" made "forupload", so
+ * subcat729mcatcontext.json → subcat729mcatforupload.json) holds only what the app reads from the
+ * category document in input 3: each MCAT's name, id, PMCAT and listings, and its ISQs with their
+ * values under `isq`. One ISQ per line.
+ *
  * An MCAT already in the file is skipped, so a run that stopped partway picks up where it left off
  * (--force fetches it again). A request that can't connect or times out is tried 3 times.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { McatApiError, fetchMcatContext, type Json } from "../src/lib/mcat-context";
-
-interface Wanted {
-  id: string;
-  name?: string;
-  listings?: number;
-  pmcat?: string;
-}
+import { readMcatList, type Wanted } from "./mcat-list";
 
 type Entry = { [key: string]: Json };
 
@@ -42,45 +38,25 @@ const flag = (name: string) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 ? args[i + 1] : undefined;
 };
-const VALUE_FLAGS = new Set(["--out", "--parallel"]);
+const VALUE_FLAGS = new Set(["--out", "--upload", "--parallel"]);
 const inputs = args.filter((a, i) => !a.startsWith("--") && !VALUE_FLAGS.has(args[i - 1] ?? ""));
 const out = flag("out") ?? "saved-results/mcat-context.json";
+const upload =
+  flag("upload") ??
+  join(
+    dirname(out),
+    /context/i.test(basename(out))
+      ? basename(out).replace(/context(?!.*context)/i, "forupload")
+      : basename(out).replace(/(\.json)?$/i, "-for-upload.json"),
+  );
 const parallel = Math.max(1, Number(flag("parallel")) || 4);
 const force = args.includes("--force");
 
-/** MCAT ids out of a file's text: the app's MCAT list ("MCAT ID 35589"), or one id per line. */
-function parseIds(text: string): Wanted[] {
-  const lines = text.split(/\r?\n/).map((l) => l.trim());
-  if (!lines.some((l) => /^MCAT ID\s*\d+$/i.test(l)))
-    return lines
-      .map((l) => l.split(/[,;\t]/)[0]!.trim())
-      .filter((cell) => /^\d+$/.test(cell))
-      .map((id) => ({ id }));
-
-  const found: Wanted[] = [];
-  lines.forEach((line, i) => {
-    const id = line.match(/^MCAT ID\s*(\d+)$/i)?.[1];
-    if (!id) return;
-    const entry: Wanted = { id };
-    if (lines[i - 1]) entry.name = lines[i - 1]!;
-    for (const next of lines.slice(i + 1, i + 3)) {
-      const listings = next.match(/^(\d+) listings?$/i)?.[1];
-      const pmcat = next.match(/^PMCAT\s+(.+)$/i)?.[1];
-      if (listings) entry.listings = Number(listings);
-      if (pmcat) entry.pmcat = pmcat;
-    }
-    found.push(entry);
-  });
-  return found;
-}
-
-const seen = new Set<string>();
-const wanted = inputs
-  .flatMap((a) => (/^\d+$/.test(a) ? [{ id: a }] : parseIds(readFileSync(a, "utf8"))))
-  .filter((w) => !seen.has(w.id) && seen.add(w.id));
+const wanted = readMcatList(inputs);
+const seen = new Set(wanted.map((w) => w.id));
 if (!wanted.length) {
   console.error(
-    "Usage: npx tsx scripts/fetch-mcat-context.ts <ids.txt | id …> [--out saved-results/mcat-context.json] [--parallel 4] [--force]",
+    "Usage: npx tsx scripts/fetch-mcat-context.ts <ids.txt | id …> [--out saved-results/mcat-context.json] [--upload <file>] [--parallel 4] [--force]",
   );
   process.exit(1);
 }
@@ -90,12 +66,32 @@ if (!force && existsSync(out))
   for (const e of JSON.parse(readFileSync(out, "utf8")) as Entry[])
     if (typeof e["mcat_id"] === "string") byId.set(e["mcat_id"], e);
 
+/** An entry cut to what the app reads: its name, id, PMCAT and listings, and its ISQs. */
+const forUpload = (e: Entry): Entry => ({
+  mcat_name: e["mcat_name"] ?? null,
+  mcat_id: e["mcat_id"] ?? null,
+  ...(e["pmcat"] != null ? { pmcat: e["pmcat"] } : {}),
+  ...(e["listings"] != null ? { listings: e["listings"] } : {}),
+  isq: e["buyer_attracting_seller_specs"] ?? [],
+});
+
+/** One MCAT per block and one ISQ per line: small, and still easy to read. */
+function uploadJson(entries: Entry[]): string {
+  const blocks = entries.map((e) => {
+    const { isq, ...head } = forUpload(e);
+    const rows = (Array.isArray(isq) ? isq : []).map((r) => `    ${JSON.stringify(r)}`);
+    return `  {${JSON.stringify(head).slice(1, -1)}, "isq": [\n${rows.join(",\n")}\n  ]}`;
+  });
+  return `[\n${blocks.join(",\n")}\n]\n`;
+}
+
 /** Entries for the ids asked for come first, in that order; anything else already in the file stays. */
 function save() {
   const asked = wanted.flatMap((w) => byId.get(w.id) ?? []);
   const rest = [...byId.values()].filter((e) => !seen.has(String(e["mcat_id"])));
   mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, `${JSON.stringify([...asked, ...rest], null, 2)}\n`);
+  writeFileSync(upload, uploadJson([...asked, ...rest]));
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -146,7 +142,9 @@ const worker = async () => {
 await Promise.all(Array.from({ length: Math.min(parallel, todo.length) }, worker));
 save();
 
-console.log(`Saved ${wanted.length - failed.length} of ${wanted.length} MCATs → ${out}`);
+console.log(
+  `Saved ${wanted.length - failed.length} of ${wanted.length} MCATs → ${out} (full), ${upload} (for upload)`,
+);
 if (failed.length) {
   console.error(
     `${failed.length} didn't load (run again to retry them):\n  ${failed.join("\n  ")}`,

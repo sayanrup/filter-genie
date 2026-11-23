@@ -26,6 +26,8 @@ STEP 1 — CANDIDATES FROM DEMAND (evidence A):
 
 STEP 2 — VALIDATE AGAINST CONTEXT (B) AND RANKING (C), for each candidate from step 1:
 - CONFIRMED: C ranks it top tier / top 3, OR B says buyers choose on it. → priority up.
+  When B and C are BOTH absent, a spec that ≥ 60% of D's listings fill confirms it instead, but only when D
+  holds at least 10 listings (sellers who nearly all state it show the market decides on it).
 - NEUTRAL: C ranks it middle, B says nothing about it. → keep it exactly as demand alone would rank it.
 - CONTRADICTED: C ranks it bottom tier, OR B says buyers ignore it. → send to Tier 3 unless demand is strong.
 - One real attribute can appear under different names across A, C and D (keyword "Material" = ranked "Build
@@ -42,7 +44,7 @@ STEP 4 — CHECK SUPPLY (D), for every candidate still in play after steps 1–3
   is needed before launch. (Tiering itself only looks at steps 1–3.)
 
 STEP 5 — CONFIDENCE, from steps 1–2 only:
-- High: demand strong or moderate (step 1) AND confirmed by B or C (step 2).
+- High: demand strong or moderate (step 1) AND confirmed in step 2 (by B or C, or by D when both are absent).
 - Medium: only one of those two holds, or both hold weakly.
 - Low: no keyword evidence at all — the filter rests on listings or general category knowledge alone.
 

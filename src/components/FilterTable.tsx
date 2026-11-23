@@ -3,6 +3,7 @@ import { FilterDetailRow } from "@/components/FilterDetail";
 import { resultHasDesign } from "@/lib/compare";
 import { VALUE_CONFIDENCE_RULE, confidenceOf } from "@/lib/value-confidence";
 import type { Evidence, FilterResult } from "@/lib/filter-gen";
+import { isShown } from "@/lib/select-isqs";
 import {
   axisMatchText,
   dimensionArea,
@@ -195,7 +196,8 @@ export function FilterTable({
   const [rangeOpen, setRangeOpen] = useState<Record<string, boolean>>({});
   // ISQs the select step left out (skill 15) stay hidden until asked for.
   const [showLeftOut, setShowLeftOut] = useState(false);
-  const leftOutCount = result.filters.filter((f) => f.selected === false).length;
+  // Shown = every Tier 1 ISQ and every Tier 2 High one (isShown); the rest stay hidden until asked for.
+  const leftOutCount = result.filters.filter((f) => !isShown(f)).length;
   return (
     <div className="panel overflow-x-auto">
       {leftOutCount ? (
@@ -205,8 +207,7 @@ export function FilterTable({
               {result.filters.length - leftOutCount} ISQ
               {result.filters.length - leftOutCount === 1 ? "" : "s"} shown
             </strong>{" "}
-            · {leftOutCount} not shown (Tier 3, Tier 2 below High, too few High / Medium values, or
-            3+ strong Tier 1 ISQs)
+            · {leftOutCount} not shown (Tier 3 or Tier 2 below High)
           </span>
           <button
             type="button"
@@ -240,7 +241,7 @@ export function FilterTable({
         </thead>
         <tbody>
           {result.filters
-            .filter((f) => showLeftOut || f.selected !== false)
+            .filter((f) => showLeftOut || isShown(f))
             .sort(
               (a, b) => (TIER_ORDER[a.tier] ?? 9) - (TIER_ORDER[b.tier] ?? 9) || a.rank - b.rank,
             )
@@ -250,7 +251,7 @@ export function FilterTable({
               const vc = confidenceOf(f, evidence);
               const levelOf = new Map((vc ?? []).map((v) => [v.value, v]));
               const rangeOf = new Map((f.ranges ?? []).map((r) => [r.value, r]));
-              // Values the select step left out (Low, or Medium beside 4+ High) are shown muted.
+              // Values the select step left out (Low, or Medium beside 3+ High) are shown muted.
               const leftOut = new Set(
                 f.selected_values ? f.values.filter((v) => !f.selected_values!.includes(v)) : [],
               );
@@ -282,21 +283,24 @@ export function FilterTable({
                   </td>
                   <td className="px-3 py-3">
                     <strong>{f.name}</strong>
-                    {f.selected === true ? (
+                    {isShown(f) ? (
                       <span
                         title="Shown as an ISQ (skill 15)"
                         className="ml-1.5 rounded bg-success-soft px-1.5 py-0.5 align-middle text-[9px] font-bold uppercase tracking-wider text-success"
                       >
                         Shown
                       </span>
-                    ) : f.selected === false ? (
+                    ) : (
                       <span
-                        title={f.select_note}
+                        title={
+                          f.select_note ??
+                          `${f.tier} ${f.tier === "Tier 2" ? `with ${f.confidence} confidence ` : ""}is not shown as an ISQ`
+                        }
                         className="ml-1.5 rounded bg-secondary px-1.5 py-0.5 align-middle text-[9px] font-bold uppercase tracking-wider text-muted-foreground"
                       >
                         Not shown
                       </span>
-                    ) : null}
+                    )}
                     <div className="mt-1 flex flex-wrap gap-x-2 font-mono text-[10px] text-muted-foreground">
                       {f.coverage_pct != null ? <span>coverage {f.coverage_pct}%</span> : null}
                       {f.top_value_share_pct != null ? (
@@ -306,7 +310,7 @@ export function FilterTable({
                         <span>filled {f.listing_fill_pct}%</span>
                       ) : null}
                     </div>
-                    {f.selected === false && f.select_note ? (
+                    {!isShown(f) && f.select_note ? (
                       <div className="mt-1 text-[10px] leading-snug text-muted-foreground">
                         {f.select_note}
                       </div>

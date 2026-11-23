@@ -1,18 +1,23 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- the document and the model's reply are untyped JSON, read field by field */
 import type { FilterRow } from "./filter-gen";
 import { parseSpecAudit, type Json } from "./mcat-context";
-import { parseQuantity } from "./quantity";
+import { measureKind, parseQuantity } from "./quantity";
 
 /*
  * The category document (skill 15): per MCAT, the "Buyer Attracting Seller Specs" of its Seller & Buyer Spec
- * Audit — the seller spec questions and the options under each. It is used for two things only: to add to an
- * ISQ that is thin (one High value or none), and to say what unit and shape a measurement ISQ's values have
- * (and to supply them when the data's own are poor). It never decides which ISQs exist or their tier.
+ * Audit — the seller spec questions and the options under each. In the select step it is used for two things
+ * only: to add to an ISQ that is thin (one High value or none), and to say what unit and shape a measurement
+ * ISQ's values have (and to supply them when the data's own are poor).
  *
  * It arrives through input 3, as either
  *   - the JSON saved by scripts/fetch-mcat-context.ts (`[{mcat_id, mcat_name, buyer_attracting_seller_specs:
- *     [{attribute, values}]}, …]`), which is then kept out of the model's context, or
- *   - the audit's own markdown (what "Load spec audit" puts there), which the model still reads as before.
+ *     [{attribute, values}]}, …]`), whose notes for the run's MCAT (docContextText) are then the design step's
+ *     context (evidence B), or
+ *   - the audit's own markdown (what "Load spec audit" puts there), which the model reads as the context.
+ *
+ * Input 4 can be JSON of the same kind, such as the live ISQs saved by scripts/fetch-isq.ts (`isqs: [{name,
+ * values}]`, or `options: [{value}]` as the API gives them). When input 3 is the document, input 4 is read as the
+ * ranking: this MCAT's ISQ names in their order (rankingText). Otherwise input 4 is the document.
  */
 
 export interface DocIsq {
@@ -65,6 +70,18 @@ export function rejoinCutNumbers(values: string[]): string[] {
   return out;
 }
 
+/** Questions every buyer form asks (in the getisq API's lists): not product attributes, so never ISQs here. */
+const BUYER_FORM =
+  /^(quantity|quantity unit|i am interested in|finance\s*\/?\s*loan requirement|business type)$/i;
+
+/** A value as text: a string, or an option object (`{value}`, as the getisq API's options are), unless inactive. */
+const valueText = (v: any): string | null =>
+  typeof v === "string"
+    ? v
+    : v && typeof v === "object" && typeof v.value === "string" && v.active !== false
+      ? v.value
+      : null;
+
 function isqsOf(rows: unknown): DocIsq[] {
   const out: DocIsq[] = [];
   for (const row of Array.isArray(rows) ? rows : []) {
@@ -73,9 +90,13 @@ function isqsOf(rows: unknown): DocIsq[] {
     const name = ISQ_NAME_KEYS.map((k) => rec[k]).find((x) => typeof x === "string" && x.trim());
     const values = ISQ_VALUE_KEYS.map((k) => rec[k]).find((x) => Array.isArray(x));
     if (typeof name !== "string" || !Array.isArray(values)) continue;
+    if (rec.active === false || BUYER_FORM.test(clean(name))) continue;
     const seen = new Set<string>();
     const list: string[] = [];
-    const texts = values.filter((v: unknown): v is string => typeof v === "string").map(clean);
+    const texts = values
+      .map(valueText)
+      .filter((v: string | null): v is string => v !== null)
+      .map(clean);
     for (const v of rejoinCutNumbers(texts)) {
       if (!v || seen.has(norm(v))) continue;
       seen.add(norm(v));
@@ -127,6 +148,66 @@ export function parseCategoryDoc(text: string): DocMcat[] | null {
   }
   lastParse = { text, list };
   return list;
+}
+
+/** Parts of a document entry that say nothing about how buyers choose: pictures, units, who made it. */
+const NOT_CHOICE = /thumbnail|image|quantity|unit|generated/i;
+const pick = (o: Record<string, any>, keys: RegExp) => {
+  const k = Object.keys(o).find((x) => keys.test(x));
+  return k === undefined ? undefined : o[k];
+};
+
+/**
+ * This MCAT's entry of the document (input 3 as JSON) as plain notes for the design step's context (evidence
+ * B), as the audit's markdown would give them: every list of specs in the entry, each spec with its rank, values
+ * and the reason the audit gives. "" when the entry isn't in the document.
+ */
+export function docContextText(
+  text: string,
+  who: { id?: string | undefined; name?: string | undefined } | null,
+): string {
+  let items: any[] = [];
+  try {
+    const data = JSON.parse(text.trim());
+    items = Array.isArray(data) ? data : Array.isArray(data?.mcats) ? data.mcats : [data];
+  } catch {
+    return "";
+  }
+  const entry =
+    items.find((m) => who?.id && String(m?.mcat_id ?? "").trim() === who.id) ??
+    items.find((m) => who?.name && nameKey(String(m?.mcat_name ?? "")) === nameKey(who.name)) ??
+    (items.length === 1 ? items[0] : null);
+  if (!entry || typeof entry !== "object") return "";
+  const lines: string[] = [
+    `${clean(String(entry.mcat_name ?? who?.name ?? ""))} — spec audit notes`,
+  ];
+  for (const [key, rows] of Object.entries(entry as Record<string, unknown>)) {
+    if (NOT_CHOICE.test(key) || !Array.isArray(rows)) continue;
+    const specs = rows.filter((r): r is Record<string, any> => Boolean(r) && typeof r === "object");
+    if (!specs.length) continue;
+    lines.push("", `${key.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())}:`);
+    for (const s of specs) {
+      const name = pick(s, /^(spec|attribute|name)$/i);
+      if (!name) continue;
+      const rank = pick(s, /rank/i);
+      const values = pick(s, /^(values|options|example_values)$/i);
+      const reason = pick(s, /reason|why/i);
+      lines.push(
+        `- ${clean(String(name))}${rank != null && rank !== "" ? ` (rank ${rank})` : ""}${
+          Array.isArray(values) && values.length ? `: ${values.slice(0, 6).join(", ")}` : ""
+        }${reason ? ` — ${clean(String(reason))}` : ""}`,
+      );
+    }
+  }
+  return lines.length > 1 ? lines.join("\n") : "";
+}
+
+/**
+ * An MCAT's ISQs as a ranking in the plain form input 4 takes, one per line in their order:
+ * "1-Candy Type\n2-Automation Grade". Values are left out: the ranking is about which ISQs matter.
+ */
+export function rankingText(m: DocMcat): string {
+  return m.isqs.map((q, i) => `${i + 1}-${q.name}`).join("\n");
 }
 
 /** This run's MCAT in the document: by id, then by name; a document of one MCAT is that MCAT's. */
@@ -187,16 +268,26 @@ export interface DocPair {
 }
 
 const MEASURE_WORD =
-  /\b(area|size|dimensions?|length|width|breadth|height|thickness|diameter|depth|span)\b/gi;
+  /\b(area|size|dimensions?|length|width|breadth|height|thickness|diameter|depth|span|capacity|output|throughput|power|wattage|weight|load|volume)\b/gi;
+const FIGURE_WORD = /^(capacity|power|weight|volume)$/;
 
-/** The measurement words in an ISQ's name: "Cabin Dimensions" → ["size"], "Clear Span Width" → ["span", "width"]. */
+/**
+ * The measurement words in an ISQ's name: "Cabin Dimensions" → ["size"], "Clear Span Width" → ["span", "width"],
+ * "Production Output" → ["capacity"]. Machine-figure words count only when the name is a figure (measureKind),
+ * so "Power Source" has none.
+ */
 function measureWords(name: string): string[] {
+  const figure = Boolean(measureKind(name));
   const out: string[] = [];
   for (const m of name.matchAll(MEASURE_WORD)) {
     const w = m[0]
       .toLowerCase()
       .replace(/^dimensions?$/, "size")
-      .replace("breadth", "width");
+      .replace("breadth", "width")
+      .replace(/^(output|throughput)$/, "capacity")
+      .replace("wattage", "power")
+      .replace("load", "weight");
+    if (FIGURE_WORD.test(w) && !figure) continue;
     if (!out.includes(w)) out.push(w);
   }
   return out;
@@ -214,9 +305,29 @@ const words = (name: string) =>
  * to be paired. The document ISQ must really hold quantities. Area and Size stand in for each other when the
  * document has only one of them. With several candidates, the one sharing the most name words; a tie is null.
  */
-function measurementPair(f: FilterRow, doc: DocMcat, used: Set<DocIsq>): DocIsq | null {
+function measurementPair(
+  f: FilterRow,
+  doc: DocMcat,
+  used: Set<DocIsq>,
+  unit: string | null,
+): DocIsq | null {
   const mine = measureWords(f.name);
-  if (!mine.length) return null;
+  // A figure in a unit outside the table ("Engine Displacement" in cc) has no measurement word: it pairs with the
+  // one document ISQ whose values are mostly in that same unit ("Engine Capacity Class": 100cc, 125cc …).
+  if (!mine.length) {
+    if (!unit) return null;
+    const inUnit = (q: DocIsq) =>
+      q.values.filter((v) => {
+        const x = parseQuantity(v);
+        return x?.kind === "figure" && x.unit === unit;
+      }).length;
+    const scored = doc.isqs
+      .filter((q) => !used.has(q))
+      .map((q) => ({ q, n: inUnit(q) }))
+      .filter((x) => x.n >= Math.max(2, x.q.values.length / 2))
+      .sort((a, b) => b.n - a.n);
+    return scored[0] && scored[0].n !== scored[1]?.n ? scored[0].q : null;
+  }
   const holdsQuantities = (q: DocIsq) =>
     q.values.filter((v) => parseQuantity(v)).length >= Math.max(2, q.values.length / 2);
   const pool = doc.isqs.filter((q) => !used.has(q) && holdsQuantities(q));
@@ -232,11 +343,16 @@ function measurementPair(f: FilterRow, doc: DocMcat, used: Set<DocIsq>): DocIsq 
 }
 
 /** The ISQs code pairs with the document itself, as measurements: these need no model call. */
-export function measurementPairs(filters: FilterRow[], doc: DocMcat): Map<FilterRow, DocIsq> {
+export function measurementPairs(
+  filters: FilterRow[],
+  doc: DocMcat,
+  /** A filter's figure unit, when it is a figure outside the unit table (select-isqs figureUnitOf). */
+  unitOf: (f: FilterRow) => string | null = () => null,
+): Map<FilterRow, DocIsq> {
   const used = new Set<DocIsq>();
   const out = new Map<FilterRow, DocIsq>();
   for (const f of filters) {
-    const isq = measurementPair(f, doc, used);
+    const isq = measurementPair(f, doc, used, unitOf(f));
     if (!isq) continue;
     used.add(isq);
     out.set(f, isq);
@@ -251,7 +367,12 @@ export function measurementPairs(filters: FilterRow[], doc: DocMcat): Map<Filter
  * its name, or its listing spec's name, is the document ISQ's name ignoring case and punctuation, else with the
  * one unused document ISQ that shares the most values with it written the same (a tie pairs nothing).
  */
-export function parseDocPairs(data: any, filters: FilterRow[], doc: DocMcat): DocPair[] {
+export function parseDocPairs(
+  data: any,
+  filters: FilterRow[],
+  doc: DocMcat,
+  unitOf: (f: FilterRow) => string | null = () => null,
+): DocPair[] {
   const byFilter = new Map(filters.map((f) => [norm(f.name), f]));
   const byIsq = new Map(doc.isqs.map((q) => [norm(q.name), q]));
   const used = new Set<DocIsq>();
@@ -271,7 +392,7 @@ export function parseDocPairs(data: any, filters: FilterRow[], doc: DocMcat): Do
     return pairs;
   };
 
-  for (const [f, isq] of measurementPairs(filters, doc)) {
+  for (const [f, isq] of measurementPairs(filters, doc, unitOf)) {
     used.add(isq);
     out.set(f, { filter: f, isq, values: valuePairs(f, isq, {}) });
   }

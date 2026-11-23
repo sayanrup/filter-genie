@@ -1,10 +1,18 @@
 import type { Evidence, FilterRow } from "./filter-gen";
-import type { DocPair } from "./category-doc";
+import type { DocMcat, DocPair } from "./category-doc";
 import {
   axisOf,
   conform,
+  COUNT_NOUN,
+  countedInBrackets,
+  countsFor,
   dominantShape,
+  figuresIn,
   formatQuantity,
+  isSpatial,
+  KIND_PLURAL,
+  kindName,
+  MEASURE_PLURAL,
   measureKind,
   parseQuantity,
   quantityKey,
@@ -12,13 +20,14 @@ import {
   type Quantity,
   type QuantityShape,
 } from "./quantity";
-import { HIGH_AT, MEDIUM_AT, type ValueConfidence, type ValueLevel } from "./value-confidence";
+import { levelFor, type ValueConfidence, type ValueLevel } from "./value-confidence";
 
 /*
  * Skill 15 · which ISQs and which of their values are finally shown. Runs after the check step, all in code
  * (one small model call before it pairs ISQs with the category document, see category-doc.ts):
  *
- *   values   1. measurements (Area, Size, Length, Width, Height…) get one spelling, one unit and one count of
+ *   values   1. measurements (Area, Size, Length, Width, Height…, and machine figures: Capacity, Output, Power,
+ *               Weight, Volume in kg/hr, L, kW…) get one spelling, one unit and one count of
  *               numbers (a Length or Width is one; an Area or Size one, two or three, as the category document
  *               writes it). When the document has the same measurement, the ISQ's values ARE the document's
  *               (paired by name, in code; nothing of ours is added, the data only scores them). Without one,
@@ -28,12 +37,11 @@ import { HIGH_AT, MEDIUM_AT, type ValueConfidence, type ValueLevel } from "./val
  *            3. thin ISQ (one High value or none): listing values the keywords missed, then the category
  *               document: a Medium / Low value of ours that it lists goes up a level, and up to 3 of its own
  *               values are added (at the level the data gives them, Medium at the least)
- *            4. only High and Medium values are shown; with 4 or more High, only the High ones. Numeric values
+ *            4. only High and Medium values are shown; with 3 or more High, only the High ones. Numeric values
  *               are listed smallest first, the rest best first
  *   ISQs     5. Tier 1 at any confidence, Tier 2 only when High; never Tier 3, Price or Location
- *            6. an ISQ needs 2 values to show; two ISQs for one attribute are one
- *            7. with 3 or more Tier 1 High / Medium ISQs, Tier 1 Low and Tier 2 are not shown (checked early
- *               too, so those ISQs aren't sent to the pairing call)
+ *            6. the tier is the only test (not how many values); two ISQs for one attribute are both shown
+ *            7. every Tier 1 ISQ (High, Medium or Low) and every Tier 2 High one is shown; no cap on how many
  *   check    8. every rule above is verified on the result; a failure is a warning
  */
 
@@ -43,16 +51,17 @@ export const THIN_HIGH = 1;
 export const THIN_TARGET = 4;
 export const MAX_ADDED = 3;
 /** With this many High values, the Medium ones are not shown. */
-export const HIGH_ONLY_AT = 4;
-/** With this many Tier 1 High / Medium ISQs, Tier 1 Low and Tier 2 ISQs are not shown. */
-export const STRONG_TIER1 = 3;
+export const HIGH_ONLY_AT = 3;
 /** A measurement ISQ with fewer good values than this takes the category document's instead. */
 export const MIN_GOOD_MEASURES = 3;
 /** An ISQ needs this many values to be shown at all. */
 export const MIN_VALUES = 2;
+/** Values taken from a category document that lists more than this are cut to it (fewest). */
+export const MAX_DOC_VALUES = 12;
 
-const PRICE_NAME = /\b(price|budget|cost)\b/i;
-const PLACE_NAME = /\b(city|location|near ?me)\b/i;
+// Whole words only: "Capacity" and "Electricity" are not places.
+export const PRICE_NAME = /\b(price|budget|cost)\b/i;
+export const PLACE_NAME = /\b(city|location|near ?me)\b/i;
 /** Price and seller location are never ISQs here. */
 export const isExcludedIsq = (name: string) => PRICE_NAME.test(name) || PLACE_NAME.test(name);
 
@@ -60,12 +69,13 @@ const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 const isOther = (v: string) => /^other\b/i.test(v.trim());
 /** Not a value a buyer could pick: catch-alls and "ask us" answers sellers type into a spec. */
 const JUNK =
-  /^(others?|all( types?)?|any( types?)?|etc\.?|n\.?a\.?|n\/a|none|nil|not applicable|various|multiple|custom(i[sz]ed?)?|customer|costomer|as (per|par)\b.*|on (request|demand)|available)$/i;
-const isJunk = (v: string) => isOther(v) || JUNK.test(v.trim().replace(/\s+/g, " "));
+  /^(others?|all( types?)?|any( types?)?|etc\.?|n\.?a\.?|n\/a|none|nil|not applicable|various|multiple|custom(i[sz]ed?)?|customer|costomer|as ?(per|par)\b.*|on (request|demand)|available|text)$/i;
+/** Not one option but a choice or a span of them: "Large or Small", "Both Thick or Thin". */
+const VAGUE = /\bor\b|^both\b/i;
+const isJunk = (v: string) =>
+  isOther(v) || JUNK.test(v.trim().replace(/\s+/g, " ")) || VAGUE.test(v.trim());
 const round1 = (n: number) => Math.round(n * 10) / 10;
 const LEVEL_RANK: Record<ValueLevel, number> = { High: 0, Medium: 1, Low: 2 };
-const levelOf = (share: number): ValueLevel =>
-  share >= HIGH_AT ? "High" : share >= MEDIUM_AT ? "Medium" : "Low";
 const lift = (l: ValueLevel): ValueLevel => (l === "Low" ? "Medium" : "High");
 
 // ───────────────────────────── text values: one key per meaning ─────────────────────────────
@@ -78,9 +88,12 @@ const SPELLING: [RegExp, string][] = [
   [/\bgrey\b/g, "gray"],
   [/\bmoulded\b/g, "molded"],
   [/\bpre[\s-]*fab(ricated)?\b/g, "prefabricated"],
-  [/\bpuff\b/g, "puf"],
   [/\bwooden\b/g, "wood"],
   [/\brectangle\b/g, "rectangular"],
+  [/\bflavour/g, "flavor"],
+  [/\bautomated\b/g, "automatic"],
+  [/\bauto\b/g, "automatic"],
+  [/\b(hours?|hrs?)\b/g, "hr"],
 ];
 /** The value is already written the standard way (none of the respellings above applies to it). */
 const standardSpelling = (label: string) => {
@@ -88,43 +101,101 @@ const standardSpelling = (label: string) => {
   return SPELLING.every(([re, to]) => l.replace(re, to) === l);
 };
 /** Short forms and what they stand for, so "MS", "Mild Steel" and "MS (Mild Steel)" are one value. */
-const SHORT_FORMS: Record<string, string[]> = {
-  ms: ["mild", "steel"],
-  gi: ["galvanized", "iron"],
-  ss: ["stainless", "steel"],
-  frp: ["fibre", "reinforced", "plastic"],
-  puf: ["polyurethane", "foam"],
-  acp: ["aluminium", "composite", "panel"],
-  eps: ["expanded", "polystyrene"],
-  hdpe: ["high", "density", "polyethylene"],
-  peb: ["pre", "engineered", "building"],
-  lgsf: ["light", "gauge", "steel", "frame"],
-};
 const stem = (t: string) =>
   t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t;
+/** Number words as numbers: "Three Phase" is "3 Phase", "Single Door" is "1 Door". */
+const NUMBER_WORD: Record<string, string> = {
+  one: "1",
+  single: "1",
+  two: "2",
+  double: "2",
+  dual: "2",
+  twin: "2",
+  three: "3",
+  triple: "3",
+  four: "4",
+  five: "5",
+  six: "6",
+};
 
-/** The words of a value with spellings unified, short forms written out, plurals dropped and repeats removed. */
-export function valueTokens(value: string): string[] {
-  let s = value.toLowerCase();
+/** Short forms → their words ("ms" → mild steel), found in an ISQ's own values (shortForms). */
+export type ShortForms = Record<string, string[]>;
+
+/**
+ * The words of a value with spellings unified, number words as numbers, short forms written out (those the ISQ's
+ * own values spell out, see shortForms), plurals dropped and repeats removed.
+ */
+export function valueTokens(value: string, shorts: ShortForms = {}): string[] {
+  // "SS304" is "SS 304": a short form or word run into its number.
+  let s = value
+    .toLowerCase()
+    .replace(/([a-z])(\d)/g, "$1 $2")
+    .replace(/(\d)([a-z]{2,})/g, "$1 $2");
   for (const [re, to] of SPELLING) s = s.replace(re, to);
   const out: string[] = [];
   for (const raw of s.split(/[^a-z0-9.]+/).filter((t) => t && t !== "etc"))
-    for (const t of SHORT_FORMS[raw] ?? [stem(raw)]) if (!out.includes(t)) out.push(t);
+    for (const t of shorts[raw] ?? [NUMBER_WORD[raw] ?? stem(raw)])
+      if (!out.includes(t)) out.push(t);
+  return out;
+}
+
+/**
+ * The short forms an ISQ's own values spell out, so "MS" and "Mild Steel (MS)" are one value. No list: a short
+ * form counts when the data writes it beside its words ("Mild Steel (MS)"), or as a value of its own whose
+ * letters are another value's initials ("MS" beside "Mild Steel", "BLDC" beside "Brushless DC").
+ */
+export function shortForms(labels: string[]): ShortForms {
+  const out: ShortForms = {};
+  const initials = (t: string[]) => t.map((w) => w[0]).join("");
+  const fulls = labels
+    .map((l) => valueTokens(l.replace(/\([^)]*\)/g, " ")))
+    .filter((t) => t.length >= 2 && t.every((w) => /^[a-z]/.test(w)));
+  for (const label of labels) {
+    const own = label.trim();
+    const candidates = [
+      ...[...own.matchAll(/\(([A-Za-z]{2,6})\)/g)].map((m) => m[1]!),
+      ...(/^[A-Z]{2,6}$/.test(own) ? [own] : []),
+    ];
+    for (const c of candidates) {
+      const short = c.toLowerCase();
+      const full = fulls.find((t) => initials(t) === short);
+      if (full && !out[short]) out[short] = full;
+    }
+  }
   return out;
 }
 
 /** A text value as shown: spaces and a trailing full stop tidied, and an all-lowercase one capitalised. */
+/** Words written small in a value: joining words and units ("Kg", "Hr" would look wrong). */
+const SMALL_WORDS =
+  /^(and|or|of|for|with|to|in|on|per|x|kg|kgs|gm|gms|ltr|ltrs|lit|ml|mm|cm|ft|hr|hrs|min|lph|lpd|tph|tpd|rpm|psi|bar|inch)$/i;
+
+/**
+ * One way of writing a value: spaces and trailing punctuation tidied, and each word capitalised the same way —
+ * "FULLY AUTOMATED" → "Fully Automated", "Line type" → "Line Type", "Stainless Steel(SS)" → "Stainless Steel (SS)".
+ * Short forms stay as written ("SS", "PUF", "HP"), as do joining words and units ("kg/hr").
+ */
 function tidy(label: string): string {
   const t = label
     .replace(/\s+/g, " ")
+    .replace(/(\S)\(/g, "$1 (")
     .replace(/\s*[.,;]+$/, "")
     .replace(/\s+etc$/i, "")
     .trim();
-  return /[A-Z]/.test(t) ? t : t.replace(/\b[a-z]/g, (c) => c.toUpperCase());
+  return t.replace(/[A-Za-z]+/g, (word, at: number) => {
+    if (at > 0 && SMALL_WORDS.test(word)) return word.toLowerCase();
+    // A long word in capitals is shouting, not a short form ("AUTOMATED"); a short one is a short form ("SS").
+    if (word === word.toUpperCase())
+      return word.length > 4 ? word[0] + word.slice(1).toLowerCase() : word;
+    // Mixed case is deliberate ("kW", "iBake").
+    if (/[A-Z]/.test(word.slice(1))) return word;
+    return word[0]!.toUpperCase() + word.slice(1);
+  });
 }
 
 /** Two text values with the same key are the same value ("Green House" = "Greenhouse", "Steels" = "Steel"). */
-export const valueKey = (value: string) => valueTokens(value).join("");
+export const valueKey = (value: string, shorts: ShortForms = {}) =>
+  valueTokens(value, shorts).join("");
 
 const JOINERS = new Set(["with", "and", "cum", "plus", "or"]);
 
@@ -239,7 +310,7 @@ function score(g: Group | undefined, src: Sources): Scored {
       source: "data",
     };
   return {
-    level: levelOf(Math.max(demandPct ?? 0, fillPct ?? 0)),
+    level: levelFor(demandPct, fillPct, g?.listings ?? 0),
     why: parts.join(" · "),
     fill_pct: fillPct,
     listings: g?.listings ?? 0,
@@ -277,6 +348,12 @@ interface Work {
   usedDoc: boolean;
   /** A measurement whose values were taken from the category document: nothing else is added to them. */
   fromDoc: boolean;
+  /** The live ISQ (input 4) whose values this text ISQ took because its own mixed figures with words. */
+  fromLive: string | null;
+  /** A count ISQ ("Number of Trays"): its values are compared by number, so "10", "10 Tray", "10 trays" are one. */
+  count: Count | null;
+  /** A figure's unit as its ISQ writes it ("cc", "kVA"): how its values and its unit are shown. */
+  unitShown: string | null;
   notes: string[];
   warnings: string[];
 }
@@ -287,6 +364,15 @@ export function isEligible(f: FilterRow): boolean {
   return f.tier === "Tier 1" || (f.tier === "Tier 2" && f.confidence === "High");
 }
 
+/**
+ * Shown as an ISQ: every Tier 1 ISQ (High, Medium or Low) and every Tier 2 High one, and nothing else (never Price
+ * or Location). The tier is the only test. The "Shown" tag, the "N ISQs shown" count and the "Selected ISQs (.json)"
+ * download all use this, so a result saved under earlier rules reads the same way.
+ */
+export function isShown(f: FilterRow): boolean {
+  return isEligible(f);
+}
+
 const sorted = (items: Item[]) =>
   [...items].sort(
     (a, b) =>
@@ -295,6 +381,59 @@ const sorted = (items: Item[]) =>
       (b.vc.demand_pct ?? -1) - (a.vc.demand_pct ?? -1),
   );
 
+/**
+ * The unit outside the table an ISQ's numbers are in, and how to write it. First from the keyword dimension the ISQ
+ * is linked to: its values are the labelling model's (step 2), which said once per unit word what its numbers
+ * measure, so "125 cc", "150 cc" under Engine Displacement are its call that cc measures it, in its spelling.
+ * Without such a dimension, from the ISQ's own values. Either way most of them must be numbers in that one unit.
+ */
+function figureUnit(src: Sources, base: string[]): { unit: string; spelled: string } | null {
+  const unitOf = (labels: string[]) => {
+    const n = new Map<string, number>();
+    for (const label of labels) {
+      const q = parseQuantity(label);
+      if (q?.kind === "figure") n.set(q.unit, (n.get(q.unit) ?? 0) + 1);
+    }
+    const [unit, count] = [...n].sort((a, b) => b[1] - a[1])[0] ?? [];
+    return unit && count && count >= Math.max(2, labels.length * 0.6) ? unit : null;
+  };
+  const dimension = src.raws.filter((r) => Object.keys(r.demand).length).map((r) => r.label);
+  const unit = (dimension.length ? unitOf(dimension) : null) ?? unitOf(base);
+  if (!unit) return null;
+  // Its spelling from everything written in it: the model's and the sellers' ("v" and "V" → "V").
+  const written = new Map<string, number>();
+  for (const label of [...dimension, ...base, ...src.raws.map((r) => r.label)]) {
+    if (parseQuantity(label)?.unit !== unit) continue;
+    const w = label.match(/(\p{L}[\p{L}\p{M}.]*(?:\s?\/\s?\p{L}+)?)\s*$/u)?.[1];
+    if (w) written.set(w, (written.get(w) ?? 0) + 1);
+  }
+  const spelled =
+    [...written].sort((a, b) => spellingRank(a[0]) - spellingRank(b[0]) || b[1] - a[1])[0]?.[0] ??
+    unit;
+  return { unit, spelled };
+}
+
+/**
+ * Which of a unit's spellings to show: one with capitals inside it says the most ("kVA", "mAh"), then all
+ * capitals ("V", "GSM"), then lower case ("cc"); a capital first letter only is a sentence's habit ("Cc").
+ */
+function spellingRank(unit: string): number {
+  const letters = unit.replace(/[^\p{L}]/gu, "");
+  if (/\p{Lu}/u.test(letters.slice(1)) && /\p{Ll}/u.test(letters)) return 0;
+  if (letters === letters.toUpperCase() && letters !== letters.toLowerCase()) return 1;
+  if (letters === letters.toLowerCase()) return 2;
+  return 3;
+}
+
+/** A figure ISQ's unit ("cc"): what its category document ISQ is paired by, whatever the names. */
+export function figureUnitOf(
+  f: FilterRow,
+  ev: Pick<Evidence, "aggregation" | "listing">,
+): string | null {
+  const w = buildWork(f, ev, null);
+  return w.measure === "figure" ? (w.shape?.unit ?? null) : null;
+}
+
 function buildWork(
   f: FilterRow,
   ev: Pick<Evidence, "aggregation" | "listing">,
@@ -302,6 +441,8 @@ function buildWork(
 ): Work {
   const src = sourcesOf(f, ev);
   const base = f.values.map((v) => v.trim()).filter((v) => v && !isJunk(v));
+  // "MS" and "Mild Steel (MS)" are one value when this ISQ's own values say so.
+  const shorts = shortForms([...base, ...src.raws.map((r) => r.label)]);
   const w: Work = {
     f,
     eligible: isEligible(f),
@@ -310,7 +451,7 @@ function buildWork(
     docShaped: false,
     src,
     groups: new Map(),
-    keyOf: (label) => valueKey(label) || null,
+    keyOf: (label) => valueKey(label, shorts) || null,
     labelOf: tidy,
     fit: null,
     items: [],
@@ -318,33 +459,48 @@ function buildWork(
     mergedInto: null,
     usedDoc: false,
     fromDoc: false,
+    fromLive: null,
+    count: null,
+    unitShown: null,
     notes: [],
     warnings: [],
   };
 
-  // 1 · a measurement ISQ: its name says so, and enough of its values really are quantities.
-  const measure = measureKind(f.name);
+  // 1 · a measurement ISQ: its name says so, and enough of its values really are quantities. Or its numbers are
+  // in one unit outside the table ("125 cc", "10 kVA"): what the labelling model wrote for its keyword dimension,
+  // or most of its own values. A count ISQ ("Number of Trays", "4 Trays") stays a count.
+  let measure = measureKind(f.name);
   const parsed = base.map((v) => parseQuantity(v));
+  const fig = figureUnit(src, base);
+  if (fig) {
+    const fits = parsed.filter((q) => q && countsFor(q, measure ?? "size")).length;
+    const counting = !measure && countOf(f.name, [...base, ...src.raws.map((r) => r.label)]);
+    if (!counting && (!measure || (!isSpatial(measure) && fits < base.length * 0.3)))
+      measure = "figure";
+  }
+  w.unitShown = fig?.spelled ?? null;
   const quantities = (labels: string[], weight: (label: string) => number) =>
     labels.flatMap((label) => {
       const q = parseQuantity(label);
       return q ? [{ q, weight: weight(label) }] : [];
     });
-  const docShape =
+  let docShape =
     measure && pair
       ? dominantShape(
           quantities(pair.isq.values, () => 1),
           measure,
         )
       : null;
-  // The category document's ISQ makes it a measurement whatever our own values look like.
-  if (
-    measure &&
-    (docShape || (base.length && parsed.filter(Boolean).length / base.length >= 0.3))
-  ) {
+  // A figure takes the document's values only in its own unit: a document in another unit says nothing of it.
+  if (measure === "figure" && docShape && docShape.unit !== fig?.unit) docShape = null;
+  const counted = parsed.filter((q) => q && countsFor(q, measure ?? "size")).length;
+  // The category document's ISQ makes an area, length or size a measurement whatever our own values look like.
+  // A machine figure needs at least one number of its own too, so "Output" holding "Single", "Dual" stays text.
+  const docMakesIt = Boolean(docShape) && (isSpatial(measure ?? "size") || counted > 0);
+  if (measure && (docMakesIt || (base.length && counted / base.length >= 0.3))) {
     if (pair && !docShape) {
       w.notes.push(
-        `"${f.name}": the category document's "${pair.isq.name}" doesn't hold ${measure === "area" ? "areas" : measure === "length" ? "lengths" : "sizes"}, so it wasn't used.`,
+        `"${f.name}": the category document's "${pair.isq.name}" doesn't hold ${MEASURE_PLURAL[measure]}, so it wasn't used.`,
       );
       w.pair = null;
     }
@@ -379,9 +535,10 @@ function buildWork(
         const q = fit(label);
         return typeof q === "string" ? null : quantityKey(q);
       };
+      const spell = (unit: string) => (unit === fig?.unit ? fig.spelled : unit);
       w.labelOf = (label) => {
         const q = fit(label);
-        return typeof q === "string" ? label : formatQuantity(q);
+        return typeof q === "string" ? label : formatQuantity(q, spell);
       };
       const dropped = base.flatMap((v) => {
         const q = fit(v);
@@ -389,9 +546,16 @@ function buildWork(
       });
       if (dropped.length)
         w.notes.push(
-          `"${f.name}": left out ${dropped.join(", ")}; its values are ${shape.kind === "dims" ? `${shape.axes} numbers (${shape.axes === 2 ? "length x width" : "length x width x height"})` : `one number (${shape.kind === "area" ? "an area" : "a length"})`} in ${shape.unit}${docShape ? `, as in the category document's "${pair!.isq.name}"` : ""}.`,
+          `"${f.name}": left out ${dropped.join(", ")}; its values are ${shape.kind === "dims" ? `${shape.axes} numbers (${shape.axes === 2 ? "length x width" : "length x width x height"})` : `one number (${kindName(shape.kind)})`} in ${shape.unit}${docShape ? `, as in the category document's "${pair!.isq.name}"` : ""}.`,
         );
     }
+  }
+
+  // A count ISQ compares its values by number and writes them one way: "10", "10 Tray", "10 trays" are "10 Trays";
+  // "Single Flavour" is "1 Flavor". A sum ("2+1 Flavour") and anything that isn't a count keep their own key.
+  if (!w.measure) {
+    const count = countOf(f.name, [...base, ...src.raws.map((r) => r.label)]);
+    if (count) applyCount(w, count);
   }
 
   // 2 · one item per meaning, scored on everything the data holds under any of its spellings.
@@ -415,7 +579,7 @@ function buildWork(
   if (merged.length) w.notes.push(`"${f.name}": merged duplicates (${merged.join("; ")}).`);
   // Of the spellings that became one text value, show the one the data uses most; on a tie, the standard one
   // ("PUF" rather than "Puff").
-  if (!w.measure) {
+  if (!w.measure && !w.count) {
     const used = (label: string) =>
       src.raws
         .filter((r) => r.label.toLowerCase() === label.toLowerCase())
@@ -426,6 +590,34 @@ function buildWork(
         (a, b) => used(b) - used(a) || Number(standardSpelling(b)) - Number(standardSpelling(a)),
       )[0]!;
       it.vc.value = tidy(best);
+    }
+  }
+
+  // A measurement's exact value inside one of its ranges is that range ("1000 L" beside "500 - 1000 L"): the range
+  // already counts it (inRange), so it goes rather than overlap.
+  if (w.measure && w.fit && !w.fromDoc) {
+    const quantity = (it: Item) => {
+      const q = w.fit!(it.vc.value);
+      return typeof q === "object" ? q : null;
+    };
+    const ranges = w.items.map(quantity).filter((q): q is Quantity => Boolean(q?.range));
+    const covered = w.items.filter((it) => {
+      const q = quantity(it);
+      if (!q || q.range || q.kind === "dims") return false;
+      const n = q.nums[0]!;
+      return ranges.some((r) =>
+        r.range === "upto"
+          ? n <= r.nums[0]!
+          : r.range === "above"
+            ? n >= r.nums[0]!
+            : n >= r.nums[0]! && n <= r.nums[1]!,
+      );
+    });
+    if (covered.length && covered.length < w.items.length) {
+      w.items = w.items.filter((it) => !covered.includes(it));
+      w.notes.push(
+        `"${f.name}": left out ${covered.map((it) => it.vc.value).join(", ")}: inside a range it also shows.`,
+      );
     }
   }
 
@@ -455,10 +647,11 @@ function buildWork(
     }
     if (fromDoc.length >= MIN_VALUES) {
       const ours = w.items.map((it) => it.vc.value);
+      const kept = fewest(fromDoc);
       w.notes.push(
-        `"${f.name}": values taken from the category document's "${w.pair.isq.name}" (${fromDoc.map((it) => it.vc.value).join(", ")})${ours.length ? `; the data had ${ours.join(", ")}` : ""}.`,
+        `"${f.name}": values taken from the category document's "${w.pair.isq.name}" (${kept.map((it) => it.vc.value).join(", ")})${kept.length < fromDoc.length ? `, ${kept.length} of its ${fromDoc.length}: those the data holds, then spread over the rest` : ""}${ours.length ? `; the data had ${ours.join(", ")}` : ""}.`,
       );
-      w.items = fromDoc;
+      w.items = kept;
       w.usedDoc = true;
       w.fromDoc = true;
     }
@@ -470,6 +663,21 @@ function buildWork(
 
   dropGenerics(w);
   return w;
+}
+
+/**
+ * A document that lists every exact size (34 engine capacities, 30 kVA ratings) is cut to MAX_DOC_VALUES: the
+ * values the data holds (by their share), then the others evenly spread over the list, in the document's order.
+ */
+function fewest(items: Item[]): Item[] {
+  if (items.length <= MAX_DOC_VALUES) return items;
+  const share = (it: Item) => Math.max(it.vc.fill_pct ?? 0, it.vc.demand_pct ?? 0);
+  const held = items.filter((it) => share(it) > 0).sort((a, b) => share(b) - share(a));
+  const keep = new Set(held.slice(0, MAX_DOC_VALUES));
+  const rest = items.filter((it) => !keep.has(it));
+  const room = MAX_DOC_VALUES - keep.size;
+  for (let i = 0; i < room; i++) keep.add(rest[Math.floor((i * rest.length) / room)]!);
+  return items.filter((it) => keep.has(it));
 }
 
 /**
@@ -522,7 +730,7 @@ function absorb(w: Work, keep: Item, drop: Item) {
     keep.vc.demand_pct == null && drop.vc.demand_pct == null
       ? null
       : Math.min(100, round1((keep.vc.demand_pct ?? 0) + (drop.vc.demand_pct ?? 0)));
-  const level = [levelOf(Math.max(fill ?? 0, demand ?? 0)), keep.vc.level, drop.vc.level].sort(
+  const level = [levelFor(demand, fill, listings), keep.vc.level, drop.vc.level].sort(
     (a, b) => LEVEL_RANK[a] - LEVEL_RANK[b],
   )[0]!;
   keep.vc = {
@@ -591,8 +799,12 @@ function boost(w: Work) {
     for (const it of w.items) {
       if (it.vc.level === "High" || it.vc.source === "doc") continue;
       const paired = it.origs.map((o) => pair.values.get(o)).find(Boolean);
-      const docLabel = docKeys.get(it.key) ?? (paired ? w.labelOf(paired) : undefined);
-      if (!docLabel) continue;
+      const found = docKeys.get(it.key) ?? (paired ? w.labelOf(paired) : undefined);
+      if (!found) continue;
+      // Our wording stays when the document's adds a figure ours doesn't have: "Electric" is not
+      // "0.5 kW Electric", which is one of several ratings the document wrote into one value.
+      const docLabel =
+        !w.measure && hasFigure(found) && !hasFigure(it.vc.value) ? it.vc.value : found;
       const to = lift(it.vc.level);
       lifted.push(
         `${it.vc.value}${docLabel !== it.vc.value ? ` → ${docLabel}` : ""} (${it.vc.level} → ${to})`,
@@ -605,6 +817,18 @@ function boost(w: Work) {
         lifted: true,
       };
       w.usedDoc = true;
+    }
+    // Two of our spellings the document writes one way ("3 Phase" and "Three Phase" → "Three Phase") are one value.
+    const byLabel = new Map<string, Item>();
+    for (const it of [...w.items]) {
+      const k = valueKey(it.vc.value);
+      const keep = byLabel.get(k);
+      if (!keep) {
+        byLabel.set(k, it);
+        continue;
+      }
+      absorb(w, keep, it);
+      w.items = w.items.filter((x) => x !== it);
     }
   }
 
@@ -659,6 +883,312 @@ function boost(w: Work) {
   if (added.length) w.notes.push(`"${w.f.name}" was thin: added ${added.join(", ")}.`);
 }
 
+// ───────────────────────────── 4 · a text ISQ that mixes figures with words ─────────────────────────────
+
+/** A value with a number and a unit in it ("1 HP", "0.5 kW Electric"); counts like "2 Seater" have none. */
+const hasFigure = (v: string) => figuresIn(v).length > 0;
+
+/**
+ * This ISQ in the live ISQs (input 4): the same name (ignoring filler words like "Type"), one name inside the
+ * other, or else the one live ISQ that shares the most values with it (a tie is none).
+ */
+function liveFor(w: Work, live: DocMcat): DocMcat["isqs"][number] | null {
+  const mine = nameTokens(w.f.name).join(" ");
+  const named = live.isqs.find((q) => nameTokens(q.name).join(" ") === mine);
+  if (named) return named;
+  const own = new Set(nameTokens(w.f.name));
+  const inside = live.isqs.filter((q) => {
+    const t = nameTokens(q.name);
+    return (
+      t.length > 0 &&
+      own.size > 0 &&
+      (t.every((x) => own.has(x)) || [...own].every((x) => t.includes(x)))
+    );
+  });
+  if (inside.length === 1) return inside[0]!;
+  const keys = new Set(w.items.map((it) => it.key));
+  const scored = live.isqs
+    .map((q) => ({ q, n: q.values.filter((v) => keys.has(w.keyOf(v) ?? "")).length }))
+    .filter((x) => x.n >= 2)
+    .sort((a, b) => b.n - a.n);
+  return scored[0] && scored[0].n !== scored[1]?.n ? scored[0].q : null;
+}
+
+/** A name that counts something: "Number of Trays", "No. of Decks", "Capacity (Trays)", "Tray Count". */
+const COUNT_NAME = /\b(number|no|nos|count|capacity)\b/i;
+const COUNT_FILLER = new Set([
+  "number",
+  "no",
+  "nos",
+  "count",
+  "capacity",
+  "of",
+  "the",
+  "per",
+  "and",
+]);
+/** Number words a count can be written with: "Single Flavour" is 1 flavour, "Double Trolley" 2 trolleys. */
+const NUMBER_WORDS: Record<string, number> = {
+  one: 1,
+  single: 1,
+  two: 2,
+  double: 2,
+  dual: 2,
+  twin: 2,
+  three: 3,
+  triple: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+};
+/** "24 Tray", "Single Flavour", "2+1 Flavour": a number (or number word, or a sum) and a noun. */
+const COUNT_VALUE = /^(\d+(?:\.\d+)?|\d+\s*\+\s*\d+|[a-z]+)\s+([a-z]+)$/i;
+/** A count word without its plural or its British spelling: "Flavours" and "Flavor" are one, "Trays" is "tray". */
+const countStem = (word: string) => stem(word.toLowerCase()).replace(/our$/, "or");
+
+interface Count {
+  stem: string;
+  singular: string;
+  plural: string;
+  /** The name states the noun, so a bare "5" is 5 of it. */
+  bare: boolean;
+}
+
+/**
+ * The noun a name states it counts: "Number of Trays", "No. of Decks", "Capacity (Trays)", "Tray Count", or a
+ * thing a machine has a number of ("Tray Capacity", "Trolley Capacity": COUNT_NOUN).
+ */
+function namedNoun(name: string): string | null {
+  const measure = measureKind(name);
+  if (measure && isSpatial(measure)) return null;
+  return (
+    name.match(/\b(?:number|no\.?|nos\.?)\s+of\s+([a-z]+)/i)?.[1] ??
+    countedInBrackets(name)?.split(/\s+/).pop() ??
+    name.match(/\b([a-z]+)\s+count\b/i)?.[1] ??
+    name.match(COUNT_NOUN)?.[0] ??
+    null
+  );
+}
+
+/** A value as a count of the noun: its number, or null for a sum ("2+1 Flavour"), which is kept as written. */
+function countIn(value: string, count: Count): { n: number | null } | null {
+  const v = value.trim();
+  if (count.bare && /^\d+$/.test(v)) return { n: Number(v) };
+  const m = v.match(COUNT_VALUE);
+  if (!m || countStem(m[2]!) !== count.stem) return null;
+  const num = m[1]!.toLowerCase();
+  if (num.includes("+")) return { n: null };
+  if (/^\d/.test(num)) return { n: Number(num) };
+  return num in NUMBER_WORDS ? { n: NUMBER_WORDS[num]! } : null;
+}
+
+const makeCount = (word: string, bare: boolean): Count => {
+  const plural = /s$/i.test(word) ? word : `${word}s`;
+  // "Lanes" → "Lane", "Boxes" → "Box", "Trays" → "Tray".
+  const singular = /(s|x|z|ch|sh)es$/i.test(plural) ? plural.slice(0, -2) : plural.slice(0, -1);
+  return { stem: countStem(word), singular, plural, bare };
+};
+
+/** A count ISQ compares its values by number and writes them one way ("10", "10 tray" → "10 Trays"). */
+function applyCount(w: Work, count: Count) {
+  w.count = count;
+  w.keyOf = (label) => {
+    const n = countIn(label, count)?.n;
+    return n != null ? `#${n} ${count.stem}` : valueKey(label) || null;
+  };
+  w.labelOf = (label) => {
+    const n = countIn(label, count)?.n;
+    return n != null ? `${n} ${n === 1 ? count.singular : count.plural}` : tidy(label);
+  };
+}
+
+/**
+ * A live ISQ's or the category document's values as this ISQ's items: in the list's order and wording (one
+ * spelling: "4 Tray" is "4 Trays" in a count ISQ), each scored on the data (a range on the values inside it) and
+ * Medium at the least. The list is someone's choice of options, so nothing in it is dropped as a duplicate.
+ */
+function listItems(w: Work, values: string[], source: "live" | "doc", from: string): Item[] {
+  const items: Item[] = [];
+  for (const v of values) {
+    if (isJunk(v)) continue;
+    const key = w.keyOf(v);
+    if (!key || items.some((it) => it.key === key)) continue;
+    const own = w.items.find((it) => it.key === key);
+    const label = w.labelOf(v);
+    const s = score(inRange(w, label) ?? w.groups.get(key), w.src);
+    items.push({
+      key,
+      origs: own?.origs ?? [],
+      vc: {
+        value: label,
+        ...s,
+        level: s.level === "Low" ? "Medium" : s.level,
+        why: `${s.level === "Low" && s.listings === 0 && s.demand_pct === null ? "" : `${s.why} · `}from ${from}`,
+        source,
+      },
+    });
+  }
+  return items;
+}
+
+/**
+ * What a count ISQ counts: the noun its name states ("Capacity (Trays)", which also makes a bare "5" a count), or
+ * else the name word most of its values count ("Size" no, "Tray Capacity" with "4 Tray", "6 Trays" yes). Written
+ * as the name has it ("Tray" / "Trays"). null when the name isn't a count or fewer than two values are.
+ */
+function countOf(name: string, labels: string[]): Count | null {
+  const named = namedNoun(name);
+  if (named) {
+    const c = makeCount(named, true);
+    if (labels.filter((l) => countIn(l, c)).length >= 2) return c;
+  }
+  if (!COUNT_NAME.test(name)) return null;
+  let best: { word: string; n: number } | null = null;
+  for (const word of name.match(/[a-z]+/gi) ?? []) {
+    if (word.length < 3 || COUNT_FILLER.has(word.toLowerCase())) continue;
+    const c = makeCount(word, false);
+    const n = labels.filter((l) => countIn(l, c)).length;
+    if (n >= 2 && (!best || n > best.n)) best = { word, n };
+  }
+  return best ? makeCount(best.word, false) : null;
+}
+
+/** An ISQ that says what powers or heats the machine: "Power Source", "Fuel Type", "Heating Source". */
+const SOURCE_NAME =
+  /\b(power|fuel|energy|heating|heat)\s*(source|type|medium)\b|\bfuel\b|\bheating\s*method\b/i;
+/** What powers or heats a machine. A value of a source ISQ without one of these is something else. */
+const SOURCE_WORD =
+  /\b(electric\w*|gas|lpg|png|cng|lng|diesel|petrol|gasoline|kerosene|wood|coal|charcoal|biomass|pellets?|solar|steam|induction|oil|manual|hand|engine|motor|battery|generator|hydraulic|pneumatic|tractor|pto|thermic)\b/i;
+/** Sources an MCAT's name can fix: an "Electric Rotary Rack Oven" is electric. */
+const ENERGY_WORD = /\b(electric|gas|lpg|diesel|petrol|wood|coal|solar|steam|induction)\b/gi;
+
+/**
+ * A text ISQ that holds two attributes keeps only its own (values a buyer would choose between):
+ * - the MCAT itself is not one of its options: "Dough Mixers" under the Dough Mixers MCAT's Mixer Type;
+ * - values that mix figures with words ("0.5 kW Electric", "Gas", "1 HP", "20 kW" under Power Source);
+ * - a count ISQ with values that aren't counts ("Conical Rounder" and "10 Kg/Hour" among "24 Tray", "40 Trays"),
+ *   or whose name counts something its values don't ("Tray Capacity" holding kg/hr);
+ * - a power or fuel source ISQ with values that aren't sources ("Liner", "Milking Cluster" beside "Electric").
+ * With the live ISQ in input 4, such an ISQ takes the live ISQ's values, scored on the data and Medium at the
+ * least. Without one, what doesn't belong goes: the figures when words are most of the values (when figures are
+ * most, it is left as it is, with a warning); a count ISQ's other values when counts are at least two thirds; a
+ * count ISQ whose values are all figures has nothing left; a source ISQ's non-sources. Last, a source the MCAT's
+ * name fixes ("Electric Rotary Rack Oven") leaves only the values that have it; fewer than 2, and the ISQ isn't
+ * shown — the MCAT's name already says it.
+ */
+function declutter(w: Work, live: DocMcat | null, mcat: string) {
+  if (!w.eligible || w.mergedInto || w.measure) return;
+  const list = (items: Item[]) => items.map((it) => it.vc.value).join(", ");
+
+  // The MCAT itself is not one of its options.
+  const mcatTokens = new Set(valueTokens(mcat));
+  const itself = w.items.filter((it) => {
+    const t = valueTokens(it.vc.value);
+    return mcatTokens.size > 0 && t.length >= 2 && t.every((x) => mcatTokens.has(x));
+  });
+  if (itself.length) {
+    w.items = w.items.filter((it) => !itself.includes(it));
+    w.notes.push(`"${w.f.name}": left out ${list(itself)}: that is the MCAT itself.`);
+  }
+
+  const figures = w.items.filter((it) => hasFigure(it.vc.value));
+  const words = w.items.filter((it) => !hasFigure(it.vc.value));
+  const mixed = figures.length > 0 && words.length > 0;
+  const kept = mixed && words.length >= figures.length ? words : w.items;
+  const count = w.count;
+  const counts = count ? kept.filter((it) => countIn(it.vc.value, count)) : [];
+  const strays = count ? kept.filter((it) => !countIn(it.vc.value, count)) : [];
+  // Counts must be a clear majority before anything else in a count ISQ is called a stray.
+  const strayCounts = Boolean(count) && strays.length > 0 && counts.length >= 2 * strays.length;
+  const noun = namedNoun(w.f.name);
+  const wrongUnit = Boolean(noun) && !count && figures.length > 0 && words.length === 0;
+  const source = SOURCE_NAME.test(w.f.name) && w.items.some((it) => SOURCE_WORD.test(it.vc.value));
+  const nonSources = source ? kept.filter((it) => !SOURCE_WORD.test(it.vc.value)) : [];
+
+  if (mixed || strayCounts || wrongUnit || nonSources.length) {
+    const why = [
+      mixed ? `figures (${list(figures)}) with words (${list(words)})` : "",
+      strayCounts
+        ? `${count!.plural.toLowerCase()} (${list(counts)}) with other things (${list(strays)})`
+        : "",
+      wrongUnit ? `figures (${list(figures)}) under a name that counts ${noun!.toLowerCase()}` : "",
+      nonSources.length ? `things that aren't power or fuel sources (${list(nonSources)})` : "",
+    ]
+      .filter(Boolean)
+      .join(", and ");
+    const isq = live ? liveFor(w, live) : null;
+    if (isq) {
+      // A name that counts something writes the live counts one way too ("2 Tray" → "2 Trays").
+      if (!w.count && noun) applyCount(w, makeCount(noun, true));
+      const items = listItems(w, isq.values, "live", `the live ISQ ${isq.name}`);
+      if (items.length >= MIN_VALUES) {
+        w.notes.push(
+          `"${w.f.name}": its values mixed ${why}, so they were taken from the live ISQ "${isq.name}" (input 4): ${list(items)}.`,
+        );
+        w.items = items;
+        w.fromLive = isq.name;
+        fixedSource(w, mcat);
+        return;
+      }
+    }
+
+    // Without a live ISQ: what doesn't belong goes.
+    if (mixed) {
+      if (words.length < figures.length && !wrongUnit) {
+        w.warnings.push(
+          `"${w.f.name}" mixes figures (${list(figures)}) with words (${list(words)}), and input 4 has no live ISQ for it to take values from.`,
+        );
+        return;
+      }
+      const kinds = [
+        ...new Set(
+          figures.flatMap((it) =>
+            figuresIn(it.vc.value).map((q) => KIND_PLURAL[q.kind as keyof typeof KIND_PLURAL]),
+          ),
+        ),
+      ];
+      w.items = words;
+      w.notes.push(
+        `"${w.f.name}": left out ${list(figures)}: ${kinds.join(" and ")}, not ${w.f.name} values.`,
+      );
+    }
+    if (wrongUnit) {
+      w.items = [];
+      w.notes.push(
+        `"${w.f.name}": its values (${list(figures)}) are figures, but its name counts ${noun!.toLowerCase()}, so it isn't shown.`,
+      );
+    }
+    if (strayCounts) {
+      w.items = w.items.filter((it) => !strays.includes(it));
+      w.notes.push(
+        `"${w.f.name}": left out ${list(strays)}: not numbers of ${count!.plural.toLowerCase()}.`,
+      );
+    }
+    if (nonSources.length) {
+      w.items = w.items.filter((it) => !nonSources.includes(it));
+      w.notes.push(`"${w.f.name}": left out ${list(nonSources)}: not power or fuel sources.`);
+    }
+  }
+  fixedSource(w, mcat);
+}
+
+/**
+ * A source the MCAT's name fixes: under an "Electric Rotary Rack Oven", a power source without "Electric" ("Gas",
+ * "Wood") contradicts the MCAT and goes. With fewer than 2 values left the ISQ isn't shown: the name says it.
+ */
+function fixedSource(w: Work, mcat: string) {
+  if (!SOURCE_NAME.test(w.f.name)) return;
+  const fixed = [...new Set((mcat.match(ENERGY_WORD) ?? []).map((x) => x.toLowerCase()))];
+  if (!fixed.length) return;
+  const has = (v: string) => fixed.some((x) => new RegExp(`\\b${x}`, "i").test(v));
+  const against = w.items.filter((it) => !has(it.vc.value));
+  if (!against.length) return;
+  w.items = w.items.filter((it) => has(it.vc.value));
+  w.notes.push(
+    `"${w.f.name}": left out ${against.map((it) => it.vc.value).join(", ")}: the MCAT's name says ${fixed.join(" / ")}${w.items.length < MIN_VALUES ? ", so this ISQ isn't shown" : ""}.`,
+  );
+}
+
 /**
  * Numeric values are listed smallest first: a measurement by its numbers ("4 x 4 ft" before "4 x 6 ft" before
  * "10 x 10 ft"; a range by where it starts, "Up to …" first and "Above …" last), and text values that all begin
@@ -706,7 +1236,15 @@ function inOrder(w: Work, items: Item[]): Item[] {
  */
 function shown(w: Work): Item[] {
   const high = highs(w);
-  return inOrder(w, sorted(high.length >= HIGH_ONLY_AT ? high : strong(w)));
+  return ordered(w, high.length >= HIGH_ONLY_AT ? high : strong(w));
+}
+
+/**
+ * Values in their display order: a live ISQ's in its own order, the rest best first; either way, values that
+ * all begin with a number go smallest first ("1 Tray", "2 Trays", "4 Trays").
+ */
+function ordered(w: Work, items: Item[]): Item[] {
+  return inOrder(w, w.fromLive ? w.items.filter((it) => items.includes(it)) : sorted(items));
 }
 
 // ───────────────────────────── the MCAT's ISQs ─────────────────────────────
@@ -725,20 +1263,6 @@ function better(a: Work, b: Work, ranking: string[]): number {
     a.f.rank - b.f.rank ||
     place(a) - place(b)
   );
-}
-
-/** Two ISQs hold one attribute: the same name words, or one name inside the other with values in common. */
-function sameAttribute(a: Work, b: Work): boolean {
-  if (Boolean(a.measure) !== Boolean(b.measure)) return false;
-  const ta = nameTokens(a.f.name);
-  const tb = nameTokens(b.f.name);
-  if (!ta.length || !tb.length) return false;
-  const [small, large] = ta.length <= tb.length ? [ta, tb] : [tb, ta];
-  if (!small.every((t) => large.includes(t))) return false;
-  if (small.length === large.length) return true;
-  const keys = new Set(a.items.map((it) => it.key));
-  const shared = b.items.filter((it) => keys.has(it.key)).length;
-  return shared >= 2 || shared >= Math.min(a.items.length, b.items.length) / 2;
 }
 
 export interface SelectReport {
@@ -763,14 +1287,10 @@ export function isqsNeedingDoc(
   filters: FilterRow[],
   ev: Pick<Evidence, "aggregation" | "listing">,
 ): FilterRow[] {
+  // Every Tier 1 ISQ and every Tier 2 High one can be shown, so each of them may need the document.
   const works = filters.filter(isEligible).map((f) => buildWork(f, ev, null));
-  // The tier rule, applied early to save the work: with STRONG_TIER1 Tier 1 High / Medium ISQs that already have
-  // their values, Tier 1 Low and Tier 2 ISQs won't be shown, so they aren't sent for pairing either.
-  const isStrong = (w: Work) => w.f.tier === "Tier 1" && w.f.confidence !== "Low";
-  const settled = works.filter((w) => isStrong(w) && shown(w).length >= MIN_VALUES).length;
   return works
-    .filter((w) => settled < STRONG_TIER1 || isStrong(w))
-    .filter((w) => Boolean(measureKind(w.f.name)) || isThin(w))
+    .filter((w) => Boolean(measureKind(w.f.name)) || Boolean(w.measure) || isThin(w))
     .map((w) => w.f);
 }
 
@@ -784,6 +1304,10 @@ export function selectIsqs(
   ev: Pick<Evidence, "aggregation" | "listing">,
   pairs: DocPair[],
   ranking: string[] = [],
+  /** This MCAT's live ISQs (input 4 as JSON): where a text ISQ mixing figures with words takes its values. */
+  liveIsqs: DocMcat | null = null,
+  /** The MCAT's name (for values that are the MCAT itself, or contradict it) and its category document. */
+  opts: { mcat?: string | undefined; doc?: DocMcat | null } = {},
 ): SelectReport {
   const pairOf = new Map(pairs.map((p) => [p.filter, p]));
   const works = filters.map((f) =>
@@ -792,29 +1316,12 @@ export function selectIsqs(
   const notes: string[] = [];
   const warnings: string[] = [];
 
-  // 6 · two ISQs for one attribute are one: the better keeps the other's values.
+  // Every Tier 1 / Tier 2 High ISQ is shown, so two ISQs for one attribute ("Size", "Dimensions") both are: they
+  // are not merged. A value under both stays under the one where it is stronger (below). Best ISQ first.
   const live = works.filter((w) => w.eligible).sort((a, b) => better(a, b, ranking));
-  for (let i = 0; i < live.length; i++) {
-    const keep = live[i]!;
-    if (keep.mergedInto) continue;
-    for (const other of live.slice(i + 1)) {
-      if (other.mergedInto || !sameAttribute(keep, other)) continue;
-      other.mergedInto = keep.f.name;
-      const taken: string[] = [];
-      for (const it of other.items) {
-        const key = keep.keyOf(it.vc.value);
-        if (!key || keep.items.some((x) => x.key === key)) continue;
-        keep.items.push({ ...it, key });
-        taken.push(it.vc.value);
-      }
-      dropGenerics(keep);
-      notes.push(
-        `"${other.f.name}" is the same attribute as "${keep.f.name}": merged into it${taken.length ? ` (brought ${taken.join(", ")})` : ""}.`,
-      );
-    }
-  }
 
   for (const w of works) boost(w);
+  for (const w of works) declutter(w, liveIsqs, opts.mcat ?? "");
 
   // A value shown under two ISQs stays under the one where it is stronger (text values only).
   const shownOf = new Map(works.map((w) => [w, shown(w)]));
@@ -838,7 +1345,9 @@ export function selectIsqs(
       }
     }
 
-  // 5–7 · which ISQs are shown.
+  // 5–7 · which ISQs are shown: every Tier 1 ISQ (High, Medium or Low) and every Tier 2 High one, and nothing
+  // else. The tier is the only test — not how many values an ISQ has, nor whether another ISQ holds the same
+  // attribute — and there is no cap on how many.
   const reason = new Map<Work, string>();
   for (const w of works) {
     const f = w.f;
@@ -847,42 +1356,31 @@ export function selectIsqs(
       reason.set(w, "Tier 3 (shown on the listing card, not as an ISQ)");
     else if (f.tier === "Tier 2" && f.confidence !== "High")
       reason.set(w, `Tier 2 with ${f.confidence} confidence (only High is picked from Tier 2)`);
-    else if (w.mergedInto) reason.set(w, `Same attribute as "${w.mergedInto}"`);
-    else if (shownOf.get(w)!.length < MIN_VALUES)
-      reason.set(
-        w,
-        `Only ${shownOf.get(w)!.length} High / Medium value(s) (an ISQ needs ${MIN_VALUES})`,
-      );
   }
-  const candidates = works.filter((w) => !reason.has(w));
-  const tier1Strong = candidates.filter((w) => w.f.tier === "Tier 1" && w.f.confidence !== "Low");
-  if (tier1Strong.length >= STRONG_TIER1)
-    for (const w of candidates)
-      if (!tier1Strong.includes(w))
-        reason.set(
-          w,
-          `${tier1Strong.length} Tier 1 High / Medium ISQs are shown, so ${w.f.tier === "Tier 1" ? "Tier 1 Low" : "Tier 2"} is not`,
-        );
 
   // Write the result back onto the filters.
   for (const w of works) {
     const f = w.f;
-    const all = inOrder(w, sorted(w.items));
+    const all = ordered(w, w.items);
     f.values = all.map((it) => it.vc.value);
     if (all.length) f.value_confidence = all.map((it) => it.vc);
     else delete f.value_confidence;
-    f.selected_values = shownOf.get(w)!.map((it) => it.vc.value);
+    // Its High and Medium values; an ISQ with none of those still shows what it has (Low), not nothing.
+    const showing = shownOf.get(w)!;
+    f.selected_values = (showing.length ? showing : all).map((it) => it.vc.value);
     f.selected = !reason.has(w);
     if (reason.has(w)) f.select_note = reason.get(w)!;
     else delete f.select_note;
     if (w.usedDoc && w.pair) f.doc_isq = w.pair.isq.name;
     else delete f.doc_isq;
-    if (w.shape) f.unit = w.shape.unit;
+    if (w.shape) f.unit = w.measure === "figure" ? (w.unitShown ?? w.shape.unit) : w.shape.unit;
     // AI-suggested values are no longer used: what the data lacks comes from the category document.
     delete f.ai_values;
     notes.push(...w.notes);
     if (f.selected) warnings.push(...w.warnings);
   }
+
+  fillThin(filters, ev, liveIsqs, opts.doc ?? null, opts.mcat ?? "", notes);
 
   const failed = checkSelection(filters);
   return {
@@ -899,10 +1397,113 @@ export function selectIsqs(
  * 8 · the check: every rule, verified on the finished filters. Returns one line per rule that doesn't hold
  * (none when all is well), so a slip in the steps above can't pass silently.
  */
+/** An MCAT is given at least this many ISQs (fillThin). */
+export const MIN_SHOWN_ISQS = 3;
+
+/** Two ISQ names for one attribute: the same name words, or one name's words inside the other's. */
+function namesMatch(a: string, b: string): boolean {
+  const ta = nameTokens(a);
+  const tb = nameTokens(b);
+  if (!ta.length || !tb.length) return false;
+  const [small, large] = ta.length <= tb.length ? [ta, tb] : [tb, ta];
+  return small.every((t) => large.includes(t));
+}
+
+/**
+ * An MCAT that shows fewer than MIN_SHOWN_ISQS ISQs — one with a few listings, where the model left everything in
+ * Tier 3 — is given more: the live ISQs (input 4) in their priority order, then the category document's ISQs,
+ * each with its own values, scored on the data and Medium at the least. Lists the model also made a Tier 1 or
+ * Tier 2 High ISQ for go first (the data has them), and that ISQ is the one shown, with its listing evidence; a
+ * list the model put in Tier 3 isn't used. Otherwise a new Tier 1 ISQ is added. Either way it is marked
+ * `added_from`, and its note says why.
+ */
+function fillThin(
+  filters: FilterRow[],
+  ev: Pick<Evidence, "aggregation" | "listing">,
+  live: DocMcat | null,
+  doc: DocMcat | null,
+  mcat: string,
+  notes: string[],
+) {
+  let need = MIN_SHOWN_ISQS - filters.filter((f) => f.selected).length;
+  if (need <= 0) return;
+  const taken = filters.filter((f) => f.selected).map((f) => f.name);
+  const hidden = (name: string) => filters.find((f) => !f.selected && namesMatch(f.name, name));
+  const lists = [
+    ...(live?.isqs ?? []).map((q) => ({ q, from: "live" as const })),
+    ...(doc?.isqs ?? []).map((q) => ({ q, from: "doc" as const })),
+  ].filter(({ q }) => !isExcludedIsq(q.name));
+  // The model's own (hidden) ISQ for a list goes first when it may be shown: Tier 1, or Tier 2 High. One it put
+  // in Tier 3 (or Tier 2 below High) stays hidden, and its list isn't used — the tier is the model's call.
+  const order = [
+    ...lists.filter(({ q }) => hidden(q.name) && isEligible(hidden(q.name)!)),
+    ...lists.filter(({ q }) => !hidden(q.name)),
+  ];
+  const added: string[] = [];
+  for (const { q, from } of order) {
+    if (need <= 0) break;
+    if (taken.some((n) => namesMatch(n, q.name))) continue;
+    const values = q.values.filter((v) => !isJunk(v));
+    if (values.length < MIN_VALUES) continue;
+    const old = hidden(q.name);
+    const spec =
+      old?.linked_listing_spec ??
+      ev.listing?.fields.find((x) => norm(x.key) === norm(q.name))?.key ??
+      null;
+    const probe: FilterRow = {
+      rank: old?.rank ?? filters.length + 1,
+      tier: old?.tier ?? "Tier 1",
+      name: old?.name ?? q.name,
+      ui_pattern: values.length <= 4 ? "single-select" : "multi-select checkboxes",
+      values,
+      confidence: old?.confidence ?? "Low",
+      rationale: old?.rationale ?? "",
+      linked_listing_spec: spec,
+      linked_dimension: old?.linked_dimension ?? null,
+    };
+    const w = buildWork(probe, ev, null);
+    const label =
+      from === "live" ? `the live ISQ "${q.name}"` : `the category document's "${q.name}"`;
+    w.items = listItems(w, values, from, label);
+    // A source the MCAT's name fixes still holds ("Electric Rotary Rack Oven": no "Gas").
+    fixedSource(w, mcat);
+    if (w.items.length < MIN_VALUES) continue;
+    // Another ISQ already shows these values (the document's "Flavour Configuration" beside "Number of Flavors").
+    const shownKeys = new Set(
+      filters
+        .filter((f) => f.selected)
+        .flatMap((f) => (f.selected_values ?? []).map((v) => valueKey(v))),
+    );
+    if (w.items.filter((it) => shownKeys.has(valueKey(it.vc.value))).length >= 2) continue;
+    // A live ISQ keeps its own order; the document's values are listed best first.
+    if (from === "live") w.fromLive = q.name;
+    const all = ordered(w, w.items);
+    const row = old ?? probe;
+    row.values = all.map((it) => it.vc.value);
+    row.value_confidence = all.map((it) => it.vc);
+    row.selected_values = shown(w).map((it) => it.vc.value);
+    row.selected = true;
+    row.ui_pattern = probe.ui_pattern;
+    row.added_from = from;
+    row.isq_note = `Added: ${mcat || "this MCAT"} showed fewer than ${MIN_SHOWN_ISQS} ISQs, so this one is taken from ${label}.`;
+    if (spec) row.linked_listing_spec = spec;
+    if (w.shape) row.unit = w.shape.unit;
+    else delete row.unit;
+    delete row.select_note;
+    if (!old) filters.push(row);
+    taken.push(row.name);
+    added.push(`${row.name} (from ${label})`);
+    need--;
+  }
+  if (added.length)
+    notes.push(
+      `${mcat || "This MCAT"} showed fewer than ${MIN_SHOWN_ISQS} ISQs: added ${added.join(", ")}.`,
+    );
+}
+
 export function checkSelection(filters: FilterRow[]): string[] {
   const failed: string[] = [];
   const picked = filters.filter((f) => f.selected);
-  const tier1Strong = picked.filter((f) => f.tier === "Tier 1" && f.confidence !== "Low");
 
   for (const f of picked) {
     const name = `"${f.name}"`;
@@ -912,12 +1513,9 @@ export function checkSelection(filters: FilterRow[]): string[] {
     if (f.tier === "Tier 3") failed.push(`${name} is Tier 3 but is shown.`);
     if (f.tier === "Tier 2" && f.confidence !== "High")
       failed.push(`${name} is Tier 2 with ${f.confidence} confidence but is shown.`);
-    if (tier1Strong.length >= STRONG_TIER1 && !tier1Strong.includes(f))
-      failed.push(`${name} is shown although ${tier1Strong.length} Tier 1 High / Medium ISQs are.`);
-    if (values.length < MIN_VALUES) failed.push(`${name} is shown with ${values.length} value(s).`);
-
+    // An ISQ with no High or Medium value shows its Low ones instead (it is shown whatever its values).
     const weak = values.filter((v) => level.get(v) !== "High" && level.get(v) !== "Medium");
-    if (weak.length)
+    if (weak.length && weak.length < values.length)
       failed.push(`${name} shows values that aren't High or Medium: ${weak.join(", ")}.`);
     const high = values.filter((v) => level.get(v) === "High").length;
     if (high >= HIGH_ONLY_AT && high < values.length)
@@ -925,7 +1523,7 @@ export function checkSelection(filters: FilterRow[]): string[] {
 
     // Measurements: every value a quantity, all of one kind, one unit and the same count of numbers; a
     // Length, Width or Height is always one number.
-    if (measureKind(f.name) && f.unit) {
+    if (f.unit) {
       const shapes = new Set<string>();
       for (const v of values) {
         const q = parseQuantity(v);
@@ -941,24 +1539,31 @@ export function checkSelection(filters: FilterRow[]): string[] {
     }
 
     // No duplicates: the same value twice, or (text) a generic beside its specific.
-    const measured = Boolean(measureKind(f.name) && f.unit);
+    const measured = Boolean(f.unit);
     const keys = values.map((v) => {
       const q = measured ? parseQuantity(v) : null;
       return q ? quantityKey(q) : valueKey(v);
     });
     const twice = values.filter((_, i) => keys.indexOf(keys[i]!) !== i);
     if (twice.length) failed.push(`${name} shows a value twice: ${twice.join(", ")}.`);
+    // A live ISQ's or the document's own options are a list someone made, not duplicates ("Automatic" beside
+    // "Semi Automatic").
+    const listed = new Set(
+      (f.value_confidence ?? [])
+        .filter((c) => c.source === "live" || c.source === "doc")
+        .map((c) => c.value),
+    );
     if (!measured)
       for (const a of values)
         for (const b of values)
-          if (a !== b && isGenericOf(a, b))
+          if (a !== b && !listed.has(a) && isGenericOf(a, b))
             failed.push(`${name} shows "${a}" beside the more specific "${b}".`);
   }
 
   // No value under two text ISQs.
   const seen = new Map<string, string>();
   for (const f of picked) {
-    if (measureKind(f.name) && f.unit) continue;
+    if (f.unit) continue;
     for (const v of f.selected_values ?? []) {
       const k = valueKey(v);
       if (seen.has(k) && seen.get(k) !== f.name)

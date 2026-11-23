@@ -1,17 +1,23 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- model replies are untyped JSON and are normalised field by field */
 import {
   aggregate,
-  alignAutoLabels,
-  autoLabels,
   dimensionCandidates,
   flattenListing,
   heuristicFieldMap,
   mineTerms,
+  LISTING_SAMPLE,
+  NO_UNIT,
+  normalizeQuery,
+  numberLabels,
   profileListings,
+  sampleRows,
+  THIN_LISTINGS,
+  SELLER_CITY,
   SOURCE_LABEL,
   specSummary,
   termsForModel,
   toKeywordTable,
+  unitGroups,
   type Aggregation,
   type DimensionStats,
   type KeywordTable,
@@ -23,6 +29,7 @@ import {
   type TermMining,
   type TermStat,
   type DimensionCandidates,
+  type UnitGroup,
 } from "./data";
 import {
   ContextLimitError,
@@ -49,22 +56,34 @@ import {
 } from "./prompts";
 import type { DimensionSpec, ValueRange } from "./ranges";
 import {
+  docContextText,
   docEntryFor,
   docFromAuditMarkdown,
   measurementPairs,
   parseCategoryDoc,
   parseDocPairs,
+  rankingText,
   type DocMcat,
 } from "./category-doc";
-import { isExcludedIsq, isqsNeedingDoc, selectIsqs } from "./select-isqs";
+import {
+  figureUnitOf,
+  isExcludedIsq,
+  isqsNeedingDoc,
+  PLACE_NAME,
+  PRICE_NAME,
+  selectIsqs,
+} from "./select-isqs";
 import type { ContextComparison } from "./compare";
 import {
   MIN_MCAT_KEYWORDS,
   describeKeywordSelection,
   mcatIdentity,
+  nameTokens,
+  rowsTaggedFor,
   selectMcatKeywords,
   splitByMcat,
   withMcatIdentity,
+  type KeywordSelection,
   type McatScope,
 } from "./mcats";
 import { valueConfidence, type ValueConfidence } from "./value-confidence";
@@ -105,6 +124,11 @@ export interface FilterRow {
    */
   selected?: boolean;
   select_note?: string;
+  /**
+   * Shown because the MCAT had too few ISQs (skill 15, fillThin): its values come from the live ISQ in input 4
+   * ("live") or the category document ("doc"), whatever the model's tier for it was.
+   */
+  added_from?: "live" | "doc";
   /** The values shown for this ISQ, best first: High and Medium only (only High when there are 4 or more). */
   selected_values?: string[];
   /** The category document's ISQ this one used, for thin values or as a measurement's reference. */
@@ -172,6 +196,8 @@ export interface PipelineInputs {
   separateMcats?: boolean;
   /** Set on the inputs of one MCAT's run (by splitByMcat): which MCAT it is and what its evidence is. */
   mcat?: McatScope;
+  /** Set when `specs` is the MCAT's live ISQs in their seller-form order, not a category manager's ranking. */
+  rankingFrom?: "live-isqs";
 }
 
 export type { StageId };
@@ -225,14 +251,13 @@ function labelSplit(mining: TermMining | null, modelLabels: TermLabel[]): StepSp
   const demandOf = (t: TermStat) =>
     Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0);
   // mining.terms is already ranked by demand share, highest first.
-  const eligible = mining.terms.filter((t) => t.auto !== "skip");
-  eligible.forEach((t, i) => {
+  mining.terms.forEach((t, i) => {
     if (i >= LABEL_SCOPE) {
       terms.outside++;
       demand.outside += demandOf(t);
       return;
     }
-    const who = t.auto ? "code" : byModel.has(t.term) ? "model" : "none";
+    const who = byModel.has(t.term) ? "model" : "none";
     terms[who]++;
     demand[who] += demandOf(t);
   });
@@ -241,22 +266,25 @@ function labelSplit(mining: TermMining | null, modelLabels: TermLabel[]): StepSp
 
 /**
  * The terms nobody labelled, highest search demand first, with why: never sent to the model (past its
- * term cap), or sent but the model gave no label. Shown in the label step's "See the working".
+ * term or unit cap), or sent but the model gave no label. Shown in the label step's "See the working".
  */
 function unlabelledReport(
   mining: TermMining | null,
   sent: TermStat[],
+  units: UnitGroup[],
   modelLabels: TermLabel[],
 ): string {
   if (!mining) return "";
   const sentSet = new Set(sent.map((t) => t.term));
+  const sentUnits = new Set(units.map((u) => u.unit));
+  for (const t of mining.terms) if (t.number && sentUnits.has(t.number.unit)) sentSet.add(t.term);
   const labelled = new Set(modelLabels.map((l) => l.term));
   const rows = mining.terms
-    .filter((t) => !t.auto && !labelled.has(t.term))
+    .filter((t) => !labelled.has(t.term))
     .map((t) => ({
       term: t.term,
       demand: Object.values(t.bySource).reduce((s, x) => s + (x?.demand ?? 0), 0),
-      why: sentSet.has(t.term) ? "sent, model gave no label" : "not sent (over the term cap)",
+      why: sentSet.has(t.term) ? "sent, model gave no label" : "not sent (over the cap)",
     }))
     .sort((a, b) => b.demand - a.demand);
   if (!rows.length) return "";
@@ -328,14 +356,14 @@ export const INITIAL_STEPS: Step[] = [
     id: "prepare",
     label: "Read & total the data",
     description:
-      "Reads every input, finds the keyword and listing columns, mines search terms and labels price words, places and sizes itself. No model involved.",
+      "Reads every input, finds the keyword and listing columns, mines search terms and groups the numbers typed in them by the word after them (150 cc, 60 V). No model involved.",
     status: "pending",
   },
   {
     id: "label",
     label: "Label keyword terms",
     description:
-      "Sends only the terms code couldn't label to the model, which maps each one to a dimension and value using the category's own spec names.",
+      "Sends the mined terms to the model, which maps each one to a dimension and value using the category's own spec names, and says once per unit word what its numbers measure.",
     status: "pending",
   },
   {
@@ -378,8 +406,10 @@ export function messagesText(messages: ChatMessage[]): string {
 export interface Prepared {
   tables: KeywordTable[];
   mining: TermMining | null;
-  /** Terms code couldn't label itself — the only ones sent to the model. */
+  /** The terms the model labels one by one (the top ones by demand). */
   modelTerms: TermStat[];
+  /** The number terms grouped by unit word: the model says once per unit what its numbers measure. */
+  units: UnitGroup[];
   flatListings: Record<string, string>[];
   /** Code-only field roles / canonical spec names for every source field. */
   fieldMap: Map<string, string>;
@@ -392,21 +422,53 @@ export interface Prepared {
 }
 
 export function prepare(inputs: PipelineInputs): Prepared {
-  const allTables = [
-    toKeywordTable(inputs.internalRows, "internal"),
-    toKeywordTable(inputs.serpRows, "serp"),
-  ].filter((t): t is KeywordTable => t !== null && t.rows.length > 0);
-  // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, picked
-  // here in code, so the terms, labels, coverage and shares below are all that MCAT's own.
-  const picked = inputs.mcat ? selectMcatKeywords(allTables, inputs.mcat) : null;
-  const tables = picked ? picked.tables : allTables;
-  const mining = tables.length ? mineTerms(tables) : null;
-  const flatListings = inputs.listingRows.slice(0, 500).map((r) => flattenListing(r));
+  const who = inputs.mcat ?? mcatIdentity(inputs.listingRows, inputs.context);
+  // The keyword files are common to all MCATs: one MCAT works only on the keywords about it, so the terms,
+  // labels, coverage and shares below are all that MCAT's own. A file that tags each keyword with its MCAT
+  // (SERP exports have an MCAT ID column) is cut by that column; the others by words (selectMcatKeywords).
+  const tables: KeywordTable[] = [];
+  const untagged: KeywordTable[] = [];
+  const selection: KeywordSelection[] = [];
+  for (const [source, rows] of [
+    ["internal", inputs.internalRows],
+    ["serp", inputs.serpRows],
+  ] as const) {
+    const all = toKeywordTable(rows, source);
+    if (!all?.rows.length) continue;
+    const tagged = rowsTaggedFor(rows, who, Boolean(inputs.mcat));
+    if (!tagged) {
+      untagged.push(all);
+      continue;
+    }
+    const mine = toKeywordTable(tagged, source);
+    const n = mine?.rows.length ?? 0;
+    const used = inputs.mcat ? n >= MIN_MCAT_KEYWORDS : n > 0;
+    if (mine && used) tables.push(mine);
+    selection.push({
+      source,
+      selected: n,
+      total: all.rows.length,
+      demandPct: Math.round(((mine?.totalDemand ?? 0) / Math.max(all.totalDemand, 1)) * 1000) / 10,
+      used,
+      byColumn: true,
+    });
+  }
+  const picked = inputs.mcat ? selectMcatKeywords(untagged, inputs.mcat) : null;
+  tables.push(...(picked ? picked.tables : untagged));
+  selection.push(...(picked?.selection ?? []));
+  // Keep the sources in one order (internal search, then SERP) however they were picked.
+  tables.sort((a, b) => Number(a.source === "serp") - Number(b.source === "serp"));
+  selection.sort((a, b) => Number(a.source === "serp") - Number(b.source === "serp"));
+  // The category's own name words: only these can be core words, so "price" or a city never is.
+  const names = [who?.name, who?.pmcat?.name].flatMap((n) => (n ? nameTokens(n) : []));
+  const mining = tables.length ? mineTerms(tables, undefined, names) : null;
+  const flatListings = sampleRows(inputs.listingRows).map((r) => flattenListing(r));
   const fieldMap = heuristicFieldMap(flatListings);
   return {
     tables,
     mining,
     modelTerms: mining ? termsForModel(mining) : [],
+    units: mining ? unitGroups(mining) : [],
     flatListings,
     fieldMap,
     specs: specSummary(flatListings, fieldMap),
@@ -415,7 +477,7 @@ export function prepare(inputs: PipelineInputs): Prepared {
       flatListings.length ? profileListings(flatListings, fieldMap) : null,
     ),
     context: inputs.context,
-    mcat: inputs.mcat && picked ? { ...inputs.mcat, keywordSelection: picked.selection } : null,
+    mcat: inputs.mcat ? { ...inputs.mcat, keywordSelection: selection } : null,
   };
 }
 
@@ -441,6 +503,7 @@ function labelMessages(
         prep.context,
         budget,
         prep.mcat,
+        prep.units,
       ).concat(note ? "\n\n" + note : ""),
     },
   ];
@@ -488,10 +551,13 @@ const STEP_NAME = {
  * The category document (skill 15), pasted or uploaded as JSON into input 3 (or input 4): this run's MCAT in
  * it. The JSON is kept out of the model's prompt (it is only for thin ISQs and measurements), so that input is
  * emptied; audit markdown in input 3 stays as it is and its "Buyer Attracting Seller Specs" table is read from it.
+ * With the document in input 3, JSON in input 4 (the live ISQs) becomes this MCAT's ranking: its ISQ names in order.
  */
 function withCategoryDoc(inputs: PipelineInputs): {
   inputs: PipelineInputs;
   doc: DocMcat | null;
+  /** This MCAT's live ISQs (input 4 as JSON beside the document): cluttered text ISQs take their values. */
+  live: DocMcat | null;
   note: string | null;
 } {
   const who = inputs.mcat
@@ -500,18 +566,37 @@ function withCategoryDoc(inputs: PipelineInputs): {
   // The document is looked for in input 3 first, then in input 4: wherever it was pasted, it is recognised
   // by what it holds (MCATs with their ISQs and values), and that input is then not read as text.
   const inContext = parseCategoryDoc(inputs.context);
-  const inSpecs = inContext ? null : parseCategoryDoc(inputs.specs);
+  const specsJson = parseCategoryDoc(inputs.specs);
+  const inSpecs = inContext ? null : specsJson;
   const list = inContext ?? inSpecs;
-  if (!list) return { inputs, doc: docFromAuditMarkdown(inputs.context, who), note: null };
-  const doc = docEntryFor(list, who);
   const label =
     `${who?.name ?? ""}${who?.id ? ` (MCAT ID ${who.id})` : ""}`.trim() || "this run's MCAT";
+  // Input 3 is the document and input 4 is JSON too (the live ISQs, say): input 4 is this MCAT's ranking, as
+  // its ISQ names in order, so the model and the ranking reader see a plain ranked list, not JSON.
+  const ranked = inContext && specsJson ? docEntryFor(specsJson, who) : null;
+  const rankingNote =
+    inContext && specsJson && !ranked?.isqs.length
+      ? `Ranking: input 4 lists ${specsJson.length} MCAT(s) but no ISQs for ${label}, so this run has no ranking.`
+      : null;
+  const specs =
+    inContext && specsJson
+      ? { specs: ranked ? rankingText(ranked) : "", rankingFrom: "live-isqs" as const }
+      : {};
+  if (!list)
+    return { inputs, doc: docFromAuditMarkdown(inputs.context, who), live: null, note: null };
+  const doc = docEntryFor(list, who);
+  const docNote = doc
+    ? null
+    : `Category document: input ${inContext ? 3 : 4} lists ${list.length} MCAT(s) but not ${label}, so its thin ISQs and measurements were not checked against it.`;
   return {
-    inputs: { ...inputs, ...(inContext ? { context: "" } : { specs: "" }) },
+    // The document's notes on this MCAT (why buyers choose its specs) are the context the design step reads.
+    inputs: {
+      ...inputs,
+      ...(inContext ? { context: docContextText(inputs.context, who), ...specs } : { specs: "" }),
+    },
     doc,
-    note: doc
-      ? null
-      : `Category document: input ${inContext ? 3 : 4} lists ${list.length} MCAT(s) but not ${label}, so its thin ISQs and measurements were not checked against it.`,
+    live: ranked?.isqs.length ? ranked : null,
+    note: [docNote, rankingNote].filter(Boolean).join(" ") || null,
   };
 }
 
@@ -531,7 +616,7 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
   const prep = prepare(inputs);
   const include = prep.mcat ? MCAT_SKILLS : null;
   const out: PromptRecord[] = [];
-  if (prep.modelTerms.length) {
+  if (prep.modelTerms.length || prep.units.length) {
     out.push({
       id: "label",
       stage: "label",
@@ -548,7 +633,6 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
       messages: fieldMessages(prep),
     });
   }
-  const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
   out.push({
     id: "design",
     stage: "design",
@@ -565,10 +649,12 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
           category: null,
           tables: prep.tables,
           mining: prep.mining,
-          // Preview with the labels code already knows; step 1's labels are added at run time.
-          aggregation: auto.length ? aggregate(prep.tables, auto) : null,
+          // The dimension tables need the terms labelled in step 1, so the preview shows the raw terms.
+          aggregation: null,
           context: inputs.context,
           specs: inputs.specs,
+          ...(inputs.rankingFrom ? { rankingFrom: inputs.rankingFrom } : {}),
+          ...(inputs.rankingFrom ? { rankingFrom: inputs.rankingFrom } : {}),
           listing: prep.flatListings.length
             ? profileListings(prep.flatListings, prep.fieldMap)
             : null,
@@ -576,8 +662,8 @@ export function previewPrompts(rawInputs: PipelineInputs): PromptRecord[] {
           uiDesign: inputs.uiDesign !== false,
           mcat: prep.mcat,
         }).concat(
-          prep.modelTerms.length
-            ? "\n\n[Preview: at run time the dimension tables also include the dimensions labelled in step 1.]"
+          prep.mining
+            ? "\n\n[Preview: at run time the raw terms above are replaced by dimension tables built from the terms labelled in step 1.]"
             : "",
         ),
       },
@@ -619,14 +705,19 @@ function remember(key: string, value: unknown) {
 
 // ───────────────────────────── parsing model answers ─────────────────────────────
 
-/** {"dimensions": {"Material": {"PUF": ["puf","puff"]}}} → labels (older [[term, dim, value]] also accepted). */
+/**
+ * {"dimensions": {"Material": {"PUF": ["puf","puff"]}}} → labels (older [[term, dim, value]] also accepted). The
+ * model's term is written the way the sent terms were ("Near me" → "near-me", "10 x 12" → "10x12") before it is
+ * matched, so a label isn't lost over spacing or case.
+ */
 export function parseLabels(data: any, known: Set<string>): TermLabel[] {
   const out: TermLabel[] = [];
   const push = (term: unknown, dimension: unknown, value: unknown) => {
     if (typeof term !== "string" || typeof dimension !== "string" || typeof value !== "string")
       return;
-    const t = term.toLowerCase().trim();
-    if (known.has(t) && dimension.trim() && value.trim())
+    const t = normalizeQuery(term);
+    // One term, one label (rule 4): a term listed twice ("near" under two cities) keeps its first.
+    if (known.has(t) && dimension.trim() && value.trim() && !out.some((l) => l.term === t))
       out.push({ term: t, dimension: dimension.trim(), value: value.trim() });
   };
   const dims = data?.dimensions;
@@ -647,29 +738,187 @@ export function parseLabels(data: any, known: Set<string>): TermLabel[] {
   return out;
 }
 
-/** Apply {"merge": {...}, "drop": [...]} from the model on top of the code-only field map. */
+/** `short`'s letters appear in `long` in order: "l" in "ltr", "v" in "volt". */
+const inOrder = (short: string, long: string) => {
+  let i = 0;
+  for (const c of long) if (c === short[i]) i++;
+  return i === short.length;
+};
+
+/** At most one letter changed, added or dropped. */
+/** Letters changed, added or dropped to turn `a` into `b`. */
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++)
+      cur[j] = Math.min(
+        prev[j]! + 1,
+        cur[j - 1]! + 1,
+        prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+/**
+ * The model's unit is the typed word in its standard spelling, not another unit: one inside the other ("ltr" /
+ * "L", "v" / "volt"), or the same first letter and at most two letters off ("dack" / "Deck", "litter" / "Litre").
+ * "cc" / "kg" is neither.
+ */
+const respelled = (a: string, b: string) =>
+  inOrder(a, b) || inOrder(b, a) || (a[0] === b[0] && editDistance(a, b) <= 2);
+
+/**
+ * {"units": {"cc": {"dimension": "Engine Displacement", "unit": "cc"}}} → what each unit word's numbers measure.
+ * Only units that were sent count. The unit may be respelled ("v" → "V", "ltr" → "L", "dack" → "Deck") or
+ * left out when the word isn't one ("2024 model" → "2024"), but not swapped for another ("cc" → "kg" falls back to
+ * "cc"); sizes typed without a unit get none.
+ */
+export function parseUnits(
+  data: any,
+  groups: UnitGroup[],
+): Map<string, { dimension: string; unit: string }> {
+  const out = new Map<string, { dimension: string; unit: string }>();
+  const sent = new Set(groups.map((g) => g.unit));
+  const units = data?.units;
+  if (!units || typeof units !== "object" || Array.isArray(units)) return out;
+  const letters = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{M}]/gu, "");
+  for (const [key, v] of Object.entries(units as Record<string, any>)) {
+    const typed = key.trim() === NO_UNIT ? "" : key.trim().toLowerCase();
+    const dimension = typeof v?.dimension === "string" ? v.dimension.trim() : "";
+    if (!sent.has(typed) || out.has(typed) || !dimension) continue;
+    const written = typeof v?.unit === "string" ? v.unit.trim() : null;
+    const a = letters(written ?? "");
+    // Another unit than the word typed is never taken, and the answer is dropped: "160 white" → "cc" or
+    // "150 cc" → "kg" would write the numbers in a unit nobody typed, or under the wrong word. A word typed in
+    // another script is taken in its Latin spelling ("केवी" → "kV").
+    if (written !== null && a && /[a-z]/.test(typed) && !respelled(a, typed)) continue;
+    const unit = written === null ? typed : !a ? "" : written;
+    out.set(typed, { dimension, unit: typed ? unit : "" });
+  }
+  // Typos of one unit under one dimension ("deck", "dack", "dec") are written the way the highest-demand one is,
+  // whether or not the model fixed each: one unit, one spelling. Groups come highest demand first.
+  const first = new Map<string, string>();
+  for (const g of groups) {
+    const u = out.get(g.unit);
+    if (!u?.unit) continue;
+    const dim = u.dimension.toLowerCase();
+    const main = first.get(dim);
+    if (main === undefined) first.set(dim, u.unit);
+    else if (sameUnit(letters(u.unit), letters(main)) || sameUnit(g.unit, letters(main)))
+      u.unit = main;
+  }
+  return out;
+}
+
+/**
+ * Two spellings of one unit, strictly: the same first letter and one letter off ("dec" / "deck", "try" / "tray",
+ * "fit" / "ft"), two for longer words ("litter" / "litre") or when the last letter is the same too ("ft" / "feet" /
+ * "foot"). One-letter units and pairs like "kw" / "kva", "sqft" / "ft", "mm" / "m" stay apart.
+ */
+const sameUnit = (a: string, b: string) => {
+  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;
+  const d = editDistance(a, b);
+  return d <= (Math.min(a.length, b.length) <= 3 ? 1 : 2) || (a.at(-1) === b.at(-1) && d <= 2);
+};
+
+/**
+ * Apply {"merge": {...}, "drop": [...]} from the model on top of the code-only field map. Two names a listing
+ * fills with different values are two attributes, not one written two ways ("Material: MS" and "Insulation
+ * Material: PUF" on one cabin): such a name is left out of the merge. The seller's city is the code's own.
+ */
 export function applySpecMerges(
   fieldMap: Map<string, string>,
   data: any,
+  flat: Record<string, string>[] = [],
 ): { map: Map<string, string>; changes: number } {
+  // Per spec name (lower case), each listing's value.
+  const values = new Map<string, Map<number, string>>();
+  flat.forEach((rec, i) => {
+    for (const [k, v] of Object.entries(rec)) {
+      const role = fieldMap.get(k)?.toLowerCase();
+      if (!role || role.startsWith("@")) continue;
+      let byListing = values.get(role);
+      if (!byListing) values.set(role, (byListing = new Map()));
+      if (!byListing.has(i)) byListing.set(i, v.trim().toLowerCase());
+    }
+  });
+  // One value written two ways is still one value: "220V" / "220 V", "Horizontal" / "Horizontally Cylindrical".
+  const sameValue = (x: string, y: string) => {
+    const [a, b] = [x, y].map((s) => s.replace(/[^\p{L}\p{N}]/gu, ""));
+    const short = a!.length < b!.length ? a! : b!;
+    return a === b || (short.length >= 3 && (a!.includes(b!) || b!.includes(a!)));
+  };
+  const apart = (a: string, b: string) => {
+    const va = values.get(a);
+    const vb = values.get(b);
+    if (!va || !vb) return false;
+    let differ = 0;
+    for (const [i, v] of va) if (vb.has(i) && !sameValue(vb.get(i)!, v)) differ++;
+    return differ > 0 && differ * 10 >= Math.min(va.size, vb.size);
+  };
+
+  // The listings' own spec names, as written: a merge keeps one of them (sellers' ISQ names, which later
+  // steps match to the category document and live ISQs by name), never a new name.
+  const written = new Map<string, string>();
+  for (const role of fieldMap.values())
+    if (!role.startsWith("@")) written.set(role.toLowerCase(), role);
   const rename = new Map<string, string>();
   let changes = 0;
   const merge = data?.merge && typeof data.merge === "object" ? data.merge : {};
   for (const [target, sources] of Object.entries(merge as Record<string, unknown>)) {
-    if (!target.trim()) continue;
-    for (const src of Array.isArray(sources) ? sources : [])
-      if (typeof src === "string") rename.set(src.toLowerCase(), target.trim());
+    if (!target.trim() || !Array.isArray(sources)) continue;
+    // Most-filled name first; each next one joins only if no name already in the group is apart from it.
+    const names = sources
+      .filter((s): s is string => typeof s === "string" && written.has(s.toLowerCase()))
+      .map((s) => s.toLowerCase())
+      .sort((a, b) => (values.get(b)?.size ?? 0) - (values.get(a)?.size ?? 0));
+    const group: string[] = [];
+    for (const name of names) if (!group.some((g) => apart(g, name))) group.push(name);
+    // The model's name when it is one of the listings' names, else the group's most-filled name.
+    const keep = written.get(target.trim().toLowerCase()) ?? written.get(group[0] ?? "");
+    if (keep) for (const name of group) rename.set(name, keep);
   }
   for (const d of Array.isArray(data?.drop) ? data.drop : [])
     if (typeof d === "string") rename.set(d.toLowerCase(), "@ignore");
 
   const map = new Map<string, string>();
   for (const [key, role] of fieldMap) {
-    const next = role.startsWith("@") ? role : (rename.get(role.toLowerCase()) ?? role);
+    const next =
+      role.startsWith("@") || role === SELLER_CITY
+        ? role
+        : (rename.get(role.toLowerCase()) ?? role);
     if (next !== role) changes++;
     map.set(key, next);
   }
   return { map, changes };
+}
+
+/**
+ * Spec names the merge renamed, old (lower case) → new: only names whose every source field went to one other
+ * spec name ("Scooter Brand" → "Brand"); a dropped or split name keeps its own.
+ */
+export function specRenames(
+  before: Map<string, string>,
+  after: Map<string, string>,
+): Map<string, string> {
+  const to = new Map<string, Set<string>>();
+  for (const [key, role] of before) {
+    if (role.startsWith("@")) continue;
+    const next = after.get(key) ?? role;
+    let set = to.get(role.toLowerCase());
+    if (!set) to.set(role.toLowerCase(), (set = new Set()));
+    set.add(next);
+  }
+  const out = new Map<string, string>();
+  for (const [role, set] of to) {
+    const [next] = set;
+    if (set.size === 1 && !next!.startsWith("@") && next!.toLowerCase() !== role)
+      out.set(role, next!);
+  }
+  return out;
 }
 
 // ───────────────────────────── normalise, link evidence, fix ─────────────────────────────
@@ -680,6 +929,53 @@ interface RawLinks {
   dimension: string | null;
   listing_spec: string | null;
   backing: string[];
+}
+
+/**
+ * The design prompt's own rules (skills 08, 10, 12), checked on the model's answer before code fixes anything:
+ * across thousands of MCATs, a panel that broke one says so in its warnings instead of waiting to be read.
+ */
+export function designChecks(
+  result: FilterResult,
+  links: RawLinks[],
+  mcat: { name: string; siblings: string[] } | null,
+): string[] {
+  const out: string[] = [];
+  const f = result.filters;
+  if (f.length > 6) out.push(`${f.length} filters returned; the limit is 6.`);
+  const t1 = f.filter((x) => x.tier === "Tier 1").length;
+  if (t1 < 3 || t1 > 4) out.push(`Tier 1 has ${t1} filter(s); it should have 3–4.`);
+  for (const x of f.filter((x) => isExcludedIsq(x.name)))
+    out.push(`"${x.name}" is a price or location filter, which the panel never has.`);
+  const others = new Set((mcat?.siblings ?? []).map(norm));
+  for (const x of f.filter((x) => others.has(norm(x.name))))
+    out.push(`"${x.name}" is the name of another MCAT, not a filter of this one.`);
+  // One attribute, one filter (skill 08 step 2).
+  for (const key of ["dimension", "listing_spec"] as const) {
+    const seen = new Map<string, string>();
+    links.forEach((l, i) => {
+      const v = l[key] ? norm(l[key]!) : "";
+      if (!v || !f[i]) return;
+      const first = seen.get(v);
+      if (first) out.push(`"${first}" and "${f[i]!.name}" both stand for "${l[key]}".`);
+      else seen.set(v, f[i]!.name);
+    });
+  }
+  links.forEach((l, i) => {
+    if (f[i] && !l.dimension && !l.listing_spec && !l.backing.length)
+      out.push(
+        `"${f[i]!.name}" is linked to no evidence (no dimension, listing spec, context or ranking).`,
+      );
+  });
+  const named = (text: string) => f.some((x) => text.toLowerCase().includes(x.name.toLowerCase()));
+  for (const r of (result.interaction_rules ?? []).filter((r) => !named(r)))
+    out.push(`Interaction rule names no filter of this panel: "${r.slice(0, 80)}".`);
+  const blockers = result.blockers ?? [];
+  for (const x of f.filter(
+    (x) => x.needs_new_isq && !blockers.some((b) => b.toLowerCase().includes(x.name.toLowerCase())),
+  ))
+    out.push(`"${x.name}" needs a new ISQ but no blocker names it.`);
+  return out;
 }
 
 function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } {
@@ -721,7 +1017,8 @@ function normalizeResult(raw: any): { result: FilterResult; links: RawLinks[] } 
   return { result, links };
 }
 
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+// Letters and digits of any script: a spec or value written in Hindi has a name too.
+const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 
 const OTHER_FLOOR_PCT = 3; // values below this share of a dimension fold into "Other" (never for Location)
 const MAX_DEFAULT_OPTIONS = 8;
@@ -771,24 +1068,40 @@ function deriveOptions(
     };
   }
 
-  let values: string[];
-  if (dim && dim.values.length) {
-    const total = dim.values.reduce(
-      (s, v) => s + Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0),
-      0,
-    );
-    const kept: string[] = [];
-    let folded = false;
-    for (const v of dim.values) {
-      const demand = Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0);
-      const share = total > 0 ? (demand / total) * 100 : 0;
-      if (kept.length < MAX_DEFAULT_OPTIONS && share >= OTHER_FLOOR_PCT) kept.push(v.value);
-      else folded = true;
-    }
-    values = folded ? [...kept, "Other"] : kept;
-  } else {
-    values = (spec?.top ?? []).slice(0, MAX_DEFAULT_OPTIONS).map(([v]) => v);
+  // Options from both sides: what buyers typed (the keyword dimension's values, by share of its demand) and
+  // what sellers list (the spec's values, by share of the listings that fill it). A value only the keywords
+  // name may have no listing to show; one only listings use is still a real choice. One option written two
+  // ways keeps the keyword's label and the larger share; the biggest MAX_DEFAULT_OPTIONS stay, the rest
+  // fold into "Other".
+  const options = new Map<string, { label: string; share: number }>();
+  const offer = (label: string, share: number) => {
+    const k = norm(label).replace(/s$/, "");
+    if (!k) return;
+    // A seller's typo of an option already there is that option ("Gaurd Room" / "Guard Room"); options whose
+    // numbers differ never are ("Model A1" / "Model A2").
+    const same =
+      options.get(k) ??
+      [...options].find(
+        ([o]) =>
+          k.length >= 6 &&
+          o[0] === k[0] &&
+          o.replace(/\D/g, "") === k.replace(/\D/g, "") &&
+          editDistance(o, k) <= (Math.min(o.length, k.length) >= 8 ? 2 : 1),
+      )?.[1];
+    if (same) same.share = Math.max(same.share, share);
+    else options.set(k, { label, share });
+  };
+  if (dim?.values.length) {
+    const demandOf = (v: (typeof dim.values)[number]) =>
+      Math.max(...Object.values(v.bySource).map((b) => b?.demand ?? 0), 0);
+    const total = dim.values.reduce((s, v) => s + demandOf(v), 0);
+    for (const v of dim.values) offer(v.value, total > 0 ? (demandOf(v) / total) * 100 : 0);
   }
+  if (spec?.filled) for (const [v, n] of spec.all ?? spec.top) offer(v, (n / spec.filled) * 100);
+  const ranked = [...options.values()].sort((a, b) => b.share - a.share);
+  const kept = ranked.filter((o) => o.share >= OTHER_FLOOR_PCT).slice(0, MAX_DEFAULT_OPTIONS);
+  let values = kept.map((o) => o.label);
+  if (kept.length < ranked.length) values = [...values, "Other"];
   const numeric = values.length > 0 && values.every((v) => /^\d+(\.\d+)?\s*[a-z%]*$/i.test(v));
   const ui_pattern =
     values.length <= 1
@@ -831,11 +1144,11 @@ export function attachEvidence(
       );
     spec ??= specs.get(norm(f.name));
     // Location filters are served by the seller-city field, whatever the filter is called.
-    const isPlace = /city|location|near ?me/i.test(`${f.name} ${link.dimension ?? ""}`);
+    const isPlace = PLACE_NAME.test(`${f.name} ${link.dimension ?? ""}`);
     if (!spec && isPlace)
       spec = (listing?.fields ?? []).find((x) => /\b(city|location)\b/i.test(x.key));
     // Price comes from the listings' price field, not from a spec.
-    const isPrice = /price|budget|cost/i.test(`${f.name} ${link.dimension ?? ""}`);
+    const isPrice = PRICE_NAME.test(`${f.name} ${link.dimension ?? ""}`);
 
     // "values"/"ui_pattern" are no longer asked of the model (fewer output tokens, faster runs):
     // code derives them from the same evidence the model linked to. A model that still sends its
@@ -881,6 +1194,8 @@ export function attachEvidence(
 const MAX_OPTIONS = 12;
 /** Filters shown in a panel, across all tiers: more than this is noise for a buyer (and for a reviewer). */
 export const MAX_FILTERS = 6;
+/** Always-visible filters: the 3–4 buyers shortlist with (skill 08). */
+const MAX_TIER1 = 4;
 /** AI-suggested ISQ values shown beside a filter's real values (see `FilterRow.ai_values`). */
 const MAX_AI_VALUES = 6;
 
@@ -951,13 +1266,13 @@ export function fixResult(
       warnings.push(`The rationale for "${f.name}" cites no evidence.`);
   }
 
-  // Tier 1 size: 3–5.
+  // Tier 1 size: 3–4, as the design prompt asks (skill 08).
   const t1 = byTier("Tier 1");
-  if (t1.length > 5) {
-    for (const f of t1.slice(5)) f.tier = "Tier 2";
+  if (t1.length > MAX_TIER1) {
+    for (const f of t1.slice(MAX_TIER1)) f.tier = "Tier 2";
     fixes.push(
       `Tier 1 had ${t1.length} filters; moved ${t1
-        .slice(5)
+        .slice(MAX_TIER1)
         .map((f) => `"${f.name}"`)
         .join(", ")} to Tier 2.`,
     );
@@ -1041,7 +1356,7 @@ export async function runPipeline(
 ): Promise<PipelineRun> {
   const { onStep, signal } = hooks;
   // Input 3 as the category document: this MCAT's entry, used only by the select step (skill 15).
-  const { inputs, doc, note: docNote } = withCategoryDoc(rawInputs);
+  const { inputs, doc, live, note: docNote } = withCategoryDoc(rawInputs);
   const from = hooks.from;
   // Re-running from a step asks the model afresh for that step (from "prepare": for every step).
   // Labelling and spec merging don't depend on each other; the design step is always asked afresh
@@ -1071,7 +1386,12 @@ export async function runPipeline(
   step("prepare", "running");
   const prep = prepare(inputs);
   const kwCount = prep.tables.reduce((s, t) => s + t.rows.length, 0);
-  const auto = prep.mining ? alignAutoLabels(autoLabels(prep.mining), prep.dims) : [];
+  const numberCount = prep.units.reduce((s, u) => s + u.amounts.length, 0);
+  // A run of several MCATs says this in each MCAT's notes (splitByMcat).
+  if (!prep.mcat && prep.flatListings.length && prep.flatListings.length < THIN_LISTINGS)
+    warnings.push(
+      `Listings: only ${prep.flatListings.length} listing(s), so fill rates and common values are rough.`,
+    );
   if (prep.mcat) {
     warnings.push(...prep.mcat.notes);
     const sel = prep.mcat.keywordSelection ?? [];
@@ -1093,8 +1413,9 @@ export async function runPipeline(
       if (bySource("serp")) stats.push({ label: "SERP keywords", value: bySource("serp") });
       stats.push(
         { label: "terms mined", value: prep.mining?.terms.length ?? 0 },
-        { label: "labelled by code", value: auto.length },
         { label: "terms for the model", value: prep.modelTerms.length },
+        { label: "number terms", value: numberCount },
+        { label: "unit words", value: prep.units.length },
       );
     }
     if (prep.flatListings.length)
@@ -1119,15 +1440,17 @@ export async function runPipeline(
       ),
       `context document: ${inputs.context.length.toLocaleString()} characters`,
       `spec ranking: ${inputs.specs.trim() ? inputs.specs.trim().split(/\n/).length + " line(s)" : "none"}`,
-      `listings: ${inputs.listingRows.length} row(s)${inputs.listingRows.length > 500 ? " (first 500 used)" : ""}`,
+      `listings: ${inputs.listingRows.length} row(s)${inputs.listingRows.length > LISTING_SAMPLE ? ` (${LISTING_SAMPLE} taken evenly across them)` : ""}`,
     ];
     const outputLines = [
       prep.mining ? `Core category words: ${prep.mining.coreTerms.join(", ") || "none"}` : "",
-      auto.length
-        ? `Labelled by code (${auto.length}):\n${auto
-            .slice(0, 60)
-            .map((l) => `  ${l.term} → ${l.dimension} = ${l.value}`)
-            .join("\n")}${auto.length > 60 ? `\n  … ${auto.length - 60} more` : ""}`
+      prep.units.length
+        ? `Numbers by unit word, for the model to say what each unit measures (${prep.units.length}):\n${prep.units
+            .map(
+              (u) =>
+                `  ${u.unit || NO_UNIT}: ${u.amounts.slice(0, 8).join(", ")}${u.amounts.length > 8 ? ", …" : ""} · e.g. "${u.example}"`,
+            )
+            .join("\n")}`
         : "",
       prep.modelTerms.length
         ? `Terms left for the model (${prep.modelTerms.length}): ${prep.modelTerms
@@ -1155,7 +1478,7 @@ export async function runPipeline(
       calls: 0,
       detail: [
         kwCount
-          ? `${kwCount.toLocaleString()} keywords · ${auto.length} terms labelled by code`
+          ? `${kwCount.toLocaleString()} keywords · ${prep.mining?.terms.length ?? 0} terms mined · ${prep.units.length} unit words`
           : "no keywords",
         prep.flatListings.length ? `${prep.flatListings.length} listings` : "",
       ]
@@ -1188,7 +1511,13 @@ export async function runPipeline(
         const key = cacheKey(settings, messages);
         const hit = reuse ? stageCache.get(key) : undefined;
         if (hit !== undefined) return { data: hit, cached: true, usage: {} as Usage, messages };
-        const res = await chatJson<unknown>(settings, messages, opts(maxTokens, reasoning));
+        // Labelling and merging sort what is given rather than write anything new: the same input should
+        // give the same answer, so they run cold.
+        const temperature = id === "label" || id === "fields" ? { temperature: 0 } : {};
+        const res = await chatJson<unknown>(settings, messages, {
+          ...opts(maxTokens, reasoning),
+          ...temperature,
+        });
         usage = addUsage(usage, res.usage);
         calls++;
         remember(key, res.data);
@@ -1212,19 +1541,26 @@ export async function runPipeline(
 
   // 2 + 3 · labelling and spec-name merging run in parallel
   const labelTask = async (): Promise<{ labels: TermLabel[]; category: string | null }> => {
-    if (!prep.mining || prep.modelTerms.length === 0) {
+    const mining = prep.mining;
+    if (!mining || (prep.modelTerms.length === 0 && prep.units.length === 0)) {
       step("label", "skipped", {
         calls: 0,
-        detail: prep.mining ? "all terms labelled by code" : "no keyword data",
-        split: labelSplit(prep.mining, []),
+        detail: mining ? "no terms to label" : "no keyword data",
+        split: labelSplit(mining, []),
       });
-      return { labels: auto, category: null };
+      return { labels: [], category: null };
     }
     const known = new Set(prep.modelTerms.map((t) => t.term));
+    // The terms the model labelled, and every number term of the units it named.
+    const labelsOf = (data: unknown) => {
+      const words = parseLabels(data, known);
+      const units = parseUnits(data, prep.units);
+      return { words, units, labels: [...words, ...numberLabels(mining, units)] };
+    };
     step("label", "running");
     try {
       const include = MCAT_SKILLS.label && prep.mcat ? MCAT_SKILLS.label : [];
-      const maxTokens = Math.min(2500, 400 + prep.modelTerms.length * 10);
+      const maxTokens = Math.min(2500, 400 + prep.modelTerms.length * 10 + prep.units.length * 25);
       let attempt = await ask(
         "label",
         "1 · Label keyword terms",
@@ -1234,13 +1570,13 @@ export async function runPipeline(
         !fresh("label"),
         include,
       );
-      let labels = parseLabels(attempt.data, known);
+      let got = labelsOf(attempt.data);
       let stepUsage = attempt.usage;
       let calls = attempt.cached ? 0 : 1;
       let retried = false;
       // An empty answer for a list this long is a failure, not a verdict: never keep it for reuse,
       // and ask once more with a firmer instruction.
-      if (!labels.length && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS) {
+      if (!got.labels.length && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS) {
         stageCache.delete(cacheKey(settings, attempt.messages));
         retried = true;
         attempt = await ask(
@@ -1254,15 +1590,16 @@ export async function runPipeline(
         );
         stepUsage = addUsage(stepUsage, attempt.usage);
         calls += 1;
-        labels = parseLabels(attempt.data, known);
-        if (!labels.length) stageCache.delete(cacheKey(settings, attempt.messages));
+        got = labelsOf(attempt.data);
+        if (!got.labels.length) stageCache.delete(cacheKey(settings, attempt.messages));
       }
       const { data, compact } = attempt;
+      const { labels, words, units } = got;
       const cached = attempt.cached && !retried;
       const none = labels.length === 0 && prep.modelTerms.length >= EMPTY_LABEL_MIN_TERMS;
       if (none)
         warnings.push(
-          `Term labelling: the model labelled none of the ${prep.modelTerms.length} keyword terms${retried ? ", even when asked a second time" : ""}, so only code-labelled terms (price, place, size) were grouped and the keyword evidence is thin. Open "See the working" on that step to read its reply.`,
+          `Term labelling: the model labelled none of the ${prep.modelTerms.length} keyword terms${retried ? ", even when asked a second time" : ""}, so no keyword demand could be grouped and the keyword evidence is missing. Open "See the working" on that step to read its reply.`,
         );
       else if (retried)
         warnings.push("Term labelling: the first answer labelled nothing; the second try worked.");
@@ -1272,43 +1609,44 @@ export async function runPipeline(
         calls,
         cached,
         usage: stepUsage,
-        detail: `${labels.length} of ${prep.modelTerms.length} terms labelled · ${auto.length} by code${none ? " · the model labelled none, used code labels only" : ""}${retried && !none ? " · second try" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
+        detail: `${words.length} of ${prep.modelTerms.length} terms labelled · ${units.size} of ${prep.units.length} unit words${none ? " · the model labelled none" : ""}${retried && !none ? " · second try" : ""}${cached ? " · reused (no cost)" : ""}${compactTag(compact)}`,
         stats: [
           { label: "terms sent", value: prep.modelTerms.length },
-          { label: "labelled", value: labels.length },
-          { label: "left unlabelled", value: prep.modelTerms.length - labels.length },
-          { label: "labelled share", value: pctOf(labels.length, prep.modelTerms.length) },
+          { label: "labelled", value: words.length },
+          { label: "left unlabelled", value: prep.modelTerms.length - words.length },
+          { label: "labelled share", value: pctOf(words.length, prep.modelTerms.length) },
+          { label: "unit words sent", value: prep.units.length },
+          { label: "unit words labelled", value: units.size },
           { label: "dimensions used", value: dims.size },
-          { label: "labelled by code", value: auto.length },
           ...(typeof category === "string" && category
             ? [{ label: "category", value: category }]
             : []),
         ],
-        split: labelSplit(prep.mining, labels),
+        split: labelSplit(mining, labels),
         output: [
           JSON.stringify(data, null, 2),
-          unlabelledReport(prep.mining, prep.modelTerms, labels),
+          unlabelledReport(mining, prep.modelTerms, prep.units, labels),
         ]
           .filter(Boolean)
           .join("\n\n"),
       });
       return {
-        labels: [...auto, ...labels],
+        labels,
         category: typeof category === "string" ? category : null,
       };
     } catch (err) {
       if ((err as Error).name === "AbortError") throw err;
       warnings.push(
-        `Term labelling failed (${(err as Error).message}); only code-labelled terms (price, location, size) were grouped.`,
+        `Term labelling failed (${(err as Error).message}); no keyword terms were labelled, so the keyword evidence is missing.`,
       );
       step("label", "error", {
-        detail: "used code labels only",
-        split: labelSplit(prep.mining, []),
-        output: [(err as Error).message, unlabelledReport(prep.mining, prep.modelTerms, [])]
+        detail: "no terms labelled",
+        split: labelSplit(mining, []),
+        output: [(err as Error).message, unlabelledReport(mining, prep.modelTerms, prep.units, [])]
           .filter(Boolean)
           .join("\n\n"),
       });
-      return { labels: auto, category: null };
+      return { labels: [], category: null };
     }
   };
 
@@ -1332,6 +1670,8 @@ export async function runPipeline(
       )
       .join("\n")}`;
 
+  // The listing spec names after the merge (step 3); the keyword labels (step 2) are renamed the same way.
+  let specMap = prep.fieldMap;
   const fieldTask = async (): Promise<ListingProfile | null> => {
     if (prep.flatListings.length === 0) {
       step("fields", "skipped", { calls: 0, detail: "no listings" });
@@ -1362,7 +1702,8 @@ export async function runPipeline(
         "off",
         !fresh("fields"),
       );
-      const { map, changes } = applySpecMerges(prep.fieldMap, data);
+      const { map, changes } = applySpecMerges(prep.fieldMap, data, prep.flatListings);
+      specMap = map;
       const profile = profileListings(prep.flatListings, map);
       step("fields", "done", {
         calls: cached ? 0 : 1,
@@ -1387,7 +1728,17 @@ export async function runPipeline(
     }
   };
 
-  const [{ labels, category }, listing] = await Promise.all([labelTask(), fieldTask()]);
+  const [labelled, listing] = await Promise.all([labelTask(), fieldTask()]);
+  const { category } = labelled;
+  // Step 2 named its dimensions after the listing specs as they were before step 3 merged them: a dimension
+  // whose spec was renamed ("Scooter Brand" → "Brand") takes the new name, so demand and fill rate stay joined.
+  const renames = specRenames(prep.fieldMap, specMap);
+  const labels = renames.size
+    ? labelled.labels.map((l) => ({
+        ...l,
+        dimension: renames.get(l.dimension.toLowerCase()) ?? l.dimension,
+      }))
+    : labelled.labels;
   const aggregation = labels.length ? aggregate(prep.tables, labels) : null;
   const evidence: Evidence = {
     category,
@@ -1447,13 +1798,16 @@ export async function runPipeline(
     throw new Error("The model returned no filters. Try again or pick another model.");
   }
   const tierN = (t: Tier) => result.filters.filter((f) => f.tier === t).length;
+  const breaks = designChecks(result, links, prep.mcat);
+  warnings.push(...breaks.map((b) => `Design check: ${b}`));
   step("design", "done", {
     calls: designCached ? 0 : 1,
     cached: designCached,
     usage: designUsage,
-    detail: `${result.filters.length} filters proposed${designCached ? " · reused (no cost)" : ""}${compactTag(designCompact)}`,
+    detail: `${result.filters.length} filters proposed${breaks.length ? ` · ${breaks.length} rule break(s)` : ""}${designCached ? " · reused (no cost)" : ""}${compactTag(designCompact)}`,
     stats: [
       { label: "filters", value: result.filters.length },
+      { label: "rule breaks", value: breaks.length },
       { label: "Tier 1", value: tierN("Tier 1") },
       { label: "Tier 2", value: tierN("Tier 2") },
       { label: "Tier 3", value: tierN("Tier 3") },
@@ -1525,8 +1879,10 @@ export async function runPipeline(
   step("select", "running");
   {
     const need = doc?.isqs.length ? isqsNeedingDoc(result.filters, evidence) : [];
-    // Measurements are paired with the document by name, in code; only the rest (thin ISQs) need the model.
-    const sure = doc ? measurementPairs(need, doc) : new Map();
+    // Measurements are paired with the document in code: by name, or a figure by its unit ("cc"); only the rest
+    // (thin ISQs) need the model.
+    const unitOf = (f: FilterRow) => figureUnitOf(f, evidence);
+    const sure = doc ? measurementPairs(need, doc, unitOf) : new Map();
     const toAsk = need.filter((f) => !sure.has(f));
     let data: unknown = null;
     let stepCalls = 0;
@@ -1559,8 +1915,11 @@ export async function runPipeline(
         );
       }
     }
-    const pairs = doc ? parseDocPairs(data, need, doc) : [];
-    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking);
+    const pairs = doc ? parseDocPairs(data, need, doc, unitOf) : [];
+    const report = selectIsqs(result.filters, evidence, pairs, prep.dims.ranking, live, {
+      mcat: prep.mcat?.name ?? doc?.name ?? result.category_name,
+      doc,
+    });
     warnings.push(...report.warnings, ...report.failed.map((x) => `Check failed: ${x}`));
     const shown = result.filters.filter((f) => f.selected);
     step("select", report.failed.length ? "error" : "done", {

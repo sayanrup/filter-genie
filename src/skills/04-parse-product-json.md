@@ -28,17 +28,25 @@ source field names onto canonical spec names so that fill rates can be measured 
    **When ≥ 30% of listings carry such a spec list, only those specs (plus the seller's city) are kept**;
    the remaining raw fields (ids, flags, ranks, seller metadata) are ignored.
 5. Only when two or more spec names remain (filled on ≥ 2% of listings, top 60) does the model get a call — and it sees just the spec names
-   with fill % and three sample values, and returns only the merges/removals. The mapping is then applied
-   by code to **all** listings.
+   with fill % and three sample values, and returns only the merges/removals. The seller's city is not sent:
+   code keeps it as Location evidence. The mapping is then applied by code to **all** listings
+   (`applySpecMerges()`), with two checks: two names that one listing fills with different values are two
+   attributes, so a merge never joins them ("Material: MS" and "Insulation Material: PUF" on one cabin); and
+   the merged spec keeps one of the listings' own names (the model's pick if it is one, else the most-filled),
+   never a new one, since later steps match ISQs by name. The model sees each spec's most common values with
+   counts, so it can tell "100 kg/hr" from "500 L".
+   Step 2 runs at the same time and names its dimensions after the specs as they were before the merge, so
+   code renames its labels the same way afterwards (`specRenames()`: "Scooter Brand" → "Brand"): demand and
+   fill rate then share one name.
 
 ## Prompt
 
 TASK: Clean up spec names from a product-listing export (one category) so fill rates are counted per real spec. Each line: spec name | fill rate | sample values.
 
 Return only the changes:
-- "merge": names holding the SAME attribute, under one short Title Case buyer-facing name ("Material Type", "Build Material" → "Material"). No units or category name in names.
-- "drop": names that are not product attributes (seller info, marketing text, stock, delivery, payment terms, ids).
+- "merge": names that are the SAME attribute written differently (spelling, plural, word order, a unit, or the product's or a generic word added: "Colour" / "Color", "Product Brand" / "Brand"), under ONE OF THOSE NAMES: the plainest (no unit, no product word), as listed. Never a new name: these are the sellers' spec names and are matched by name later. A name that narrows another to one part, side or kind is a DIFFERENT attribute and stays apart: "Inner Wall Material" is not "Material", "Eave Height" is not "Height", "Length" is not "Size", "No. of Gears" is not "Transmission". Their samples must be the same kind of value.
+- "drop": only names that are not about the product itself: the seller or their business ("I Deal In", branches, service area), payment, delivery, stock, contact, ids. A product attribute stays even when it looks unimportant (Brand, Weight, Thickness, Roof Type, Capacity): later steps decide what matters.
 Unmentioned names stay as they are. Judge by name AND samples; when unsure, leave it.
 
 OUTPUT (names copied exactly; {} and [] when nothing changes):
-{"merge": {"Material": ["Material Type", "Build Material"]}, "drop": ["Delivery Time"]}
+{"merge": {"Material": ["Material", "Material Type", "Build Material"]}, "drop": ["Delivery Time"]}

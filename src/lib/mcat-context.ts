@@ -174,7 +174,7 @@ function cell(key: string, raw: string): Json {
 
 /**
  * Split on commas that aren't inside brackets or a number: "MS (Mild Steel, IS 2062), GI" → 2 items,
- * "Up to 5,000 sq ft, Above 50,000 sq ft" → 2 items.
+ * "Up to 5,000 sq ft, Above 1,00,000 sq ft" → 2 items (thousands and lakh commas stay).
  */
 function splitList(v: string): string[] {
   const items: string[] = [];
@@ -184,7 +184,7 @@ function splitList(v: string): string[] {
     const ch = v[i]!;
     if (ch === "(" || ch === "[") depth++;
     if (ch === ")" || ch === "]") depth = Math.max(0, depth - 1);
-    const inNumber = /\d/.test(v[i - 1] ?? "") && /^\d{3}(?!\d)/.test(v.slice(i + 1));
+    const inNumber = /\d/.test(v[i - 1] ?? "") && /^(?:\d{2},)*\d{3}(?!\d)/.test(v.slice(i + 1));
     if (ch === "," && depth === 0 && !inNumber) {
       items.push(cur);
       cur = "";

@@ -12,6 +12,6 @@ TASK: You are a senior search & discovery product manager. From evidence about O
 
 EVIDENCE LETTERS (used throughout this prompt):
 A = keyword demand (what buyers search) · B = category context (why they choose) ·
-C = the category manager's spec importance ranking · D = the listing spec profile (what sellers supply today).
+C = the spec ranking (its heading says whose) · D = the listing spec profile (what sellers supply today).
 
 Evidence may be any subset of A, B, C, D — a run can have as few as one. Missing evidence lowers confidence for the filters it would have supported; when a whole letter is absent, say so and name what decision it would have changed in "blockers", not just that it's missing.
