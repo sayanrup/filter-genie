@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { InputPanel } from "@/components/InputPanel";
 import { McatContextLoader } from "@/components/McatContextLoader";
+import { McatInputsFetcher } from "@/components/McatInputsFetcher";
 import {
   SOURCE_LABEL,
   describeKeywordTable,
@@ -1747,6 +1748,29 @@ function Index() {
           className="md:col-span-2"
         />
       </div>
+
+      {mcatSlices.length > 1 ? (
+        <McatInputsFetcher
+          mcats={mcatSlices.flatMap(({ inputs: { mcat } }) =>
+            mcat?.id
+              ? [
+                  {
+                    id: mcat.id,
+                    name: mcat.name,
+                    listings: mcat.listings,
+                    ...(mcat.pmcat ? { pmcat: mcat.pmcat.name } : {}),
+                  },
+                ]
+              : [],
+          )}
+          subcatId={mcatSlices[0]?.inputs.mcat?.subcat?.id}
+          hasInputs={Boolean(contextText.trim() || specsText.trim())}
+          onFetched={(context, specs) => {
+            setContextText(context);
+            setSpecsText(specs);
+          }}
+        />
+      ) : null}
 
       {mcatSlices.length > 1 ? (
         <McatPlan

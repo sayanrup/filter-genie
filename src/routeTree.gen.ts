@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiMcatContextRouteImport } from './routes/api/mcat-context'
+import { Route as ApiMcatIsqRouteImport } from './routes/api/mcat-isq'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +23,40 @@ const ApiMcatContextRoute = ApiMcatContextRouteImport.update({
   path: '/api/mcat-context',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiMcatIsqRoute = ApiMcatIsqRouteImport.update({
+  id: '/api/mcat-isq',
+  path: '/api/mcat-isq',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/mcat-context': typeof ApiMcatContextRoute
+  '/api/mcat-isq': typeof ApiMcatIsqRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/mcat-context': typeof ApiMcatContextRoute
+  '/api/mcat-isq': typeof ApiMcatIsqRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/mcat-context': typeof ApiMcatContextRoute
+  '/api/mcat-isq': typeof ApiMcatIsqRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/mcat-context'
+  fullPaths: '/' | '/api/mcat-context' | '/api/mcat-isq'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/mcat-context'
-  id: '__root__' | '/' | '/api/mcat-context'
+  to: '/' | '/api/mcat-context' | '/api/mcat-isq'
+  id: '__root__' | '/' | '/api/mcat-context' | '/api/mcat-isq'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiMcatContextRoute: typeof ApiMcatContextRoute
+  ApiMcatIsqRoute: typeof ApiMcatIsqRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +75,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiMcatContextRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/mcat-isq': {
+      id: '/api/mcat-isq'
+      path: '/api/mcat-isq'
+      fullPath: '/api/mcat-isq'
+      preLoaderRoute: typeof ApiMcatIsqRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiMcatContextRoute: ApiMcatContextRoute,
+  ApiMcatIsqRoute: ApiMcatIsqRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

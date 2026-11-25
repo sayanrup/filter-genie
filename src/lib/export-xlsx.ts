@@ -275,7 +275,7 @@ const byTier = (r: FilterResult) =>
  */
 /**
  * The shown ISQs only (skill 15, isShown): every Tier 1 ISQ (High, Medium or Low) and every Tier 2 High one, and
- * nothing else. Compact: per MCAT its id and name, and each ISQ with its tier (1 or 2) and its own confidence as one
+ * nothing else. Compact: per MCAT its subcategory id and name, its id and name, and each ISQ with its tier (1 or 2) and its own confidence as one
  * letter (`isq_conf`), the values that are shown (its High and Medium ones; an ISQ with none of those, all it has),
  * and their confidence one letter each in `conf` ("HHM": conf[i] belongs to values[i]). Order is the rank, so none
  * is written: ISQs by tier then rank, values best first. One MCAT per line.
@@ -283,6 +283,8 @@ const byTier = (r: FilterResult) =>
 export function selectedIsqJson(items: McatResult[]): string {
   const mcats = items.map(({ name, result }) => {
     return {
+      subcat_id: result.subcat_id ?? null,
+      subcat_name: result.subcat_name ?? null,
       mcat_id: result.mcat_id ?? null,
       mcat_name: result.mcat_name ?? (name || result.category_name || null),
       isqs: byTier(result)
