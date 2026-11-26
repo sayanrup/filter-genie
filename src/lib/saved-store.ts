@@ -19,7 +19,7 @@ export const sharedStorageEnabled = Boolean(API_KEY && PROJECT);
 
 const DOCS = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/${DATABASE}/documents`;
 /** Most recent saved results fetched for the list. */
-const LIST_LIMIT = 70;
+const LIST_LIMIT = 110;
 /** Stay under Firestore's 1 MiB document limit (string bytes + field overhead). */
 const MAX_PAYLOAD_CHARS = 900_000;
 
